@@ -102,10 +102,60 @@ nothing in the protocol would reveal it.
 
 ## Pointing at an Auto-Ontology on your own machine
 
-Only `AUTO_ONTOLOGY_API_URL` changes. For the Docker stack the web app is on `:3000`:
+The local Compose stack includes an `auto-ontology-mcp` service built from
+`mcp/Dockerfile`. After preparing `.env`, start the stack from the repository root:
 
 ```sh
-AUTO_ONTOLOGY_API_URL=http://localhost:3000 auto-ontology-mcp
+docker compose up -d --build
+```
+
+With this checkout's `.env.example`, the web app is `http://localhost:18300`
+and the MCP endpoint is `http://localhost:18303/mcp`. Both are published only
+on loopback. The backend and ingestion API have no host port mappings.
+
+Compose sends MCP requests to `http://auto-ontology-frontend:3000` on the
+private network, but advertises `APP_URL` as the browser/client-facing OAuth
+frontend base URL through `AUTO_ONTOLOGY_AUTH_URL`. MCP appends `/api/auth`
+to advertise Better Auth's exact issuer, not the frontend origin. Its RFC 8414
+discovery URL is `/.well-known/oauth-authorization-server/api/auth`.
+Do not replace the public base URL with a Docker service name. The frontend and
+MCP must receive the same
+`AUTO_ONTOLOGY_MCP_PUBLIC_URL`, without `/mcp`; do not mix `localhost` and
+`127.0.0.1` in the public URLs. This loopback profile assumes the browser and
+MCP client run on the same host.
+
+For OpenCode V2, merge this entry into `mcp.servers` in its configuration:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "auto-ontology": {
+        "type": "remote",
+        "url": "http://localhost:18303/mcp",
+        "timeout": { "execution": 900000 }
+      }
+    }
+  }
+}
+```
+
+Then run `opencode mcp auth auto-ontology` and sign in through Auto-Ontology.
+No OmniRoute key or shared API token belongs in this MCP connection.
+
+With the local stack running, check issuer/discovery without signing in or
+registering an OAuth client:
+
+```sh
+AUTO_ONTOLOGY_TEST_RUNTIME=1 .venv/bin/python -m pytest dev_tools/tests/test_oauth_runtime.py -q
+```
+
+To run MCP outside Docker against the same frontend instead:
+
+```sh
+AUTO_ONTOLOGY_API_URL=http://localhost:18300 \
+AUTO_ONTOLOGY_MCP_PUBLIC_URL=http://localhost:18303 \
+AUTO_ONTOLOGY_MCP_PORT=18303 auto-ontology-mcp
 ```
 
 Sign-in needs an Auto-Ontology new enough to be an authorization server, which an
@@ -113,10 +163,10 @@ already-built image may not be. Checking first is worth it, because otherwise th
 failure surfaces as a client that cannot log in:
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' $AUTO_ONTOLOGY_API_URL/.well-known/oauth-authorization-server
+curl -fsS http://localhost:18300/.well-known/oauth-authorization-server/api/auth
 ```
 
-A `200` is what you want. Anything else means running the frontend from your
+A successful JSON response is what you want. Anything else means running the frontend from your
 checkout instead — `pnpm dev`, with `AUTO_ONTOLOGY_API_URL` pointing at its port.
 
 ## Tools
@@ -126,6 +176,7 @@ underlying databases.
 
 | Tool | What it is for |
 | --- | --- |
+| `list_sources` | Discover active source IDs, unique labels, physical names and dialects without credentials or driver probes. Requires `chat:use`, not connection-settings access. |
 | `ask_question` | **The primary tool.** Ask a question in plain language; get the answer, the SQL Auto-Ontology ran, and the rows. |
 | `check_answerable` | Grade whether the semantic layer covers a question. Cheap pre-flight before `ask_question`. |
 | `check_readiness` | Whether this deployment can answer anything at all. |
@@ -136,7 +187,8 @@ underlying databases.
 | `get_sql_attribute` | One SQL attribute: its expression and purpose. |
 | `describe_table` | A table's columns, related terms, and SQL attributes together. |
 
-There is deliberately no tool for browsing databases, schemas, or raw columns.
+Source discovery lists identities, not a physical catalog. There is deliberately
+no tool for browsing database contents, schemas, or raw columns.
 Consumers are meant to reach the data through the semantic layer, and a catalog
 browser invites an agent to reason about raw tables instead. `describe_table`
 covers the legitimate case, since what it returns is the terms and SQL attributes
@@ -155,6 +207,33 @@ rather than the markdown the UI receives, so an agent can use the SQL without
 parsing prose. Results are capped at 100 rows, with `row_count` and `truncated`
 reporting what was withheld. It emits MCP progress notifications as the agent
 works, mirroring the reasoning trace the web UI shows.
+
+### Selecting a source
+
+1. Call `list_sources`. When multiple sources exist, choose one explicitly using
+   its stable `connection_id` or unique `connection_label`, never both. Two
+   sources may have the same physical database name; that name is not identity.
+2. Pass that selector to `check_answerable` and `ask_question`. Optional selectors
+   on glossary/detail tools return the selected source's projection, including
+   its counts and relationships. Without a selector those reads remain a global
+   glossary overview, not permission to execute against an arbitrary source.
+3. Check the returned `source` snapshot: `{connection_id, display_label,
+   database_name}`. MCP validates SSE `source` and `answer.source`, rejects
+   malformed or conflicting provenance and never derives it from the selector.
+   Older responses with neither field retain `source: null`; SQL, rows and
+   truncation remain unchanged.
+
+With no selector, a stateless query auto-selects only when exactly one active
+source exists. Multiple sources require selection (422); missing or inactive
+sources return 404, ambiguous legacy physical names return 409, and an unready
+selected source returns 503. These are errors, not invitations to retry against
+another source. Selected-source SSO failures never fall back to stored PATs.
+
+A `conversation_id` inherits its saved immutable source when no selector is
+supplied. An explicit different source returns `409 source_conflict`. A legacy
+conversation with messages but no source returns
+`409 legacy_conversation_read_only`, even if a new selector is provided. Create
+a new conversation to use a different source; do not rebind history.
 
 ### About `check_readiness`
 
@@ -177,6 +256,7 @@ under `unverified` and the verdict stands on what could be checked.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AUTO_ONTOLOGY_API_URL` | `http://localhost:3000` | Base URL of the Auto-Ontology web app. |
+| `AUTO_ONTOLOGY_AUTH_URL` | Same as `AUTO_ONTOLOGY_API_URL` | Public frontend base URL for OAuth discovery. MCP appends `/api/auth` to form the issuer; do not include that suffix here. Set separately when the API URL is private to Docker; does not change upstream API or token-verification requests. |
 | `AUTO_ONTOLOGY_MCP_PUBLIC_URL` | `http://localhost:3003` | Public MCP origin, without `/mcp`. The frontend must receive the same value so issued tokens have the resource URL clients use. |
 
 Rarely needed: `AUTO_ONTOLOGY_MCP_HOST` and `AUTO_ONTOLOGY_MCP_PORT` (bind address and port, default
@@ -204,7 +284,9 @@ hand.
 ## Troubleshooting
 
 **A client cannot discover how to sign in** — check that
-`$AUTO_ONTOLOGY_API_URL/.well-known/oauth-authorization-server` returns JSON. A redirect to
+`$AUTO_ONTOLOGY_AUTH_URL/.well-known/oauth-authorization-server/api/auth` returns JSON
+with `issuer` equal to `$AUTO_ONTOLOGY_AUTH_URL/api/auth` (use the API URL if
+the public auth URL is unset). A redirect to
 the login page instead means the deployment predates that route.
 
 **"Protected resource ... does not match expected ..."** — the server advertises

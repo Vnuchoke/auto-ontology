@@ -87,6 +87,31 @@ back to the legacy `NVIDIA_API_KEY` for backward compatibility.
 
 ## Quickstart
 
+### Local Compose profile in this checkout
+
+The current `.env.example` uses the existing OmniRoute gateway at
+`host.docker.internal:20128` and an external source database. After reviewing
+its credentials and source connection, copy it to `.env` and run
+`docker compose up -d --build`. Copying replaces any existing `.env`.
+
+The web app is `http://localhost:18300`, MCP is
+`http://localhost:18303/mcp`, pgAdmin is `http://localhost:18350`, and the
+internal application Postgres is published at `127.0.0.1:18332`. All published
+ports bind to loopback; backend and ingestion ports stay private. The MCP
+service builds from the existing `mcp/Dockerfile`; no host-side `uv run` is
+needed. See [MCP setup and OpenCode configuration](./docs/mcp.md#pointing-at-an-auto-ontology-on-your-own-machine).
+
+The reranker at `host.docker.internal:18304` is an **external dependency**;
+Compose does not start it. Pulling a model into Ollama does not create a
+compatible reranking API. Its endpoint, model ID, and credentials must match
+a separately deployed service before using flows that require reranking.
+
+### Sample database walkthrough
+
+The following walkthrough replaces that external source with a sample dataset
+and uses NVIDIA-hosted models; adapt `.env` accordingly rather than running
+the sample seed against an existing source database.
+
 This runs Auto-Ontology with Docker Compose against Wide World Importers,
 Microsoft's sample sales database. You need Docker with Compose v2,
 [uv](https://docs.astral.sh/uv/), and an NVIDIA API key (`nvapi-...`) from
@@ -104,7 +129,7 @@ Microsoft's sample sales database. You need Docker with Compose v2,
    ```dotenv
    DEFAULT_MODELS_API_KEY=nvapi-...
    AUTH_SECRET=<a long random string, e.g. from openssl rand -base64 32>
-   APP_URL=http://localhost:3000
+   APP_URL=http://localhost:18300
    POSTGRES_PASSWORD=<a new password>
    CONNECTION_STRINGS=postgresql://postgres:<the same password>@postgres:5432/wideworldimporters
    AUTO_ONTOLOGY_ADMIN_PASSWORD=<a new password>
@@ -133,10 +158,16 @@ Microsoft's sample sales database. You need Docker with Compose v2,
    docker compose up -d --build
    ```
 
-4. Open <http://localhost:3000> and sign in with `AUTO_ONTOLOGY_ADMIN_EMAIL` and
+4. Open <http://localhost:18300> and sign in with `AUTO_ONTOLOGY_ADMIN_EMAIL` and
    `AUTO_ONTOLOGY_ADMIN_PASSWORD` from `.env`. Go to **Settings → Semantic
    Compilation** and turn it on. Ingestion runs at startup; compilation starts
    immediately and reports **Semantic compilation is ready** when it finishes.
+
+   For a developer CLI run against one registered source, use
+   `uv run --no-sync python -m auto_ontology.semantic --connection-id <connection_id>`.
+   Use the stable ID returned by the connection API, not the physical database
+   name. See the [connection identity migration guide](docs/connection-identity-migration.md)
+   before upgrading an existing deployment.
 
 5. Ask a question in **Chat**:
 
@@ -183,7 +214,7 @@ Microsoft's sample sales database. You need Docker with Compose v2,
    ```
 
 If the UI loads without its left navigation after a restart, the browser is
-holding a stale session cookie. Clear site data for `localhost:3000` and sign in
+holding a stale session cookie. Clear site data for `localhost:18300` and sign in
 again. For other setup failures, see the
 [setup skill's troubleshooting guide](./skills/nvidia-ontology-setup/references/troubleshooting.md).
 
@@ -246,7 +277,11 @@ can't be answered from this data. Predictive questions go to KumoRFM when it's
 configured (see [Predictions](#predictions)).
 
 In Chat, each answer shows its SQL, and you can view the rows, download them as
-CSV, or read them as a chart:
+CSV, or read them as a chart. When multiple sources are active, choose a source
+before the first question. The conversation locks that source; use **New chat**
+to switch. Legacy or unavailable-source history stays read-only. See the
+[conversation API guide](docs/conversation-api.md) for source selection,
+provenance and recovery after a refused request.
 
 <p>
 <img src="./docs/assets/qa-example.png" alt="Chat answering which products drive the most revenue and highest customer count, with the generated SQL and a revenue chart" width="550">
@@ -271,7 +306,7 @@ Use **Settings → Import / Export**, or `POST /api/model/import` and
 Keep ports 3001 and 3002 on a private network. FastAPI trusts the user identity
 the frontend forwards in the `x-auto-ontology-user-id` header, and the ingestion
 service's endpoints (ingest, delete, reset, compile) have no authentication of
-their own. Clients go through the web app on port 3000.
+their own. Clients go through the web app (host port 18300 in local Compose).
 
 ## Use it from your agent
 
@@ -288,10 +323,13 @@ call runs with that user's permissions.
 | Answerability | `check_answerable`: does the ontology cover this question     |
 | Questions     | `ask_question`: the answer, the SQL, and the rows             |
 
-Run the server against your deployment:
+Local Compose starts the MCP server at `http://localhost:18303/mcp`.
+Alternatively, run a separate server against your deployment (do not run
+both on the same port):
 
 ```bash
-AUTO_ONTOLOGY_API_URL=http://localhost:3000 \
+AUTO_ONTOLOGY_API_URL=http://localhost:18300 \
+AUTO_ONTOLOGY_MCP_PUBLIC_URL=http://localhost:18303 AUTO_ONTOLOGY_MCP_PORT=18303 \
   uvx --from "git+https://github.com/NVIDIA/auto-ontology.git#subdirectory=mcp" auto-ontology-mcp
 ```
 
@@ -300,7 +338,7 @@ Cursor (`~/.cursor/mcp.json`):
 ```json
 {
   "mcpServers": {
-    "auto-ontology": { "url": "http://localhost:3003/mcp" }
+    "auto-ontology": { "url": "http://localhost:18303/mcp" }
   }
 }
 ```
@@ -313,7 +351,7 @@ Claude Desktop (`claude_desktop_config.json`), bridged with
   "mcpServers": {
     "auto-ontology": {
       "command": "npx",
-      "args": ["mcp-remote", "http://localhost:3003/mcp"]
+      "args": ["mcp-remote", "http://localhost:18303/mcp"]
     }
   }
 }
@@ -341,7 +379,7 @@ server-sent event stream: a `result` event carries the answer, and
 `data: [DONE]` ends the stream.
 
 ```bash
-curl -N http://localhost:3000/api/chat/completions \
+curl -N http://localhost:18300/api/chat/completions \
   -H "x-api-key: $AUTO_ONTOLOGY_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"question": "How many orders shipped last week?"}'
@@ -354,7 +392,7 @@ import os
 import requests
 
 response = requests.post(
-    "http://localhost:3000/api/chat/completions",
+    "http://localhost:18300/api/chat/completions",
     headers={"x-api-key": os.environ["AUTO_ONTOLOGY_API_TOKEN"]},
     json={"question": "How many orders shipped last week?"},
     stream=True,
@@ -401,6 +439,15 @@ Add connections under **Settings → Connections**, or list them in
 `CONNECTION_STRINGS`. DuckDB and SQLite are connection-string only. See
 [docs/connections.md](./docs/connections.md) for URL schemes, scoping, and
 credential storage.
+
+Every connection has a stable ID and a required, case-insensitively unique
+**Display Label**. Two connections may use the same physical database name;
+cards and catalog pickers show the label with that physical name separately.
+The form suggests the physical name only while that label is free. Renaming
+an otherwise unchanged connection saves only its label: no connection test,
+re-ingestion, ID change or conversation rebinding. Editing driver settings
+still requires a successful test. Edit, removal and per-user SSO actions address
+the selected ID, never another connection with the same physical name.
 
 ### Models
 

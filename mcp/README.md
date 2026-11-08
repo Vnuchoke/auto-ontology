@@ -63,6 +63,18 @@ and returns the answer, the SQL it ran, and the rows. The rest — `search_terms
 `describe_table`, `check_answerable` and friends — let an agent learn the
 vocabulary and check its assumptions first.
 
+Start with `list_sources`: it returns active IDs, unique labels, physical names
+and dialects, never credentials. For multiple sources, pass exactly one
+`connection_id` or `connection_label` to `ask_question` and `check_answerable`;
+do not pick the first entry. Pass the same selector to semantic reads for a
+source projection; omitting it keeps the global glossary overview.
+
+Answers include a safe `source` snapshot (`connection_id`, `display_label`,
+`database_name`) alongside SQL and rows. Bound conversations inherit their
+source when selectors are omitted. A different source needs a new conversation;
+legacy conversations with messages but no source are read-only. Unknown,
+inactive or unready sources fail without switching connections.
+
 Every tool reads, and every tool works through the semantic layer: there is none
 for browsing databases, schemas, or raw columns. Nothing here modifies the
 glossary, the catalog, or the underlying databases.
