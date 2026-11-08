@@ -25,6 +25,7 @@ from auto_ontology.retrieval.text_to_sql.agents.information_tools import (
 
 def _state() -> dict[str, Any]:
     return {
+        "connection_id": "test-source",
         "llm": MagicMock(),
         "initial_question": "How is revenue calculated?",
         "messages": [],

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 
 import httpx
 
@@ -30,11 +29,13 @@ def _base_url() -> str:
     return url.rstrip("/")
 
 
-def trigger_ingest(connection: dict[str, Any]) -> None:
-    """Ask the ingestion service to ingest a connection (best-effort)."""
+def trigger_ingest(connection_id: str) -> None:
+    """Ask the ingestion service to ingest this source ID (best-effort)."""
     url = f"{_base_url()}/ingest"
     try:
-        httpx.post(url, json=connection, timeout=_REQUEST_TIMEOUT).raise_for_status()
+        httpx.post(
+            url, json={"connection_id": connection_id}, timeout=_REQUEST_TIMEOUT
+        ).raise_for_status()
     except Exception:
         logger.exception("Failed to trigger ingest via %s", url)
 
@@ -82,15 +83,15 @@ def is_semantic_compilation_running() -> bool:
         return False
 
 
-def trigger_semantic_reset(database_name: str | None = None) -> None:
+def trigger_semantic_reset(connection_id: str | None = None) -> None:
     """Ask the ingestion service to delete the semantic layer (best-effort).
 
-    Omitting ``database_name`` resets every database. The service deletes the
-    semantic nodes and embeddings without recompiling; the next scheduled run
-    rebuilds them.
+    Omitting ``connection_id`` resets every source; global PQL is preserved.
+    The service stops and drains compilation, deletes, then rebuilds. A 202
+    acknowledges queueing, not successful completion.
     """
     url = f"{_base_url()}/semantic/reset"
-    params = {} if database_name is None else {"database_name": database_name}
+    params = {} if connection_id is None else {"connection_id": connection_id}
     try:
         httpx.post(
             url,
@@ -98,17 +99,23 @@ def trigger_semantic_reset(database_name: str | None = None) -> None:
             timeout=_REQUEST_TIMEOUT,
         ).raise_for_status()
     except Exception:
-        logger.exception("Failed to trigger semantic reset via %s", url)
+        logger.error(
+            "Failed to trigger semantic reset for connection %s", connection_id
+        )
 
 
-def trigger_reset(database_name: str) -> None:
-    """Ask the ingestion service to reset a database's data (best-effort)."""
+def trigger_reset(connection_id: str) -> None:
+    """Queue final cleanup of this retired source ID (best-effort, not a reset).
+
+    The caller captures the ID before retiring credentials. Never resolve a
+    reusable label or physical name on the asynchronous cleanup path.
+    """
     url = f"{_base_url()}/ingest/delete"
     try:
         httpx.post(
             url,
-            params={"database_name": database_name},
+            params={"connection_id": connection_id},
             timeout=_REQUEST_TIMEOUT,
         ).raise_for_status()
     except Exception:
-        logger.exception("Failed to trigger reset via %s", url)
+        logger.error("Failed to trigger final cleanup for connection %s", connection_id)

@@ -49,10 +49,12 @@ class ColumnCatalogMeta:
     table_name: str
     schema_name: str
     database_name: str
+    connection_id: str
 
 
 def build_column_data_row(
     *,
+    connection_id: str,
     live_id: str,
     column_name: str,
     column_description: str,
@@ -75,6 +77,7 @@ def build_column_data_row(
     return build_embed_row(
         text=text,
         node_id=live_id,
+        connection_id=connection_id,
         label=Labels.COLUMN,
         name=column_name,
         schema_name=schema_name,
@@ -84,6 +87,7 @@ def build_column_data_row(
 
 def build_table_data_row(
     *,
+    connection_id: str,
     live_id: str,
     table_name: str,
     table_description: str,
@@ -102,6 +106,7 @@ def build_table_data_row(
     return build_embed_row(
         text=text,
         node_id=live_id,
+        connection_id=connection_id,
         label=Labels.TABLE,
         name=table_name,
         schema_name=schema_name,
@@ -111,6 +116,7 @@ def build_table_data_row(
 
 def build_term_semantic_rows(
     *,
+    connection_id: str,
     database_name: str,
     live_id: str,
     name: str,
@@ -125,13 +131,16 @@ def build_term_semantic_rows(
             "description": description,
             "id": live_id,
             "schema_names": schema_names or [],
+            "connection_id": connection_id,
         },
         [],
+        connection_id=connection_id,
     )
 
 
 def build_column_attribute_semantic_rows(
     *,
+    connection_id: str,
     database_name: str,
     live_id: str,
     name: str,
@@ -160,13 +169,16 @@ def build_column_attribute_semantic_rows(
                 "sample_values": sample_values,
                 "id": live_id,
                 "schema_name": schema_name,
+                "connection_id": connection_id,
             },
         ],
+        connection_id=connection_id,
     )
 
 
 def build_sql_attribute_semantic_row(
     *,
+    connection_id: str,
     live_id: str,
     name: str,
     description: str,
@@ -189,11 +201,13 @@ def build_sql_attribute_semantic_row(
             "id": live_id,
         },
         database_name,
+        connection_id=connection_id,
     )
 
 
 def build_custom_analysis_semantic_row(
     *,
+    connection_id: str,
     live_id: str,
     name: str,
     description: str,
@@ -214,13 +228,18 @@ def build_custom_analysis_semantic_row(
             "id": live_id,
         },
         database_name,
+        connection_id=connection_id,
     )
 
 
 def _doc_to_embed_row(
     item: dict[str, Any],
     database_name: str | None,
+    *,
+    connection_id: str,
 ) -> dict[str, Any]:
+    if not connection_id:
+        raise ValueError("connection_id is required for imported embedding docs")
     node_id = item.get("id")
     path = (
         f"auto_ontology:{node_id}" if node_id is not None else "auto_ontology:unknown"
@@ -231,6 +250,7 @@ def _doc_to_embed_row(
         "name": item.get("name", ""),
         "source_path": path,
         "database_name": database_name,
+        "connection_id": connection_id,
     }
     return {
         "text": (item.get("text") or "").strip(),
@@ -243,7 +263,13 @@ def _doc_to_embed_row(
 def _embed_and_ingest_rows(rows: list[dict[str, Any]], vdb: Any) -> int:
     if not rows:
         return 0
+    if any(not (row.get("metadata") or {}).get("connection_id") for row in rows):
+        raise ValueError("Imported embedding rows require connection_id")
     embedded = embed_rows(rows, get_embed_params(), what="imported")
+    for connection_id, node_id in {
+        (row["metadata"]["connection_id"], row["metadata"]["id"]) for row in embedded
+    }:
+        vdb.delete_by_id(node_id, connection_id=connection_id)
     write_embedded_rows(vdb, embedded)
     return len(embedded)
 

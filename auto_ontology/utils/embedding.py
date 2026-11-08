@@ -515,6 +515,25 @@ def embed_rows_into_vdb(
     """
     if not rows:
         return 0
+    for row in rows:
+        metadata = row.get("metadata") or {}
+        if getattr(vdb, "global_pql", False):
+            from auto_ontology.vdb.records import validate_global_pql_metadata
+
+            validate_global_pql_metadata(metadata)
+        else:
+            if metadata.get("label") == "PqlAnalysis":
+                raise ValueError(
+                    "invalid_global_pql: use the explicit global PQL client"
+                )
+            for key in ("connection_id", "id"):
+                if not isinstance(metadata.get(key), str) or not metadata[key].strip():
+                    raise ValueError(f"source_required: embedded row requires {key}")
+            bound = getattr(vdb, "connection_id", None)
+            if bound is not None and metadata["connection_id"] != bound:
+                raise ValueError(
+                    "source_conflict: connection_id differs from bound source"
+                )
     before = time.time()
     embedded = embed_rows(rows, params, what=what)
     written = write_embedded_rows(vdb, embedded)
@@ -534,6 +553,8 @@ def embed_docs_into_vdb(
     embed_params: EmbedParams,
     vdb: "PostgresVDB",
     database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> int:
     """Embed *docs* and upsert them into *vdb*.
 
@@ -553,6 +574,13 @@ def embed_docs_into_vdb(
 
     rows = []
     for item in docs:
+        row_connection_id = item.get("connection_id")
+        if not row_connection_id or (
+            connection_id is not None and row_connection_id != connection_id
+        ):
+            raise ValueError(
+                "Embedding docs require a matching validated connection_id"
+            )
         node_id = item.get("id")
         path = (
             f"auto_ontology:{node_id}"
@@ -565,6 +593,7 @@ def embed_docs_into_vdb(
             "name": item.get("name", ""),
             "source_path": path,
             "database_name": database_name,
+            "connection_id": row_connection_id,
             "source": item.get("source", ""),
         }
         rows.append(

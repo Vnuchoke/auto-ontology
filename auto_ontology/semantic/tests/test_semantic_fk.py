@@ -12,9 +12,19 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from auto_ontology.connectors.sources import SourceDescriptor
+
 from auto_ontology.semantic import semantic_fk
 from auto_ontology.semantic.embed import _build_rows
 from auto_ontology.semantic.models import SemanticFkJoinDefaultSelection
+
+
+@pytest.fixture(autouse=True)
+def active_source(monkeypatch):
+    monkeypatch.setattr(
+        "auto_ontology.connectors.sources.list_active_sources",
+        lambda: [SourceDescriptor("database", "Test", "sales", "postgres", "managed")],
+    )
 
 
 def _hit(
@@ -29,6 +39,7 @@ def _hit(
     return {
         "metadata": {
             "id": attr_id,
+            "connection_id": "database",
             "table_id": table_id,
             "table_name": table_name,
             "schema_name": schema_name,
@@ -148,8 +159,10 @@ def test_column_attribute_embedding_includes_physical_table() -> None:
                 "table_id": "table-1",
                 "table_name": "tags",
                 "is_unique": True,
+                "connection_id": "source-1",
             }
         ],
+        connection_id="source-1",
     )
 
     assert rows[0]["metadata"]["table_id"] == "table-1"
@@ -479,6 +492,10 @@ def test_missing_llm_uses_deterministic_default() -> None:
 
 def test_resolution_always_normalizes_join_defaults() -> None:
     with (
+        patch(
+            "auto_ontology.semantic.semantic_fk.prune_disjoint_semantic_fks",
+            return_value=0,
+        ),
         patch(
             "auto_ontology.semantic.semantic_fk._resolve_semantic_fks",
             return_value=3,

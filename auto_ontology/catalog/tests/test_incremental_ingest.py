@@ -104,11 +104,21 @@ def _ingest(database_name: str, *, deny: str | None = None) -> None:
     from auto_ontology.catalog import ingest_catalog
     from auto_ontology.catalog.table_filter import from_connection
     from auto_ontology.connectors.registry import create_connector
+    from auto_ontology.catalog.constants import Labels
+    from auto_ontology.catalog.store.rows import upsert_row
+
+    connection_id = f"test-root-{database_name}"
+    upsert_row(
+        Labels.DB,
+        {"id": connection_id},
+        {"id": connection_id, "name": database_name, "display_label": database_name},
+    )
 
     connector = create_connector(
         _pg_dsn(database_name),
         table_filter=from_connection({"table_deny_regex": deny} if deny else None),
     )
+    connector.connection_id = connection_id
     try:
         ingest_catalog(connector)
     finally:

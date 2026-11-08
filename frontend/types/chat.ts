@@ -14,6 +14,8 @@ export type ChatMessage = {
 
 export type ChatRequest = {
 	question: string;
+	connection_id?: string | null;
+	connection_label?: string | null;
 	/**
 	 * Stable thread UUID. When supplied, prior completed turns are loaded and
 	 * the new turn — including the chart/table bubble, once ready — is
@@ -60,6 +62,7 @@ export type SqlResult = string[] | { [key: string]: string }[];
 export type ResultEvent = {
 	type: 'result';
 	answer: {
+		source?: SourceDescriptor;
 		response: string;
 		sql_code?: string;
 		sql_response_from_db?: SqlResult;
@@ -70,6 +73,19 @@ export type ResultEvent = {
 export type ErrorEvent = {
 	type: 'error';
 	message: string;
+	code?: string;
+	status?: number;
+};
+
+export type SourceDescriptor = {
+	connection_id: string;
+	display_label: string;
+	database_name: string;
+};
+
+export type SourceEvent = {
+	type: 'source';
+	source: SourceDescriptor;
 };
 
 /**
@@ -85,7 +101,13 @@ export type ChartsEvent = {
 	sql_response?: string | null;
 };
 
-export type ChatStreamEvent = StepEvent | SqlEvent | ResultEvent | ErrorEvent | ChartsEvent;
+export type ChatStreamEvent =
+	| StepEvent
+	| SqlEvent
+	| ResultEvent
+	| ErrorEvent
+	| ChartsEvent
+	| SourceEvent;
 
 export type GraphStep = {
 	node: string;
@@ -96,6 +118,7 @@ export type GraphStep = {
 
 export type Conversation = {
 	id: string;
+	connectionId: string | null;
 	title: string;
 	messages: ChatMessage[];
 	createdAt: number;

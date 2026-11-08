@@ -8,12 +8,18 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { cancelChat, streamChat, watchChat } from '@/api/chat';
 import { conversationsApi, toConversation } from '@/api/conversations';
 import { GENERIC_ANSWER_ERROR, buildSqlAnswerMessage, isResultMessage } from '@/lib/answerMessages';
-import type { ChartsEvent, ChatMessage, GraphStep, ResultEvent, StepEvent } from '@/types/chat';
+import type {
+	ChartsEvent,
+	ChatMessage,
+	ErrorEvent,
+	GraphStep,
+	ResultEvent,
+	SourceDescriptor,
+	StepEvent,
+} from '@/types/chat';
 
 let nextId = 0;
 const uid = () => `msg-${Date.now()}-${nextId++}`;
-
-const CONVERSATION_IN_PROGRESS = 'Conversation in progress';
 
 const REFETCH_DELAY_MS = 1000;
 const REFETCH_ATTEMPTS = 3;
@@ -54,6 +60,9 @@ const applyStepEvent = (prev: GraphStep[], event: StepEvent): GraphStep[] => {
 
 export const useChat = () => {
 	const [messages, setMessages] = useState<ChatMessage[]>([]);
+	const [source, setSource] = useState<SourceDescriptor | null>(null);
+	const [error, setError] = useState<ErrorEvent | null>(null);
+	const pendingAcceptanceRef = useRef<((accepted: boolean) => void) | null>(null);
 	const [steps, setSteps] = useState<GraphStep[]>([]);
 	// The validated query the running agent is executing, rendered inside the
 	// thinking bubble so the user can read it while it runs instead of only
@@ -151,14 +160,30 @@ export const useChat = () => {
 	// result have no Message 2 at all, and simply run out of attempts with the
 	// transcript already up to date.
 	const pollForPersistedAssistant = useCallback(
-		async (conversationId: string, watchController: AbortController) => {
+		async (conversationId: string, watchController: AbortController, requestId: number) => {
 			for (let attempt = 0; attempt < REFETCH_ATTEMPTS; attempt += 1) {
-				if (watchController.signal.aborted || controllerRef.current) return;
+				if (
+					watchController.signal.aborted ||
+					controllerRef.current ||
+					requestId !== requestIdRef.current
+				)
+					return;
 				await sleep(REFETCH_DELAY_MS);
-				if (watchController.signal.aborted || controllerRef.current) return;
+				if (
+					watchController.signal.aborted ||
+					controllerRef.current ||
+					requestId !== requestIdRef.current
+				)
+					return;
 
 				try {
 					const detail = await conversationsApi.get(conversationId);
+					if (
+						watchController.signal.aborted ||
+						controllerRef.current ||
+						requestId !== requestIdRef.current
+					)
+						return;
 					const conv = toConversation(detail);
 					const last = conv.messages[conv.messages.length - 1];
 					if (last?.role !== 'assistant') continue;
@@ -175,6 +200,9 @@ export const useChat = () => {
 
 	useEffect(
 		() => () => {
+			requestIdRef.current += 1;
+			pendingAcceptanceRef.current?.(false);
+			pendingAcceptanceRef.current = null;
 			controllerRef.current?.abort();
 			controllerRef.current = null;
 			resumeControllerRef.current?.abort();
@@ -189,6 +217,8 @@ export const useChat = () => {
 	// would leave the next question rejected with 409.
 	const stopGeneration = useCallback((cancel = true) => {
 		requestIdRef.current += 1;
+		pendingAcceptanceRef.current?.(false);
+		pendingAcceptanceRef.current = null;
 		controllerRef.current?.abort();
 		controllerRef.current = null;
 		resumeControllerRef.current?.abort();
@@ -218,7 +248,7 @@ export const useChat = () => {
 	// nothing is running, `watchChat` closes immediately with no events and
 	// this is a silent no-op — no loading flash, no stray messages.
 	const resumeIfRunning = useCallback(
-		(conversationId: string) => {
+		(conversationId: string, expectedConnectionId?: string | null) => {
 			// Never disturb an active local send.
 			if (controllerRef.current) return;
 
@@ -231,7 +261,13 @@ export const useChat = () => {
 			let sawActivity = false;
 
 			const controller = watchChat(conversationId, {
+				expectedConnectionId,
+				onSource(event) {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
+					setSource(event.source);
+				},
 				onStep(event) {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 					sawActivity = true;
 					activeRunConvIdRef.current = conversationId;
 					setIsLoading(true);
@@ -242,6 +278,7 @@ export const useChat = () => {
 				// tab that reattaches mid-run catches up to whatever SQL the
 				// agent is on right now, exactly like one that watched all along.
 				onSql(event) {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 					updateLiveSql(event.sql);
 				},
 
@@ -261,6 +298,8 @@ export const useChat = () => {
 				// about to rebuild from the live buffer: drop them first so it
 				// doesn't land on top as a duplicate.
 				onResult(event) {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
+					if (event.answer.source) setSource(event.answer.source);
 					setMessages((prev) => {
 						let cut = prev.length;
 						while (cut > 0 && prev[cut - 1].role === 'assistant') cut -= 1;
@@ -288,6 +327,7 @@ export const useChat = () => {
 				},
 
 				onCharts(event) {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 					appendChartsMessage(event, requestId);
 					if (requestId === requestIdRef.current) {
 						setSteps((prev) =>
@@ -302,21 +342,21 @@ export const useChat = () => {
 				},
 
 				onError(event) {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 					if (resumeControllerRef.current === controller) {
 						activeRunConvIdRef.current = null;
 						resumeControllerRef.current = null;
 					}
-					if (!sawActivity) {
+					if (!sawActivity && !event.code) {
 						// The watch connection itself failed before we ever confirmed
 						// a run was in progress — likely a network blip while probing
 						// an idle conversation. Stay silent rather than injecting an
 						// error bubble for something that may never have been running.
 						return;
 					}
-					if (requestId !== requestIdRef.current) {
-						return;
-					}
+					sawActivity = true;
 					const message = event.message.trim() || GENERIC_ANSWER_ERROR;
+					setError(event);
 					// Keep the query that failed attached to the error bubble —
 					// the backend persists it the same way, so a reload shows the
 					// same thing.
@@ -327,6 +367,7 @@ export const useChat = () => {
 				},
 
 				onDone() {
+					if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 					if (resumeControllerRef.current === controller) {
 						activeRunConvIdRef.current = null;
 						resumeControllerRef.current = null;
@@ -352,7 +393,7 @@ export const useChat = () => {
 					// row yet — poll briefly before giving up.
 					const last = messagesRef.current[messagesRef.current.length - 1];
 					if (last?.role === 'user') {
-						void pollForPersistedAssistant(conversationId, controller);
+						void pollForPersistedAssistant(conversationId, controller, requestId);
 					}
 				},
 			});
@@ -373,12 +414,21 @@ export const useChat = () => {
 	// refused before the stream started — the caller uses that to decide
 	// whether the typed text can be discarded.
 	const sendMessage = useCallback(
-		async (text: string, conversationId: string | null): Promise<boolean> => {
+		async (
+			text: string,
+			conversationId: string | null,
+			connectionId?: string,
+		): Promise<boolean> => {
 			// A background resume may still be tailing this conversation (its
 			// `isLoading` only flips on the first step, so the input isn't locked).
 			// Drop it — this send supersedes it.
 			resumeControllerRef.current?.abort();
 			resumeControllerRef.current = null;
+			controllerRef.current?.abort();
+			controllerRef.current = null;
+			pendingAcceptanceRef.current?.(false);
+			pendingAcceptanceRef.current = null;
+			setError(null);
 
 			const userMsg: ChatMessage = {
 				id: uid(),
@@ -399,6 +449,7 @@ export const useChat = () => {
 			activeRunConvIdRef.current = conversationId;
 
 			const finishRun = () => {
+				if (requestId !== requestIdRef.current) return;
 				setSteps((prev) => prev.map((s) => ({ ...s, status: 'completed' as const })));
 				setIsLoading(false);
 				activeRunConvIdRef.current = null;
@@ -410,28 +461,45 @@ export const useChat = () => {
 			// looking like it never sent).
 			const pendingCancel = cancelInFlightRef.current;
 			if (pendingCancel) await pendingCancel;
+			if (requestId !== requestIdRef.current) return false;
 
 			let settle: (accepted: boolean) => void = () => {};
 			const accepted = new Promise<boolean>((resolve) => {
 				settle = resolve;
+				pendingAcceptanceRef.current = resolve;
 			});
+			let started = false;
 
 			const controller = streamChat(
-				{ question: text, conversationId },
+				{ question: text, conversationId, connection_id: connectionId },
 				{
+					onSource(event) {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) return;
+						setSource(event.source);
+					},
 					onStart() {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) {
+							settle(false);
+							return;
+						}
+						started = true;
+						pendingAcceptanceRef.current = null;
 						settle(true);
 					},
 
 					onStep(event) {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 						setSteps((prev) => applyStepEvent(prev, event));
 					},
 
 					onSql(event) {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 						updateLiveSql(event.sql);
 					},
 
 					onResult(event) {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) return;
+						if (event.answer.source) setSource(event.answer.source);
 						appendSqlAnswerMessage(event.answer);
 						// The answer bubble owns the SQL from here on.
 						updateLiveSql(null);
@@ -457,6 +525,7 @@ export const useChat = () => {
 					},
 
 					onCharts(event) {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 						appendChartsMessage(event, requestId);
 						if (requestId === requestIdRef.current) finishRun();
 					},
@@ -467,21 +536,25 @@ export const useChat = () => {
 					// chart step then failed to produce one — without this, the UI
 					// would be stuck on "Building charts" forever.
 					onDone() {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) return;
 						if (requestId === requestIdRef.current) finishRun();
 					},
 
 					onError(event) {
+						if (requestId !== requestIdRef.current || controller.signal.aborted) {
+							settle(false);
+							return;
+						}
+						setError(event);
 						const message = event.message.trim() || GENERIC_ANSWER_ERROR;
 						finishRun();
 
-						// Another stream already owns this conversation (a second tab,
-						// or a run we stopped watching but couldn't cancel). Nothing
-						// was submitted, so roll back the optimistic user turn, keep
-						// the question in the input, and attach to the live run.
-						if (message === CONVERSATION_IN_PROGRESS && conversationId) {
+						// A pre-stream rejection did not accept the turn; keep the
+						// structured error but roll back its optimistic history entry.
+						if (!started) {
 							setMessages((prev) => prev.filter((m) => m.id !== userMsg.id));
+							pendingAcceptanceRef.current = null;
 							settle(false);
-							resumeIfRunning(conversationId);
 							return;
 						}
 
@@ -499,13 +572,7 @@ export const useChat = () => {
 			controllerRef.current = controller;
 			return accepted;
 		},
-		[
-			appendAssistantMessage,
-			appendSqlAnswerMessage,
-			appendChartsMessage,
-			resumeIfRunning,
-			updateLiveSql,
-		],
+		[appendAssistantMessage, appendSqlAnswerMessage, appendChartsMessage, updateLiveSql],
 	);
 
 	// Leaves the run alone server-side: it keeps streaming into the buffer and
@@ -513,11 +580,15 @@ export const useChat = () => {
 	const clearConversation = useCallback(() => {
 		stopGeneration(false);
 		setMessages([]);
+		setSource(null);
+		setError(null);
 		setSteps([]);
 		updateLiveSql(null);
 	}, [stopGeneration, updateLiveSql]);
 
 	return {
+		source,
+		error,
 		messages,
 		setMessages,
 		steps,

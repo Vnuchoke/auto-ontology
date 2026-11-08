@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+from auto_ontology.connectors.sources import list_active_sources
 from auto_ontology.ingestion_service.history import (
     get_last_failure_if_most_recent,
     get_last_successful_run,
@@ -71,32 +73,59 @@ async def liveness() -> dict[str, str]:
     return {"status": "ok"}
 
 
+class IngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_id: str = Field(strict=True, pattern=r"\S")
+
+
 @router.post("/ingest", status_code=202, response_model=StatusResponse)
-async def ingest_connection(connection: dict[str, Any] = Body(...)) -> dict[str, str]:
-    """Trigger a non-blocking ingest for a single connection."""
-    trigger_ingest(connection)
+async def ingest_connection(connection: IngestRequest) -> dict[str, str]:
+    """Queue one active source by opaque ID; no credentials or physical-name routing.
+
+    Validate metadata before queueing work or opening drivers/models. Unknown
+    or inactive IDs return 404, malformed selectors return 422.
+    """
+    if not any(
+        source.connection_id == connection.connection_id
+        for source in list_active_sources()
+    ):
+        raise HTTPException(status_code=404, detail="source_unavailable")
+    trigger_ingest(connection.connection_id)
     return {"status": "accepted"}
 
 
 @router.post("/ingest/delete", status_code=202, response_model=StatusResponse)
-async def ingest_delete(database_name: str) -> dict[str, str]:
-    """Trigger a non-blocking reset of a database's ingested data.
+async def ingest_delete(
+    connection: Annotated[IngestRequest, Query()],
+) -> dict[str, str]:
+    """Queue final cleanup of one retired source by required opaque connection ID.
 
-    ``database_name`` is required: this endpoint always targets one database.
+    No active-source or credential lookup is performed. Unknown IDs are allowed
+    for idempotent cleanup after root removal; physical-name selectors are rejected.
+    A 202 acknowledges queueing, not successful cleanup.
     """
-    trigger_delete_ingest(database_name)
+    trigger_delete_ingest(connection.connection_id)
     return {"status": "accepted"}
+
+
+class SemanticResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_id: str | None = Field(default=None, strict=True, pattern=r"\S")
 
 
 @router.post("/semantic/reset", status_code=202, response_model=StatusResponse)
 async def semantic_reset(
-    request: Request, database_name: str | None = None
+    request: Request, scope: Annotated[SemanticResetRequest, Query()]
 ) -> dict[str, str]:
-    """Trigger a non-blocking reset of a database's semantic layer.
+    """Queue a semantic reset by opaque connection ID, or all sources if omitted.
 
     Deletes the semantic nodes and embeddings, then asks for a compilation pass
     so the layer is rebuilt without waiting for the scheduler's next run.
-    Omitting ``database_name`` resets every database.
+    Global PQL vocabulary is preserved. Legacy physical-name selectors are
+    rejected rather than silently causing a global reset. A 202 only acknowledges
+    queueing, not successful deletion or rebuild.
 
     The three steps are strictly ordered — stop the running pass, wait for it to
     stop, delete, then rebuild — and run as a background task, so this returns
@@ -106,7 +135,7 @@ async def semantic_reset(
     Term and compiled nothing, while a pass still running during the delete kept
     writing Terms it had already swept past.
     """
-    trigger_reset_semantic(request.app.state.semantic_scheduler, database_name)
+    trigger_reset_semantic(request.app.state.semantic_scheduler, scope.connection_id)
     return {"status": "accepted"}
 
 

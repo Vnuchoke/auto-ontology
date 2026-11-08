@@ -160,6 +160,10 @@ class Schema:
     def get_database_name(self):
         return self.db_node.get_name()
 
+    def get_connection_id(self) -> str:
+        """Registered source identity; database names remain SQL/display context."""
+        return self.db_node.get_id()
+
     def get_table_nodes(self):
         if self.tables_df is not None:
             return self.tables_df.to_dict(orient="records")
@@ -442,7 +446,7 @@ class Schema:
             self.schema_name = schema_name
             props = {"name": schema_name}
             match_props = {
-                "database_name": self.get_database_name(),
+                "connection_id": self.get_connection_id(),
                 "name": schema_name,
             }
             self.schema_node = CatalogNode(

@@ -200,6 +200,11 @@ def agent_wrapper(agent: BaseAgent):
         This function is called by LangGraph for each agent node.
         It provides error handling and logging around the agent's execute method.
         """
+        connection_id = state.get("connection_id")
+        source = dict(state.get("source") or {})
+        if connection_id:
+            state.setdefault("path_state", {})["connection_id"] = connection_id
+            state["path_state"]["target_db"] = source["database_name"]
         # Validate input
         if not agent.validate_input(state):
             message = f"Input validation failed for {agent.agent_name}"
@@ -228,6 +233,13 @@ def agent_wrapper(agent: BaseAgent):
                 raise AgentExecutionError(
                     f"Agent {agent.agent_name} returned non-dict result: {result}"
                 )
+
+            if connection_id:
+                result.pop("connection_id", None)
+                result.pop("source", None)
+                result.pop("connectors", None)
+                result.setdefault("path_state", {})["connection_id"] = connection_id
+                result["path_state"]["target_db"] = source["database_name"]
 
             # Log execution end
             agent.log_execution_end(state, result)

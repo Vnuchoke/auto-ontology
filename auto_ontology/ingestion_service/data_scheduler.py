@@ -7,6 +7,8 @@
 Runs :func:`run_ingest` for every configured connection once at startup, then
 again every 24h measured from the end of the previous run. Connections are
 reloaded on every pass so newly added ones are picked up without a restart.
+Discovery reads active source metadata only; each connector is selected by its
+opaque connection ID, even when multiple sources share a physical SQL name.
 
 A pass also replays the tagging rules, but only when semantic compilation is
 switched off — with it on, the semantic pass is the better moment and does it
@@ -21,10 +23,11 @@ import time
 from datetime import timedelta
 
 from auto_ontology.connectors.registry import (
-    get_connectors,
+    get_connector,
     invalidate_connectors_cache,
 )
 from auto_ontology.ingestion_service.config import is_semantic_compilation_enabled
+from auto_ontology.ingestion_service.connections import resolve_connection_ids
 from auto_ontology.ingestion_service.ingest import run_ingest
 from auto_ontology.ingestion_service.rules import replay_rules_in_thread
 from auto_ontology.ingestion_service.scheduler import IntervalScheduler
@@ -46,12 +49,11 @@ class DataScheduler(IntervalScheduler):
 
     async def _run_once(self) -> None:
         # Reload connectors each pass so newly added connections are picked up
-        # without a restart. get_connectors caches, so invalidate first; the
-        # returned connectors carry each connection's schema allowlist and are
-        # owned by the cache (run_ingest must not close them).
+        # without a restart. Cache-owned connectors are opened one at a time,
+        # inside the failure boundary, so a broken source cannot hide its peers.
         invalidate_connectors_cache()
-        connectors = get_connectors()
-        if not connectors:
+        connection_ids = resolve_connection_ids()
+        if not connection_ids:
             logger.info(
                 "ingest: no connections configured. "
                 "Add a connection in Settings → Connections or set "
@@ -59,17 +61,17 @@ class DataScheduler(IntervalScheduler):
             )
             return
 
-        logger.info("ingest: starting (%s connection(s))", len(connectors))
+        logger.info("ingest: starting (%s connection(s))", len(connection_ids))
         started = time.monotonic()
         succeeded = failed = 0
-        for connector in connectors:
-            database_name = getattr(connector, "database_name", "?")
+        for connection_id in connection_ids:
             try:
+                connector = get_connector(connection_id)
                 await asyncio.to_thread(run_ingest, connector)
                 succeeded += 1
             except Exception:
                 failed += 1
-                logger.exception("ingest: failed for connection %s", database_name)
+                logger.exception("ingest: failed for connection %s", connection_id)
 
         # Rules are replayed at the end of the *semantic* pass when compilation
         # is on, because a rule labels both layers and the end of that pass is
@@ -91,7 +93,7 @@ class DataScheduler(IntervalScheduler):
                 "ingest: finished with errors — %d of %d connection(s) succeeded, "
                 "%d failed in %.1fs",
                 succeeded,
-                len(connectors),
+                len(connection_ids),
                 failed,
                 elapsed,
             )

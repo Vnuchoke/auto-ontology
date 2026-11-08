@@ -4,8 +4,11 @@
 
 import { withPermission } from '@/auth/with-auth';
 import { proxyToBackend } from '@/auth/proxy-backend';
+import { resolveSubjectToken } from '@/auth/sso-token';
 
 // Grade how well the semantic layer covers the entities in a free-text
 // question. Same retrieval capability as chat, so it is gated on
 // `chat: ['use']`.
-export const POST = withPermission({ chat: ['use'] })((req) => proxyToBackend(req));
+export const POST = withPermission({ chat: ['use'] })(async (req, { user }) =>
+	proxyToBackend(req, { subjectToken: await resolveSubjectToken(req.headers, user.id) }),
+);

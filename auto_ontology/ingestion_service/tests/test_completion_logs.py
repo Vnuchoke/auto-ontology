@@ -30,6 +30,7 @@ from auto_ontology.ingestion_service.semantic_scheduler import SemanticScheduler
 class _Connector:
     def __init__(self, name: str) -> None:
         self.database_name = name
+        self.connection_id = name
 
 
 def _messages(caplog: pytest.LogCaptureFixture) -> str:
@@ -71,7 +72,7 @@ def _stub_ingest(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod, "ingest_catalog", lambda c: ([1, 2, 3], [1, 2]))
     monkeypatch.setattr(mod, "is_pii_detection_enabled", lambda: True)
     monkeypatch.setattr(mod, "detect_and_tag_pii", lambda columns: None)
-    monkeypatch.setattr(mod, "run_pii_propagation", lambda label: None)
+    monkeypatch.setattr(mod, "run_pii_propagation", lambda label, **kw: None)
     monkeypatch.setattr(mod, "CatalogEmbeddingRowsOp", lambda **kw: lambda pair: pair)
     monkeypatch.setattr(
         mod, "batch_embed_chunks", lambda rows, params, label="": iter(())
@@ -144,7 +145,8 @@ def test_run_ingest_tags_persisted_columns_before_embedding(
 
         return build
 
-    def propagate(_label: str) -> None:
+    def propagate(_label: str, *, connection_id: str) -> None:
+        assert connection_id == "pagila"
         order.append("propagate")
 
     monkeypatch.setattr(mod, "ingest_catalog", ingest)
@@ -168,7 +170,11 @@ def test_detection_failure_still_propagates_pii_to_attributes(
         raise RuntimeError("classifier unavailable")
 
     monkeypatch.setattr(mod, "detect_and_tag_pii", fail)
-    monkeypatch.setattr(mod, "run_pii_propagation", propagated.append)
+    monkeypatch.setattr(
+        mod,
+        "run_pii_propagation",
+        lambda label, **kw: propagated.append(kw["connection_id"]),
+    )
 
     mod.run_ingest(_Connector("pagila"))
 
@@ -180,13 +186,13 @@ def test_propagation_failure_is_contained(
 ) -> None:
     import auto_ontology.ingestion_service.pii as pii_mod
 
-    def boom() -> None:
+    def boom(**kwargs: Any) -> None:
         raise RuntimeError("db down")
 
     monkeypatch.setattr(pii_mod, "propagate_pii_to_attributes", boom)
 
     with caplog.at_level(logging.INFO):
-        pii_mod.run_pii_propagation("ingest")
+        pii_mod.run_pii_propagation("ingest", connection_id="pagila")
 
     assert "could not propagate PII tags to attributes" in _messages(caplog)
 
@@ -204,7 +210,7 @@ def test_run_ingest_skips_pii_when_disabled(
         mod, "detect_and_tag_pii", lambda _columns: pii_runs.append("detect")
     )
     monkeypatch.setattr(
-        mod, "run_pii_propagation", lambda _label: pii_runs.append("propagate")
+        mod, "run_pii_propagation", lambda _label, **kw: pii_runs.append("propagate")
     )
 
     with caplog.at_level(logging.INFO):
@@ -250,14 +256,14 @@ def test_trigger_ingest_re_applies_the_rules(
     import auto_ontology.ingestion_service.ingest as mod
 
     monkeypatch.setattr(mod, "invalidate_connectors_cache", lambda: None)
-    monkeypatch.setattr(mod, "get_connectors", lambda: [_Connector("pagila")])
+    monkeypatch.setattr(mod, "get_connector", lambda cid: _Connector(cid))
     pii_runs: list[bool] = []
     monkeypatch.setattr(
         mod, "detect_and_tag_pii", lambda _columns: pii_runs.append(True)
     )
     ran = _stub_rules(monkeypatch)
 
-    mod.trigger_ingest({"database": "pagila"})
+    mod.trigger_ingest("pagila")
     for thread in threading.enumerate():
         if thread.name == "ingest-pagila":
             thread.join(timeout=10)
@@ -281,7 +287,14 @@ def _patch_data_scheduler(
     import auto_ontology.ingestion_service.data_scheduler as mod
 
     monkeypatch.setattr(mod, "invalidate_connectors_cache", lambda: None)
-    monkeypatch.setattr(mod, "get_connectors", lambda: connectors)
+    monkeypatch.setattr(
+        mod, "resolve_connection_ids", lambda: [c.connection_id for c in connectors]
+    )
+    monkeypatch.setattr(
+        mod,
+        "get_connector",
+        lambda cid: next(c for c in connectors if c.connection_id == cid),
+    )
     monkeypatch.setattr(mod, "run_ingest", run)
     monkeypatch.setattr(
         mod, "is_semantic_compilation_enabled", lambda: semantic_enabled
@@ -407,10 +420,10 @@ def _patch_semantic_scheduler(
     import auto_ontology.ingestion_service.semantic_scheduler as mod
 
     monkeypatch.setattr(mod, "is_semantic_compilation_enabled", lambda: True)
-    monkeypatch.setattr(mod, "resolve_database_names", lambda: databases)
+    monkeypatch.setattr(mod, "resolve_connection_ids", lambda: databases)
     monkeypatch.setattr(mod, "run_semantic_compilation", run)
 
-    async def _record_propagation(_label: str) -> None:
+    async def _record_propagation(_label: str, *, connection_id: str) -> None:
         _PROPAGATED.append(True)
 
     _PROPAGATED.clear()

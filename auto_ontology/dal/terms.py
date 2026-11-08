@@ -29,6 +29,7 @@ import logging
 from typing import Any
 
 from sqlalchemy import (
+    Select,
     String,
     and_,
     bindparam,
@@ -39,12 +40,18 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.sql.selectable import Subquery
 
 from auto_ontology.catalog.constants import Edges, Labels
 from auto_ontology.dal import schema as s
-from auto_ontology.dal.attributes import fetch_column_attribute_columns_map
+from auto_ontology.dal.attributes import (
+    _column_path_dict,
+    _column_path_select,
+    fetch_column_attribute_columns_map,
+)
 from auto_ontology.dal.datasources import fetch_col_table_contexts
 from auto_ontology.dal.session import store, write_transaction
+from auto_ontology.dal.source_scope import definition_source_scope, query_source_scope
 from auto_ontology.dal.tags import TARGET_COLUMN_ATTRIBUTE, TARGET_TERM, fetch_tags_map
 from auto_ontology.dal.users import resolve_accessible_catalog_ids
 from auto_ontology.dal.zones import fetch_table_zones_map, zone_covers_table
@@ -128,6 +135,7 @@ def _semantic_terms(
     data_ids_by_zone: dict[str, set[str]] | None = None,
     *,
     term_id: str | None = None,
+    connection_id: str | None = None,
 ):
     """The predicate list every read of the visible Term set applies.
 
@@ -136,7 +144,11 @@ def _semantic_terms(
     ``term_is_in_scope`` must answer for one id whatever those two would answer
     for the whole set. All three take their filter from here.
     """
-    conditions = [s.term.c.source == SEMANTIC_SOURCE, _represented()]
+    membership = _represented()
+    if connection_id is not None:
+        links = _term_projection_links(connection_id)
+        membership = s.term.c.id.in_(select(links.c.term_id))
+    conditions = [s.term.c.source == SEMANTIC_SOURCE, membership]
     scope = _in_scope(_scope_table_ids(zone_ids, data_ids_by_zone))
     if scope is not None:
         conditions.append(scope)
@@ -153,7 +165,9 @@ def _semantic_terms(
     return conditions
 
 
-def _certification(table_ids: list[str] | None):
+def _certification(
+    table_ids: list[str] | None, *, connection_id: str | None = None
+) -> Any:
     """A Term's aggregate certification: ``certified``, ``partial`` or ``pending``.
 
     The single definition of the rollup — the list cards, the detail page and
@@ -212,6 +226,23 @@ def _certification(table_ids: list[str] | None):
             )
             .correlate(s.sql_attribute)
             .exists()
+        )
+
+    if connection_id is not None:
+        owned = s.column_attribute.c.id.in_(
+            _projection_attributes(connection_id)
+            .with_only_columns(s.column_attribute.c.id)
+            .order_by(None)
+            .correlate(None)
+        )
+        source_sql = definition_source_scope(
+            s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+        )
+        column_visible = (
+            and_(column_visible, owned) if column_visible is not None else owned
+        )
+        sql_visible = (
+            and_(sql_visible, source_sql) if sql_visible is not None else source_sql
         )
 
     column_total, column_certified = counts(
@@ -283,13 +314,15 @@ def term_is_in_scope(
     return bool(rows)
 
 
-def semantic_layer_calculated() -> bool:
-    """Has the semantic layer been built at all?"""
-    return bool(
-        store().query_read(
-            select(s.term.c.id).where(s.term.c.source == SEMANTIC_SOURCE).limit(1)
-        )
-    )
+def semantic_layer_calculated(*, connection_id: str | None = None) -> bool:
+    """Probe semantic readiness; no CID retains the administrative global status."""
+    statement = select(s.term.c.id).where(s.term.c.source == SEMANTIC_SOURCE)
+    if connection_id is not None:
+        if not connection_id.strip():
+            return False
+        links = _term_projection_links(connection_id)
+        statement = statement.where(s.term.c.id.in_(select(links.c.term_id)))
+    return bool(store().query_read(statement.limit(1)))
 
 
 def get_term_record_for_table(table_id: str) -> dict[str, str] | None:
@@ -516,7 +549,9 @@ def upsert_table_term(
     raise RuntimeError(f"Could not allocate a private Term name for table {table_id}")
 
 
-def fetch_term_synonyms(attr_ids: list[str]) -> dict[str, list[str]]:
+def fetch_term_synonyms(
+    attr_ids: list[str], *, connection_id: str | None = None
+) -> dict[str, list[str]]:
     """``{term_name: [synonym, ...]}`` for the terms behind these attributes.
 
     Keyed by *name*, not id, because the caller matches synonyms against text.
@@ -536,6 +571,21 @@ def fetch_term_synonyms(attr_ids: list[str]) -> dict[str, list[str]]:
                 s.column_attribute__term.c.attribute_id.in_(list(attr_ids)),
                 s.term.c.synonyms.isnot(None),
                 func.array_length(s.term.c.synonyms, 1) > 0,
+                *(
+                    [
+                        s.column_attribute__term.c.attribute_id.in_(
+                            select(s.column_attribute.c.id)
+                            .join(
+                                s.catalog_table,
+                                s.catalog_table.c.id == s.column_attribute.c.table_id,
+                            )
+                            .join(s.catalog_schema)
+                            .where(s.catalog_schema.c.database_id == connection_id)
+                        )
+                    ]
+                    if connection_id is not None
+                    else []
+                ),
             )
             .distinct()
         )
@@ -563,6 +613,7 @@ def fetch_all_terms(
     *,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """The glossary, paged.
 
@@ -580,6 +631,52 @@ def fetch_all_terms(
     same-named terms, without which a page boundary could repeat one and skip
     another. Pair with ``count_terms`` for the total.
     """
+    if connection_id is not None:
+        if not connection_id.strip():
+            return []
+        links = _term_projection_links(connection_id)
+        schema_names = (
+            select(func.array_agg(func.distinct(s.catalog_schema.c.name)))
+            .select_from(
+                links.join(s.catalog_schema, s.catalog_schema.c.id == links.c.schema_id)
+            )
+            .where(links.c.term_id == s.term.c.id)
+            .correlate(s.term)
+            .scalar_subquery()
+        )
+        statement = (
+            select(
+                s.term,
+                literal(connection_id).label("connection_id"),
+                schema_names.label("schema_names"),
+                _certification(
+                    _scope_table_ids(zone_ids, data_ids_by_zone),
+                    connection_id=connection_id,
+                ).label("certification"),
+            )
+            .where(
+                *_semantic_terms(
+                    zone_ids, search, data_ids_by_zone, connection_id=connection_id
+                ),
+            )
+            .order_by(func.lower(s.term.c.name), s.term.c.id)
+            .offset(skip)
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        rows = [
+            {**dict(row), "schema_names": row["schema_names"] or []}
+            for row in store().query_read(statement)
+        ]
+        term_ids = [row["id"] for row in rows]
+        zones_by_term = fetch_term_zones_map(
+            zone_ids, term_ids=term_ids, connection_id=connection_id
+        )
+        tags_by_term = fetch_tags_map(TARGET_TERM, term_ids)
+        for row in rows:
+            row["zones"] = zones_by_term.get(row["id"], [])
+            row["tags"] = tags_by_term.get(row["id"], [])
+        return rows
     table_ids = _scope_table_ids(zone_ids, data_ids_by_zone)
     schema_names = (
         select(func.array_agg(func.distinct(s.catalog_schema.c.name)))
@@ -631,8 +728,19 @@ def count_terms(
     zone_ids: list[str] | None = None,
     search: str | None = None,
     data_ids_by_zone: dict[str, set[str]] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> int:
     """The unpaged size of :func:`fetch_all_terms`, from the same filter."""
+    if connection_id is not None:
+        rows = store().query_read(
+            select(func.count(s.term.c.id).label("total")).where(
+                *_semantic_terms(
+                    zone_ids, search, data_ids_by_zone, connection_id=connection_id
+                ),
+            )
+        )
+        return int(rows[0]["total"]) if rows else 0
     rows = store().query_read(
         select(func.count(func.distinct(s.term.c.id)).label("total")).where(
             *_semantic_terms(zone_ids, search, data_ids_by_zone)
@@ -641,19 +749,73 @@ def count_terms(
     return int(rows[0]["total"]) if rows else 0
 
 
-def fetch_all_terms_and_attributes(
-    zone_ids: list[str] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Every Term and every ColumnAttribute, for a one-shot bulk re-embed.
-
-    Only ``embed_all_semantic_nodes`` wants this. The second scan is global and
-    expensive; callers that need Term rows alone — the ``/terms`` list, the
-    Exploration graph — should call :func:`fetch_all_terms` and skip it.
-    """
-    terms = fetch_all_terms(zone_ids=zone_ids)
-
-    statement = (
+def _term_projection_links(connection_id: str) -> Subquery:
+    """Term/schema membership from owned relations, never dictionary names."""
+    represented = (
+        select(s.table__term.c.term_id, s.catalog_schema.c.id.label("schema_id"))
+        .select_from(s.table__term.join(s.catalog_table).join(s.catalog_schema))
+        .where(s.catalog_schema.c.database_id == connection_id)
+    )
+    columns = (
         select(
+            s.column_attribute__term.c.term_id, s.catalog_schema.c.id.label("schema_id")
+        )
+        .select_from(
+            s.column_attribute__term.join(s.column_attribute)
+            .join(
+                s.catalog_table, s.catalog_table.c.id == s.column_attribute.c.table_id
+            )
+            .join(s.catalog_schema)
+        )
+        .where(
+            s.catalog_schema.c.database_id == connection_id,
+            s.column_attribute.c.source == SEMANTIC_SOURCE,
+        )
+    )
+    sql_scope = definition_source_scope(
+        s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+    )
+    sql_path = s.sql_attribute__term.join(s.sql_attribute)
+    sql_owner = (
+        select(
+            s.sql_attribute__term.c.term_id, literal(None, String).label("schema_id")
+        )
+        .select_from(sql_path)
+        .where(sql_scope)
+    )
+    sql_path = sql_path.join(s.sql_attribute__sql).join(s.sql_query)
+    sql_tables = (
+        select(
+            s.sql_attribute__term.c.term_id, s.catalog_schema.c.id.label("schema_id")
+        )
+        .select_from(
+            sql_path.join(s.sql_query__table)
+            .join(s.catalog_table)
+            .join(s.catalog_schema)
+        )
+        .where(sql_scope, s.catalog_schema.c.database_id == connection_id)
+    )
+    sql_columns = (
+        select(
+            s.sql_attribute__term.c.term_id, s.catalog_schema.c.id.label("schema_id")
+        )
+        .select_from(
+            sql_path.join(s.sql_query__column)
+            .join(s.catalog_column)
+            .join(s.catalog_table)
+            .join(s.catalog_schema)
+        )
+        .where(sql_scope, s.catalog_schema.c.database_id == connection_id)
+    )
+    return represented.union(columns, sql_owner, sql_tables, sql_columns).subquery()
+
+
+def _projection_attributes(connection_id: str) -> Select:
+    """Samples come only from the attribute's owned table in this source."""
+    return (
+        select(
+            s.column_attribute__term.c.term_id,
+            s.catalog_schema.c.database_id.label("connection_id"),
             s.column_attribute.c.name,
             s.column_attribute.c.description,
             s.column_attribute.c.term_name,
@@ -668,7 +830,8 @@ def fetch_all_terms_and_attributes(
             s.column_attribute.c.datatype,
         )
         .select_from(
-            s.column_attribute.join(
+            s.column_attribute__term.join(s.column_attribute)
+            .join(
                 s.column__has_attribute,
                 s.column__has_attribute.c.attribute_id == s.column_attribute.c.id,
             )
@@ -681,18 +844,67 @@ def fetch_all_terms_and_attributes(
                 s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
             )
         )
-        .where(s.column_attribute.c.source == SEMANTIC_SOURCE)
+        .where(
+            s.column_attribute.c.source == SEMANTIC_SOURCE,
+            s.catalog_schema.c.database_id == connection_id,
+            s.column_attribute.c.table_id == s.catalog_table.c.id,
+        )
+        .order_by(s.column_attribute.c.id, s.catalog_column.c.id)
     )
-    table_ids = _scope_table_ids(zone_ids)
-    if table_ids is not None:
-        statement = statement.where(s.catalog_table.c.id.in_(table_ids))
 
-    return terms, [dict(r) for r in store().query_read(statement)]
+
+def fetch_all_terms_and_attributes(
+    *,
+    connection_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Source-scoped embedding input. Global vocabulary inspection uses fetch_all_terms."""
+    if not connection_id:
+        raise ValueError("connection_id is required for semantic projections")
+    links = _term_projection_links(connection_id)
+    term_rows = store().query_read(
+        select(
+            s.term.c.id,
+            s.term.c.name,
+            s.term.c.description,
+            s.term.c.synonyms,
+            s.catalog_schema.c.name.label("schema_name"),
+            s.catalog_database.c.name.label("database_name"),
+        )
+        .select_from(
+            s.term.join(links, links.c.term_id == s.term.c.id)
+            .outerjoin(s.catalog_schema, s.catalog_schema.c.id == links.c.schema_id)
+            .join(s.catalog_database, s.catalog_database.c.id == connection_id)
+        )
+        .where(s.term.c.source == SEMANTIC_SOURCE)
+        .order_by(s.term.c.id, s.catalog_schema.c.name)
+    )
+    projected = {}
+    for row in term_rows:
+        term = projected.setdefault(
+            row["id"],
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "description": row["description"],
+                "synonyms": row["synonyms"] or [],
+                "database_name": row["database_name"],
+                "connection_id": connection_id,
+                "schema_names": [],
+            },
+        )
+        if row["schema_name"] and row["schema_name"] not in term["schema_names"]:
+            term["schema_names"].append(row["schema_name"])
+    attrs = store().query_read(_projection_attributes(connection_id))
+    return list(projected.values()), [
+        dict(r) for r in attrs if r["term_id"] in projected
+    ]
 
 
 def get_full_term_by_id(
     term_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, Any] | None:
     """One Term with its tables, table count, zones and certification.
 
@@ -719,8 +931,11 @@ def get_full_term_by_id(
         s.term.c.modified,
         s.term.c.created_by,
         s.term.c.modified_by,
-        _certification(table_ids).label("certification"),
+        _certification(table_ids, connection_id=connection_id).label("certification"),
     ).where(s.term.c.id == term_id)
+    if connection_id is not None:
+        links = _term_projection_links(connection_id)
+        statement = statement.where(s.term.c.id.in_(select(links.c.term_id)))
     scope = _in_scope(table_ids)
     if scope is not None:
         statement = statement.where(scope)
@@ -749,14 +964,23 @@ def get_full_term_by_id(
                 s.catalog_database.c.id == s.catalog_schema.c.database_id,
             )
         )
-        .where(s.table__term.c.term_id == term_id)
+        .where(
+            s.table__term.c.term_id == term_id,
+            *(
+                [s.catalog_database.c.id == connection_id]
+                if connection_id is not None
+                else []
+            ),
+        )
         .order_by(s.catalog_table.c.id)
     )
     result["tables"] = [dict(r) for r in tables]
     result["table_count"] = len(result["tables"])
-    result["zones"] = fetch_term_zones_map(zone_ids, term_ids=[term_id]).get(
-        term_id, []
-    )
+    result["zones"] = fetch_term_zones_map(
+        zone_ids, term_ids=[term_id], connection_id=connection_id
+    ).get(term_id, [])
+    if connection_id is not None:
+        result["connection_id"] = connection_id
     result["tags"] = fetch_tags_map(TARGET_TERM, [term_id]).get(term_id, [])
     return result
 
@@ -780,6 +1004,8 @@ def _term_zone_rows(path_join, term_filter):
 def fetch_term_zones_map(
     zone_ids: list[str] | None = None,
     term_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """``{term_id: [zone, ...]}``, resolving many terms in one pass.
 
@@ -839,6 +1065,24 @@ def fetch_term_zones_map(
         term_filter.append(s.zone.c.id.in_(list(zone_ids)))
         term_filter.append(s.zone.c.enabled.is_(True))
 
+    if connection_id is not None:
+        term_filter.append(s.catalog_schema.c.database_id == connection_id)
+        column_path = column_path.join(
+            s.column_attribute,
+            and_(
+                s.column_attribute.c.id == s.column_attribute__term.c.attribute_id,
+                s.column_attribute.c.table_id == s.catalog_table.c.id,
+            ),
+        )
+        sql_path = sql_path.join(
+            s.sql_attribute,
+            and_(
+                s.sql_attribute.c.id == s.sql_attribute__term.c.attribute_id,
+                definition_source_scope(
+                    s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+                ),
+            ),
+        )
     rows = store().query_read(
         _term_zone_rows(column_path, term_filter).union(
             _term_zone_rows(sql_path, term_filter)
@@ -864,8 +1108,8 @@ def fetch_term_zones_map(
 # ---------------------------------------------------------------------------
 
 
-def fetch_table_schema_map(database_name: str) -> dict[str, str]:
-    """``{table_name_lower: schema_name}`` for one database.
+def fetch_table_schema_map(connection_id: str) -> dict[str, str]:
+    """``{table_name_lower: schema_name}`` for one connection ID.
 
     The SqlAttribute suggester uses it to qualify bare table names in generated
     SELECTs. Lower-cased keys, and last write wins on a collision — two schemas
@@ -884,7 +1128,7 @@ def fetch_table_schema_map(database_name: str) -> dict[str, str]:
                 s.catalog_database.c.id == s.catalog_schema.c.database_id,
             )
         )
-        .where(s.catalog_database.c.name == database_name)
+        .where(s.catalog_database.c.id == connection_id)
         .order_by(s.catalog_table.c.id)
     )
     return {
@@ -896,7 +1140,8 @@ def fetch_table_schema_map(database_name: str) -> dict[str, str]:
 
 def fetch_terms_with_sqls(
     source: str = SEMANTIC_SOURCE,
-    database_name: str | None = None,
+    *,
+    connection_id: str,
 ) -> list[dict[str, Any]]:
     """Every Term with the **ingestion** SQL of its connected tables.
 
@@ -904,15 +1149,10 @@ def fetch_terms_with_sqls(
     generated semantic SQL cannot feed the next round of suggestions — a
     feedback loop where the suggester learns from itself.
 
-    *source* defaults to ``SEMANTIC_SOURCE`` — matching main's version, which
-    hardcoded it — so callers that never cared about non-semantic terms (the
-    zero-arg call sites/tests) keep working unchanged; it's only a parameter
-    at all because ``sql_attribute_suggester.py`` passes it explicitly.
-
-    Terms with no ingestion query are omitted. When *database_name* is given,
-    only terms whose tables belong to that database are returned — required
-    when compiling one DB at a time so SqlAttribute validation uses a
-    matching catalog.
+    Terms are global vocabulary, but tables and SQL are projected onto the
+    required ``connection_id`` before any prompt is built. Unknown ownership
+    and statements with foreign-source links are excluded in their entirety.
+    Terms with no eligible ingestion query are omitted.
 
     ``props`` is the statement row itself. There are no per-month counters —
     they were measured as unread by anything, and the schema does not carry
@@ -949,17 +1189,14 @@ def fetch_terms_with_sqls(
         .distinct()
         .order_by(s.term.c.id, s.sql_query.c.id)
     )
-    if database_name is not None:
-        statement = statement.select_from(
-            s.catalog_schema.join(
-                s.catalog_database,
-                s.catalog_database.c.id == s.catalog_schema.c.database_id,
-            )
-        ).where(
-            s.table__term.c.table_id == s.catalog_table.c.id,
-            s.catalog_table.c.schema_id == s.catalog_schema.c.id,
-            s.catalog_database.c.name == database_name,
-        )
+    statement = statement.where(
+        query_source_scope(connection_id),
+        s.table__term.c.table_id.in_(
+            select(s.catalog_table.c.id)
+            .select_from(s.catalog_table.join(s.catalog_schema))
+            .where(s.catalog_schema.c.database_id == connection_id)
+        ),
+    )
 
     rows = store().query_read(statement)
 
@@ -992,6 +1229,7 @@ def fetch_terms_with_sqls(
 def _embedding_attrs_for_table(table_id: str):
     return (
         select(
+            s.catalog_schema.c.database_id.label("connection_id"),
             s.column_attribute.c.name,
             s.column_attribute.c.description,
             s.column_attribute.c.term_name,
@@ -1002,6 +1240,7 @@ def _embedding_attrs_for_table(table_id: str):
             s.catalog_table.c.name.label("table_name"),
             s.column_attribute.c.id,
             s.catalog_schema.c.name.label("schema_name"),
+            s.column_attribute.c.datatype,
         )
         .select_from(
             s.column_attribute.join(
@@ -1019,6 +1258,7 @@ def _embedding_attrs_for_table(table_id: str):
         )
         .where(
             s.catalog_table.c.id == table_id,
+            s.column_attribute.c.table_id == table_id,
             s.column_attribute.c.source == SEMANTIC_SOURCE,
         )
     )
@@ -1026,10 +1266,18 @@ def _embedding_attrs_for_table(table_id: str):
 
 def fetch_terms_and_attributes_for_table(
     table_id: str,
+    *,
+    connection_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """``(terms, attrs)`` written for one table — the inline embedding input."""
+    if connection_id is not None:
+        from auto_ontology.dal.datasources import fetch_table_by_id
+
+        if fetch_table_by_id(table_id, connection_id=connection_id) is None:
+            return [], []
     terms = store().query_read(
         select(
+            s.catalog_schema.c.database_id.label("connection_id"),
             s.term.c.name,
             s.term.c.description,
             s.term.c.synonyms,
@@ -1049,7 +1297,7 @@ def fetch_terms_and_attributes_for_table(
             s.table__term.c.table_id == table_id,
             s.term.c.source == SEMANTIC_SOURCE,
         )
-        .group_by(s.term.c.id)
+        .group_by(s.term.c.id, s.catalog_schema.c.database_id)
     )
     attrs = store().query_read(_embedding_attrs_for_table(table_id))
     return [dict(r) for r in terms], [dict(r) for r in attrs]
@@ -1057,75 +1305,29 @@ def fetch_terms_and_attributes_for_table(
 
 def fetch_term_and_column_attributes_for_embedding(
     term_id: str,
+    *,
+    connection_id: str,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """One Term and its ColumnAttributes, for a semantic VDB re-embed."""
-    terms = store().query_read(
-        select(
-            s.term.c.name,
-            s.term.c.description,
-            s.term.c.synonyms,
-            s.term.c.id,
-            s.catalog_database.c.name.label("database_name"),
-        )
-        .select_from(
-            s.term.outerjoin(s.table__term, s.table__term.c.term_id == s.term.c.id)
-            .outerjoin(
-                s.catalog_table, s.catalog_table.c.id == s.table__term.c.table_id
-            )
-            .outerjoin(
-                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
-            )
-            .outerjoin(
-                s.catalog_database,
-                s.catalog_database.c.id == s.catalog_schema.c.database_id,
-            )
-        )
-        .where(s.term.c.id == term_id)
-        # Ordered so a term spanning two databases reports the same one on
-        # every call.
-        .order_by(s.catalog_database.c.id)
-        .limit(1)
-    )
-    if not terms:
-        return None, []
+    """One source projection, including attribute-only and SQL-only Terms."""
+    terms, attrs = fetch_all_terms_and_attributes(connection_id=connection_id)
+    term = next((t for t in terms if t["id"] == term_id), None)
+    return term, [a for a in attrs if a["term_id"] == term_id]
 
-    attrs = store().query_read(
-        select(
-            s.column_attribute.c.name,
-            s.column_attribute.c.description,
-            s.column_attribute.c.term_name,
-            s.column_attribute.c.source_column,
-            s.catalog_column.c.sample_values,
-            s.catalog_column.c.is_unique,
-            s.catalog_table.c.id.label("table_id"),
-            s.catalog_table.c.name.label("table_name"),
-            s.column_attribute.c.id,
-        )
-        .select_from(
-            s.column_attribute__term.join(
-                s.column_attribute,
-                s.column_attribute.c.id == s.column_attribute__term.c.attribute_id,
+
+def fetch_term_projection_contexts(term_id: str) -> list[dict[str, str]]:
+    """Affected source IDs and physical names, without credentials/connectors."""
+    contexts = []
+    for root in store().query_read(
+        select(s.catalog_database.c.id, s.catalog_database.c.name)
+    ):
+        links = _term_projection_links(root["id"])
+        if store().query_read(
+            select(links.c.term_id).where(links.c.term_id == term_id).limit(1)
+        ):
+            contexts.append(
+                {"connection_id": root["id"], "database_name": root["name"]}
             )
-            .outerjoin(
-                s.column__has_attribute,
-                s.column__has_attribute.c.attribute_id == s.column_attribute.c.id,
-            )
-            .outerjoin(
-                s.catalog_column,
-                s.catalog_column.c.id == s.column__has_attribute.c.column_id,
-            )
-            # Outer, like the join above it: an attribute need not reach a
-            # column, and an inner join here would drop those attributes
-            # entirely rather than leaving their table fields null.
-            .outerjoin(
-                s.catalog_table,
-                s.catalog_table.c.id == s.catalog_column.c.table_id,
-            )
-        )
-        .where(s.column_attribute__term.c.term_id == term_id)
-        .order_by(s.column_attribute.c.id)
-    )
-    return dict(terms[0]), [dict(r) for r in attrs]
+    return contexts
 
 
 def fetch_column_attribute_embedding_contexts_by_column_id(
@@ -1143,6 +1345,9 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
             s.term.c.synonyms.label("term_synonyms"),
             s.term.c.id.label("term_id"),
             s.catalog_database.c.name.label("database_name"),
+            s.catalog_database.c.id.label("connection_id"),
+            s.catalog_schema.c.name.label("schema_name"),
+            s.column_attribute.c.datatype,
             s.column_attribute.c.name,
             s.column_attribute.c.description,
             s.column_attribute.c.term_name,
@@ -1178,7 +1383,11 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
                 s.catalog_database.c.id == s.catalog_schema.c.database_id,
             )
         )
-        .where(s.catalog_column.c.id == column_id)
+        .where(
+            s.catalog_column.c.id == column_id,
+            s.column_attribute.c.table_id == s.catalog_table.c.id,
+            s.column_attribute.c.source == SEMANTIC_SOURCE,
+        )
         .order_by(s.term.c.id, s.column_attribute.c.id)
     )
 
@@ -1195,6 +1404,8 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
                     "synonyms": row["term_synonyms"] or [],
                     "id": term_id,
                     "database_name": row["database_name"] or "",
+                    "connection_id": row["connection_id"],
+                    "schema_names": [row["schema_name"]] if row["schema_name"] else [],
                 },
                 [],
             )
@@ -1206,6 +1417,12 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
                 "source_column": row["source_column"],
                 "sample_values": row["sample_values"],
                 "id": row["id"],
+                "connection_id": row["connection_id"],
+                "table_id": row["table_id"],
+                "table_name": row["table_name"],
+                "schema_name": row["schema_name"],
+                "datatype": row["datatype"],
+                "is_unique": row["is_unique"],
             }
         )
     return list(contexts.values())
@@ -1237,6 +1454,8 @@ def fetch_column_attribute_counts(
     zone_ids: list[str] | None = None,
     data_ids_by_zone: dict[str, set[str]] | None = None,
     term_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """``[{term_id, count}]`` per Term. Terms with none are omitted."""
     statement = (
@@ -1253,6 +1472,15 @@ def fetch_column_attribute_counts(
         .where(s.column_attribute.c.source == SEMANTIC_SOURCE)
         .group_by(s.column_attribute__term.c.term_id)
     )
+    if connection_id is not None:
+        statement = statement.where(
+            s.column_attribute.c.id.in_(
+                _projection_attributes(connection_id)
+                .with_only_columns(s.column_attribute.c.id)
+                .order_by(None)
+                .correlate(None)
+            )
+        )
     table_ids = _scope_table_ids(zone_ids, data_ids_by_zone)
     if table_ids is not None:
         statement = statement.where(s.column_attribute.c.table_id.in_(table_ids))
@@ -1267,12 +1495,46 @@ def fetch_column_attribute_counts(
     ]
 
 
+def _source_column_paths(
+    attr_ids: list[str], connection_id: str
+) -> dict[str, dict[str, Any]]:
+    """Hydrate paths only through this source and the canonical attribute owner."""
+    result = {
+        attr_id: {"primary_column": None, "referenced_columns": []}
+        for attr_id in attr_ids
+    }
+    if not attr_ids:
+        return result
+    for link, primary in (
+        (s.column__has_attribute, True),
+        (s.column__semantic_fk, False),
+    ):
+        statement = _column_path_select(link).where(
+            link.c.attribute_id.in_(attr_ids),
+            s.catalog_schema.c.database_id == connection_id,
+        )
+        if primary:
+            statement = statement.join(
+                s.column_attribute, s.column_attribute.c.id == link.c.attribute_id
+            ).where(s.column_attribute.c.table_id == s.catalog_table.c.id)
+        rows = store().query_read(statement.order_by(s.catalog_column.c.id))
+        for row in rows:
+            entry = result[row["attr_id"]]
+            if primary:
+                if entry["primary_column"] is None:
+                    entry["primary_column"] = _column_path_dict(row)
+            else:
+                entry["referenced_columns"].append(_column_path_dict(row))
+    return result
+
+
 def fetch_column_attributes_by_term_id(
     term_id: str,
     zone_ids: list[str] | None = None,
     *,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """One Term's ColumnAttributes, with their columns and zones.
 
@@ -1283,6 +1545,50 @@ def fetch_column_attributes_by_term_id(
     Ordered by name then id, so *skip* and *limit* page it stably; pair with
     ``count_column_attributes_by_term_id``.
     """
+    if connection_id is not None:
+        projection = (
+            _projection_attributes(connection_id)
+            .add_columns(
+                s.column_attribute.c.certified,
+                s.column_attribute.c.created,
+                s.column_attribute.c.modified,
+                s.column_attribute.c.created_by,
+                s.column_attribute.c.modified_by,
+            )
+            .where(
+                s.column_attribute__term.c.term_id == term_id,
+                *_column_attribute_scope(term_id, zone_ids),
+            )
+            .distinct(s.column_attribute.c.id)
+            .subquery()
+        )
+        statement = (
+            select(projection).order_by(projection.c.name, projection.c.id).offset(skip)
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        rows = _with_parsed_sample_values(
+            [dict(row) for row in store().query_read(statement)]
+        )
+        ids = [row["id"] for row in rows]
+        columns = _source_column_paths(ids, connection_id)
+        zones = (
+            fetch_table_zones_map(
+                zone_ids=zone_ids, table_ids=list({row["table_id"] for row in rows})
+            )
+            if rows
+            else {}
+        )
+        tags = fetch_tags_map(TARGET_COLUMN_ATTRIBUTE, ids)
+        return [
+            {
+                **row,
+                **columns[row["id"]],
+                "zones": zones.get(row["table_id"], []),
+                "tags": tags.get(row["id"], []),
+            }
+            for row in rows
+        ]
     sample_values = (
         select(s.catalog_column.c.sample_values)
         .select_from(
@@ -1344,8 +1650,26 @@ def fetch_column_attributes_by_term_id(
 def count_column_attributes_by_term_id(
     term_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> int:
     """The unpaged size of :func:`fetch_column_attributes_by_term_id`."""
+    if connection_id is not None:
+        projection = (
+            _projection_attributes(connection_id)
+            .where(
+                s.column_attribute__term.c.term_id == term_id,
+                *_column_attribute_scope(term_id, zone_ids),
+            )
+            .with_only_columns(s.column_attribute.c.id)
+            .order_by(None)
+            .distinct()
+            .subquery()
+        )
+        rows = store().query_read(
+            select(func.count().label("total")).select_from(projection)
+        )
+        return int(rows[0]["total"])
     rows = store().query_read(
         select(func.count(func.distinct(s.column_attribute.c.id)).label("total")).where(
             *_column_attribute_scope(term_id, zone_ids)
@@ -1377,6 +1701,7 @@ def fetch_term_table_pairs(
     data_ids_by_zone: dict[str, set[str]] | None = None,
     database_name: str | None = None,
     *,
+    connection_id: str | None = None,
     term_ids: list[str] | None = None,
     table_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1416,6 +1741,8 @@ def fetch_term_table_pairs(
 
     *term_ids* and *table_ids* narrow the scan; neither widens access, both
     being intersected with what *zone_ids* already allows.
+    Executable callers must pass ``connection_id``; name/unscoped reads are
+    retained only for administrative graph inspection.
     """
     scope_ids = _scope_table_ids(zone_ids, data_ids_by_zone)
     database_table_ids = (
@@ -1444,6 +1771,14 @@ def fetch_term_table_pairs(
             conditions.append(table_column.in_(list(table_ids)))
         if database_table_ids is not None:
             conditions.append(table_column.in_(database_table_ids))
+        if connection_id is not None:
+            conditions.append(
+                table_column.in_(
+                    select(s.catalog_table.c.id)
+                    .select_from(s.catalog_table.join(s.catalog_schema))
+                    .where(s.catalog_schema.c.database_id == connection_id)
+                )
+            )
         return statement.where(*conditions)
 
     represents = restrict(
@@ -1497,6 +1832,15 @@ def fetch_term_table_pairs(
         ),
         s.catalog_column.c.table_id,
     )
+    if connection_id is not None:
+        via_attribute = via_attribute.where(
+            s.column_attribute.c.id.in_(
+                _projection_attributes(connection_id)
+                .with_only_columns(s.column_attribute.c.id)
+                .order_by(None)
+                .correlate(None)
+            )
+        )
 
     return [dict(r) for r in store().query_read(represents.union(via_attribute))]
 
@@ -1519,6 +1863,8 @@ def fetch_related_term_ids(
     term_id: str,
     zone_ids: list[str] | None = None,
     data_ids_by_zone: dict[str, set[str]] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[str]:
     """Ids of every Term sharing a table with *term_id*.
 
@@ -1529,13 +1875,17 @@ def fetch_related_term_ids(
     the name order :func:`fetch_terms_by_ids` imposes.
     """
     resolved = resolve_accessible_catalog_ids(zone_ids, data_ids_by_zone)
-    own_pairs = fetch_term_table_pairs(zone_ids, resolved, term_ids=[term_id])
+    own_pairs = fetch_term_table_pairs(
+        zone_ids, resolved, term_ids=[term_id], connection_id=connection_id
+    )
     shared = sorted({r["table_id"] for r in own_pairs if r.get("table_id")})
     if not shared:
         return []
 
     _, table_terms = build_term_table_maps(
-        fetch_term_table_pairs(zone_ids, resolved, table_ids=shared)
+        fetch_term_table_pairs(
+            zone_ids, resolved, table_ids=shared, connection_id=connection_id
+        )
     )
     related: set[str] = set()
     for table_id in shared:
@@ -1574,6 +1924,7 @@ def fetch_related_terms(
     *,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Terms related to *term_id* by sharing a table, paged by name.
 
@@ -1584,7 +1935,9 @@ def fetch_related_terms(
     related term the caller could not actually open — it would 404 through
     ``get_full_term_by_id`` — is never shown as a chip.
     """
-    related_ids = fetch_related_term_ids(term_id, zone_ids, data_ids_by_zone)
+    related_ids = fetch_related_term_ids(
+        term_id, zone_ids, data_ids_by_zone, connection_id=connection_id
+    )
     return fetch_terms_by_ids(related_ids, skip=skip, limit=limit)
 
 
@@ -1592,6 +1945,8 @@ def fetch_related_terms_counts(
     zone_ids: list[str] | None = None,
     term_ids: list[str] | None = None,
     data_ids_by_zone: dict[str, set[str]] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """``[{term_id, count}]`` — how many terms each one shares a table with.
 
@@ -1603,17 +1958,21 @@ def fetch_related_terms_counts(
     resolved = resolve_accessible_catalog_ids(zone_ids, data_ids_by_zone)
     if term_ids is None:
         term_tables, table_terms = build_term_table_maps(
-            fetch_term_table_pairs(zone_ids, resolved)
+            fetch_term_table_pairs(zone_ids, resolved, connection_id=connection_id)
         )
         wanted = list(term_tables)
     else:
         if not term_ids:
             return []
-        own_pairs = fetch_term_table_pairs(zone_ids, resolved, term_ids=term_ids)
+        own_pairs = fetch_term_table_pairs(
+            zone_ids, resolved, term_ids=term_ids, connection_id=connection_id
+        )
         term_tables, _ = build_term_table_maps(own_pairs)
         touched = sorted({r["table_id"] for r in own_pairs})
         _, table_terms = build_term_table_maps(
-            fetch_term_table_pairs(zone_ids, resolved, table_ids=touched)
+            fetch_term_table_pairs(
+                zone_ids, resolved, table_ids=touched, connection_id=connection_id
+            )
             if touched
             else []
         )

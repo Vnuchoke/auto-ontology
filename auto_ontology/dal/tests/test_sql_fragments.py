@@ -56,7 +56,7 @@ def _insert(table, **values):
 def fixture():
     """One column and one table, each with nothing described yet."""
     prefix = f"d-{uuid.uuid4().hex[:8]}"
-    db = _insert(s.catalog_database, name=prefix)
+    db = _insert(s.catalog_database, name=prefix, display_label=prefix)
     schema = _insert(s.catalog_schema, database_id=db, name="shop")
     table = _insert(s.catalog_table, schema_id=schema, name="customer")
     column = _insert(s.catalog_column, table_id=table, name="email")

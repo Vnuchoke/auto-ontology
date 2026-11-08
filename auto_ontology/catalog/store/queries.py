@@ -32,7 +32,7 @@ import pandas as pd
 from sqlalchemy import Text, cast, distinct, func, literal, select, update
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 
-from auto_ontology.catalog.constants import Edges, Props
+from auto_ontology.catalog.constants import Edges, Props, Labels
 from auto_ontology.catalog.model.node import CatalogNode
 
 # Pure, so it lives outside this module rather than being reimplemented.
@@ -41,7 +41,7 @@ from auto_ontology.catalog.query_stats import (  # noqa: F401
     get_sql_counters,
 )
 from auto_ontology.catalog.store import registry
-from auto_ontology.catalog.store.rows import upsert_row
+from auto_ontology.catalog.store.rows import upsert_row, resolve_id
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import store, write_transaction
 
@@ -111,47 +111,104 @@ def _reject_nested(properties: dict) -> None:
             )
 
 
-def add_query(edges) -> None:
-    """Write a parsed statement, the rows it references, and the links."""
-    for source, target, properties in edges:
-        _write_link(source, target, properties)
+def _validate_endpoint(node: CatalogNode, connection_id: str) -> None:
+    if node.get_match_props().get("id", node.id) != node.id:
+        raise ValueError("SQL endpoint ID conflicts with its match")
+    spec = registry.entity_spec(node.get_label())
+    if "connection_id" in spec.natural_key:
+        if (
+            node.get_properties().get("connection_id") != connection_id
+            or node.get_match_props().get("connection_id") != connection_id
+        ):
+            raise ValueError("SQL endpoint requires the selected connection_id")
+        resolve_id(spec.label, {"id": node.id, "connection_id": connection_id})
+        resolve_id(spec.label, node.get_match_props())
+        if (node.get_override_existing_props() or {}).get(
+            "connection_id", connection_id
+        ) != connection_id:
+            raise ValueError("SQL ownership cannot change")
+        return
+    if spec.label == Labels.TABLE:
+        statement = (
+            select(s.catalog_schema.c.database_id)
+            .select_from(s.catalog_table.join(s.catalog_schema))
+            .where(s.catalog_table.c.id == node.id)
+        )
+    elif spec.label == Labels.COLUMN:
+        statement = (
+            select(s.catalog_schema.c.database_id)
+            .select_from(s.catalog_column.join(s.catalog_table).join(s.catalog_schema))
+            .where(s.catalog_column.c.id == node.id)
+        )
+    else:
+        raise ValueError("Unsupported SQL dependency")
+    rows = store().query_read(statement)
+    if not rows or rows[0]["database_id"] != connection_id:
+        raise ValueError("Unknown or foreign-source SQL dependency")
 
 
-def _write_link(source: CatalogNode, target: CatalogNode, properties: dict) -> None:
-    """Upsert both endpoint rows and the association between them.
+def add_query(edges, *, connection_id: str) -> None:
+    """Validate the complete dependency set before atomically saving one source."""
+    if not connection_id:
+        raise ValueError("SQL requires connection_id")
+    edges = list(edges)
+    with write_transaction():
+        for source, target, properties in edges:
+            registry.link_spec(
+                _link_kind(properties), source.get_label(), target.get_label()
+            )
+            _reject_nested(properties)
+            for node in (source, target):
+                _validate_endpoint(node, connection_id)
+                _reject_nested(node.get_properties())
+                _reject_nested(node.get_override_existing_props() or {})
+        endpoint_ids = {}
+        for source, target, _ in edges:
+            for node in (source, target):
+                if node.id not in endpoint_ids:
+                    endpoint_ids[node.id] = _endpoint_id(node)
+        for source, target, properties in edges:
+            properties = dict(properties)
+            if "refs" in properties:
+                refs = []
+                for ref in properties["refs"]:
+                    sql_id, separator, condition = ref.partition("|")
+                    refs.append(
+                        f"{endpoint_ids.get(sql_id, sql_id)}{separator}{condition}"
+                    )
+                properties["refs"] = refs
+            _write_link(source, target, properties, endpoint_ids)
+    # Callers return these node IDs; dedup must not leave a transient SQL ID in responses.
+    for source, target, _ in edges:
+        for node in (source, target):
+            node.replace_id(endpoint_ids.get(node.id, node.id))
 
-    All three writes are one unit. Committed separately, a failure on the
-    association leaves two endpoint rows with nothing joining them -- which no
-    reader here can detect, because every read starts from the link and a
-    missing one is indistinguishable from a statement that never referenced
-    that table.
-    """
-    for endpoint in (source, target):
-        _reject_nested(endpoint.get_properties())
-        if endpoint.get_override_existing_props():
-            _reject_nested(endpoint.get_override_existing_props())
-    _reject_nested(properties)
 
+def _endpoint_id(node: CatalogNode) -> str:
+    if node.get_label() in (Labels.TABLE, Labels.COLUMN):
+        return node.id
+    return upsert_row(
+        node.get_label(),
+        node.get_match_props(),
+        node.get_properties(),
+        on_match=node.get_override_existing_props() or {},
+    )
+
+
+def _write_link(
+    source: CatalogNode,
+    target: CatalogNode,
+    properties: dict,
+    endpoint_ids: dict[str, str],
+) -> None:
+    """Write an association using already validated and resolved endpoints."""
     spec = registry.link_spec(
         _link_kind(properties), source.get_label(), target.get_label()
     )
 
     with write_transaction():
-        source_id = upsert_row(
-            source.get_label(),
-            source.get_match_props(),
-            source.get_properties(),
-            on_match=source.get_override_existing_props() or {},
-        )
-        # For a foreign key link the child's row *carries* the relationship, so
-        # the parent id goes in with the child rather than as a separate write.
-        target_id = upsert_row(
-            target.get_label(),
-            target.get_match_props(),
-            target.get_properties(),
-            parent_id=source_id if spec.is_parent_link else None,
-            on_match=target.get_override_existing_props() or {},
-        )
+        source_id = endpoint_ids[source.id]
+        target_id = endpoint_ids[target.id]
 
         if spec.is_parent_link:
             return
@@ -219,17 +276,20 @@ def _dedupe(array):
     ).scalar_subquery()
 
 
-def get_sql_by_full_query(sql_full_query: str):
+def get_sql_by_full_query(sql_full_query: str, *, connection_id: str):
     """The statement's id, or None.
 
     Matched through ``md5`` on both sides so the ``uq_sql_query_text_md5``
     expression index applies; comparing the column directly is a sequential
     scan. See ``registry.EntitySpec.key_expressions``.
     """
+    if not connection_id:
+        raise ValueError("SQL lookup requires connection_id")
     rows = store().query_read(
         select(s.sql_query.c.id).where(
+            s.sql_query.c.connection_id == connection_id,
             func.md5(s.sql_query.c.sql_full_query)
-            == func.md5(literal(sql_full_query, Text))
+            == func.md5(literal(sql_full_query, Text)),
         )
     )
     return rows[0]["id"] if rows else None
@@ -239,18 +299,28 @@ def update_counters_and_timestamps_for_query_and_affected_data(
     identical_sql_id: str,
     sql_node: CatalogNode,
     update_data_last_query_timestamp: bool = True,
+    *,
+    connection_id: str,
 ):
     """Add this sighting's count to the stored statement, and stamp the time.
 
     The per-month counters ``get_sql_counters`` also returns are ignored — see
     the module docstring.
     """
+    if (
+        not connection_id
+        or sql_node.get_properties().get("connection_id") != connection_id
+    ):
+        raise ValueError("SQL counters require the selected connection_id")
     latest_timestamp = sql_node.get_properties()["last_query_timestamp"]
     total_counter, _unreadable_month_counters = get_sql_counters(sql_node)
 
     store().query_write(
         update(s.sql_query)
-        .where(s.sql_query.c.id == identical_sql_id)
+        .where(
+            s.sql_query.c.id == identical_sql_id,
+            s.sql_query.c.connection_id == connection_id,
+        )
         .values(
             last_query_timestamp=latest_timestamp,
             total_counter=s.sql_query.c.total_counter + total_counter,
@@ -283,8 +353,10 @@ def update_counters_and_timestamps_for_query_and_affected_data(
         )
 
 
-def load_sqls_to_tables() -> pd.DataFrame:
+def load_sqls_to_tables(*, connection_id: str) -> pd.DataFrame:
     """Every stored statement with the table and column ids it references."""
+    if not connection_id:
+        raise ValueError("SQL lookup requires connection_id")
     rows = store().query_read(
         select(
             s.sql_query.c.id.label("sql_id"),
@@ -292,17 +364,24 @@ def load_sqls_to_tables() -> pd.DataFrame:
             s.sql_query.c.join_count,
             s.sql_query.c.union_count,
             s.sql_query.c.sql_full_query,
-        )
+        ).where(s.sql_query.c.connection_id == connection_id)
     )
     if not rows:
         return pd.DataFrame(columns=_EMPTY_SQLS_COLUMNS)
 
     tables: dict[str, list[str]] = {}
-    for row in store().query_read(select(s.sql_query__table)):
+    sql_ids = [row["sql_id"] for row in rows]
+    for row in store().query_read(
+        select(s.sql_query__table).where(s.sql_query__table.c.sql_query_id.in_(sql_ids))
+    ):
         tables.setdefault(row["sql_query_id"], []).append(row["table_id"])
 
     columns: dict[str, list[str]] = {}
-    for row in store().query_read(select(s.sql_query__column)):
+    for row in store().query_read(
+        select(s.sql_query__column).where(
+            s.sql_query__column.c.sql_query_id.in_(sql_ids)
+        )
+    ):
         columns.setdefault(row["sql_query_id"], []).append(row["column_id"])
 
     return pd.DataFrame(

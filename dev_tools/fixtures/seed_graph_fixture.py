@@ -43,17 +43,18 @@ logger = logging.getLogger("dev_tools.fixtures.seed_graph_fixture")
 
 
 def ingest_catalog() -> None:
-    """Write both fixture databases' catalogs into the graph."""
+    """Explicitly register env sources, then ingest each catalog by stable ID."""
     from auto_ontology.catalog import ingest_catalog as write_catalog
-    from auto_ontology.connectors.registry import create_connector
+    from auto_ontology.connectors.registry import get_connector
+    from auto_ontology.connectors.sources import bootstrap_sources
+    from auto_ontology.dal.schema_version import require_current_schema
 
-    raw = os.environ.get("CONNECTION_STRINGS", "")
-    connection_strings = [cs.strip() for cs in raw.split(",") if cs.strip()]
-    if not connection_strings:
+    if not os.environ.get("CONNECTION_STRINGS", "").strip():
         raise SystemExit("CONNECTION_STRINGS is empty; nothing to ingest")
 
-    for connection_string in connection_strings:
-        connector = create_connector(connection_string)
+    require_current_schema()
+    for source in bootstrap_sources():
+        connector = get_connector(source.connection_id)
         try:
             logger.info("ingesting %s (%s)", connector.database_name, connector.dialect)
             write_catalog(connector)
@@ -354,9 +355,26 @@ def seed_semantic_fks(attr_ids: dict[tuple[str, str], str]) -> None:
         merge_semantic_fk(_column_id(db, schema, table, column), attr_ids[key])
 
 
+def _pagila_connection_id() -> str:
+    """These fixture SQL constants all belong to one unambiguous env Pagila."""
+    from auto_ontology.connectors.sources import list_active_sources
+
+    sources = [
+        source
+        for source in list_active_sources()
+        if source.database_name == "pagila" and source.configuration_origin == "env"
+    ]
+    if len(sources) != 1:
+        raise ValueError(
+            "Fixture SQL requires exactly one active env source named pagila"
+        )
+    return sources[0].connection_id
+
+
 def seed_sql_attributes(term_ids: dict[str, str]) -> list[str]:
     from auto_ontology.server.sql_attributes import service
 
+    connection_id = _pagila_connection_id()
     created: list[str] = []
     for name, description, expression, term_name, source in SQL_ATTRIBUTES:
         row = service.create_sql_attribute(
@@ -365,6 +383,7 @@ def seed_sql_attributes(term_ids: dict[str, str]) -> list[str]:
             expression=expression,
             term_id=term_ids[term_name],
             source=source,
+            connection_id=connection_id,
         )
         created.append(row["id"])
     return created
@@ -373,10 +392,11 @@ def seed_sql_attributes(term_ids: dict[str, str]) -> list[str]:
 def seed_custom_analyses() -> list[str]:
     from auto_ontology.server.custom_analyses import service
 
+    connection_id = _pagila_connection_id()
     created: list[str] = []
     for name, description, sql in CUSTOM_ANALYSES:
         row = service.create_custom_analysis(
-            name=name, description=description, sql=sql
+            name=name, description=description, sql=sql, connection_id=connection_id
         )
         created.append(row["id"])
     return created
@@ -453,15 +473,11 @@ def _stub_embedding() -> None:
 
 
 def reset_graph() -> None:
-    """Empty the store, whichever one is selected.
+    """Reset source-owned analysis and fixture zones, not connection identities.
 
-    ``delete_all_data(None)`` is the DAL's own definition of a full wipe, so the
-    fixture is built from the same empty state a reset produces — **plus the
-    zones, which that reset does not touch.** Zones are not part of either
-    layer: the SQL's semantic labels never included them, so
-    ``delete_all_data`` left them standing on both backends. The old
-    ``MATCH (n) DETACH DELETE n`` swept them up incidentally, and a fixture
-    built on top of leftover zones is not reproducible.
+    The DAL preserves configured roots, retired-ID tombstones and global PQL;
+    fixture PQL rows are idempotently upserted. Zones require explicit cleanup
+    because source resets do not own them.
     """
     from auto_ontology.dal.reset import delete_all_data
     from auto_ontology.dal.zones import delete_zone, list_zones

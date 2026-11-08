@@ -62,7 +62,11 @@ class World:
         self.database(database)
 
     def database(self, name: str) -> str:
-        did = _add(s.catalog_database, name=f"{self.prefix}-{name}")
+        did = _add(
+            s.catalog_database,
+            name=f"{self.prefix}-{name}",
+            display_label=f"{self.prefix}-{name}",
+        )
         self.databases[name] = did
         sid = _add(s.catalog_schema, database_id=did, name="public")
         self.schemas[name] = sid
@@ -100,9 +104,9 @@ class World:
         aid = _add(
             s.column_attribute,
             name=f"{self.prefix}-{key}",
-            source_column=key,
+            source_column=owner.rsplit(".", 1)[1] if owner else key,
             term_name=key,
-            table_id="",
+            table_id=self.tables[owner.rsplit(".", 1)[0]] if owner else "",
         )
         self.attributes[key] = aid
         self.created.append((s.column_attribute, aid))
@@ -286,7 +290,7 @@ def test_setting_join_default_disables_every_other_group_member(world) -> None:
     world.references("orders.billing_customer_id", "customer-id")
     world.references("orders.customer_id", "customer-id")
 
-    group = a.fetch_semantic_fk_join_groups(f"{world.prefix}-shopdb")
+    group = a.fetch_semantic_fk_join_groups(connection_id=world.databases["shopdb"])
     assert {
         (row["source_column_name"], row["target_column_name"]) for row in group
     } == {
@@ -820,18 +824,12 @@ def test_an_attribute_with_no_columns_still_gets_an_entry(world) -> None:
     assert context["attr_name"] == f"{world.prefix}-orphan"
 
 
-def test_a_database_filter_does_not_drop_the_attribute(joined) -> None:
-    """The attribute survives with blank context rather than disappearing.
-
-    Filtering in a plain WHERE over an outer join would delete the row entirely
-    instead of blanking its context — a silent difference, since the caller's
-    `.get` would return the same empty strings either way until something
-    downstream noticed a missing key.
-    """
+def test_a_database_filter_excludes_foreign_catalog_context(joined) -> None:
+    """Do not retain foreign table/column names under a blank database name."""
     contexts = a.fetch_attr_column_contexts(
         [joined.attributes["customer-id"]], database_name="some-other-database"
     )
-    assert joined.attributes["customer-id"] in contexts
+    assert contexts == {}
 
 
 # --------------------------------------------------------------------------
@@ -850,7 +848,10 @@ def test_unlinked_excludes_columns_with_either_link(world) -> None:
     world.attribute("customer-id", owner="customers.id")
     world.references("orders.customer_id", "customer-id")
 
-    names = {r["name"] for r in a.find_unlinked_fk_columns(f"{world.prefix}-shopdb")}
+    names = {
+        r["name"]
+        for r in a.find_unlinked_fk_columns(connection_id=world.databases["shopdb"])
+    }
     assert names == {"name", "plain"}
 
 
@@ -865,7 +866,10 @@ def test_unlinked_reports_a_declared_fk_target_when_there_is_one(world) -> None:
         target_column_id=world.columns["customers.id"],
     )
 
-    rows = {r["name"]: r for r in a.find_unlinked_fk_columns(f"{world.prefix}-shopdb")}
+    rows = {
+        r["name"]: r
+        for r in a.find_unlinked_fk_columns(connection_id=world.databases["shopdb"])
+    }
     assert rows["customer_id"]["fk_target_col_id"] == world.columns["customers.id"]
     # A column with no declared key still appears -- those are the ones the
     # semantic resolver exists for.
@@ -879,7 +883,10 @@ def test_unlinked_scopes_to_one_database(world) -> None:
     world.table("there", database="otherdb")
     world.column("there", "y")
 
-    scoped = {r["name"] for r in a.find_unlinked_fk_columns(f"{world.prefix}-shopdb")}
+    scoped = {
+        r["name"]
+        for r in a.find_unlinked_fk_columns(connection_id=world.databases["shopdb"])
+    }
     assert scoped == {"x"}
     assert "y" in {r["name"] for r in a.find_unlinked_fk_columns()}
 

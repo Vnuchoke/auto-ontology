@@ -17,6 +17,7 @@ from auto_ontology.dal.owners import CATALOG_EDIT, edit_subject
 from auto_ontology.server.identity import resolve_internal_user
 from auto_ontology.server.owners import enforce_edit, owner_from_body
 from auto_ontology.server.pagination import LIMIT_QUERY, SKIP_QUERY
+from auto_ontology.server.source_context import resolve_semantic_source
 from auto_ontology.server.terms import service as term_service
 from auto_ontology.server.responses import (
     ColumnAttributePageResponse,
@@ -54,6 +55,9 @@ def list_terms(
     ),
     skip: int = SKIP_QUERY,
     limit: int | None = LIMIT_QUERY,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
 ) -> dict:
     """Return Term nodes.
 
@@ -78,7 +82,13 @@ def list_terms(
     counts-only so the Terms list never pulls attribute nodes it won't show.
     """
     return term_service.list_terms_page(
-        zone_ids=None, search=query, skip=skip, limit=limit
+        zone_ids=None,
+        search=query,
+        skip=skip,
+        limit=limit,
+        connection_id=resolve_semantic_source(
+            connection_id, connection_label, target_db
+        ),
     )
 
 
@@ -89,6 +99,9 @@ def list_term_column_attributes_by_id(
     term_id: str,
     skip: int = SKIP_QUERY,
     limit: int | None = LIMIT_QUERY,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
 ) -> dict:
     """Return ColumnAttribute nodes for a single Term.
 
@@ -99,14 +112,17 @@ def list_term_column_attributes_by_id(
     Each attribute includes ``primary_column`` and ``referenced_columns``
     (catalog path ids + names) for navigation from the detail page.
     """
+    connection_id = resolve_semantic_source(connection_id, connection_label, target_db)
     attrs = terms_dal.fetch_column_attributes_by_term_id(
-        term_id, zone_ids=None, skip=skip, limit=limit
+        term_id, zone_ids=None, skip=skip, limit=limit, connection_id=connection_id
     )
     # `len(attrs)` only equals the term's full count when neither paging
     # argument was given — a `skip` alone (no `limit`) still returns a
     # partial read, so it needs the same separate count query.
     total = (
-        terms_dal.count_column_attributes_by_term_id(term_id, zone_ids=None)
+        terms_dal.count_column_attributes_by_term_id(
+            term_id, zone_ids=None, connection_id=connection_id
+        )
         if skip or limit is not None
         else len(attrs)
     )
@@ -181,6 +197,9 @@ def list_term_sql_attributes_by_id(
     term_id: str,
     skip: int = SKIP_QUERY,
     limit: int | None = LIMIT_QUERY,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
 ) -> dict:
     """Return SqlAttribute nodes for a single Term.
 
@@ -188,14 +207,17 @@ def list_term_sql_attributes_by_id(
     of that order. ``count`` is the length of ``data`` (this page), ``total``
     the number of attributes the term has in full.
     """
+    connection_id = resolve_semantic_source(connection_id, connection_label, target_db)
     attrs = sql_attr_dal.fetch_sql_attributes_by_term_id(
-        term_id, zone_ids=None, skip=skip, limit=limit
+        term_id, zone_ids=None, skip=skip, limit=limit, connection_id=connection_id
     )
     # `len(attrs)` only equals the term's full count when neither paging
     # argument was given — a `skip` alone (no `limit`) still returns a
     # partial read, so it needs the same separate count query.
     total = (
-        sql_attr_dal.count_sql_attributes_by_term_id(term_id, zone_ids=None)
+        sql_attr_dal.count_sql_attributes_by_term_id(
+            term_id, zone_ids=None, connection_id=connection_id
+        )
         if skip or limit is not None
         else len(attrs)
     )
@@ -270,10 +292,20 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
 
 
 @router.get("/terms/{term_id}", response_model=TermDetailResponse)
-def get_term(term_id: str) -> dict:
+def get_term(
+    term_id: str,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
+) -> dict:
     """Return a single Term node by id, including zones and related terms."""
-    term = terms_dal.get_full_term_by_id(term_id, zone_ids=None)
+    connection_id = resolve_semantic_source(connection_id, connection_label, target_db)
+    term = terms_dal.get_full_term_by_id(
+        term_id, zone_ids=None, connection_id=connection_id
+    )
     if term is None:
         raise HTTPException(status_code=404, detail="Term not found")
-    term["related_terms"] = terms_dal.fetch_related_terms(term_id, zone_ids=None)
+    term["related_terms"] = terms_dal.fetch_related_terms(
+        term_id, zone_ids=None, connection_id=connection_id
+    )
     return {"data": term}

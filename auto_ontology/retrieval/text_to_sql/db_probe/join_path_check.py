@@ -77,7 +77,9 @@ logger = logging.getLogger(__name__)
 _OVERLAP_KEEP_THRESHOLD = 0.2
 
 
-def _find_join_path_either_direction(col_a_id: str, col_b_id: str) -> list[dict]:
+def _find_join_path_either_direction(
+    col_a_id: str, col_b_id: str, *, connection_id: str | None = None
+) -> list[dict]:
     """``find_join_path``, tried in both column orders.
 
     ``find_join_path`` walks ``SEMANTIC_FK`` outgoing-only (child FK ->
@@ -92,10 +94,10 @@ def _find_join_path_either_direction(col_a_id: str, col_b_id: str) -> list[dict]
     reverse order costs one extra graph query only when the forward one
     finds nothing.
     """
-    hops = find_join_path(col_a_id, col_b_id)
+    hops = find_join_path(col_a_id, col_b_id, connection_id=connection_id)
     if hops:
         return hops
-    return find_join_path(col_b_id, col_a_id)
+    return find_join_path(col_b_id, col_a_id, connection_id=connection_id)
 
 
 def _join_equalities(tree: exp.Expression) -> list[tuple[exp.Column, exp.Column]]:
@@ -262,18 +264,25 @@ def find_join_path_mismatches(
             continue
         checked_pairs.add(flat_key)
 
-        col_a_id = find_column_id_by_table_and_name(table_a, left.name, database_name)
-        col_b_id = find_column_id_by_table_and_name(table_b, right.name, database_name)
+        connection_id = getattr(executor.connector, "connection_id", None)
+        col_a_id = find_column_id_by_table_and_name(
+            table_a, left.name, database_name, connection_id=connection_id
+        )
+        col_b_id = find_column_id_by_table_and_name(
+            table_b, right.name, database_name, connection_id=connection_id
+        )
         if not col_a_id or not col_b_id:
             continue  # can't resolve — never flag on missing information
 
         if not (
-            column_participates_in_semantic_fk(col_a_id)
-            or column_participates_in_semantic_fk(col_b_id)
+            column_participates_in_semantic_fk(col_a_id, connection_id=connection_id)
+            or column_participates_in_semantic_fk(col_b_id, connection_id=connection_id)
         ):
             continue  # neither side is FK-shaped — out of scope for this check
 
-        hops = _find_join_path_either_direction(col_a_id, col_b_id)
+        hops = _find_join_path_either_direction(
+            col_a_id, col_b_id, connection_id=connection_id
+        )
 
         if len(hops) == 1:
             hop = hops[0]
@@ -394,7 +403,7 @@ def find_join_path_mismatches(
         # legitimate case). Trusted at the same confidence as the
         # multi-hop `missing_bridge` branch above — both sides already
         # have a real, ingested FK edge, so no extra probe is needed here.
-        hub = find_shared_hub_bridge(col_a_id, col_b_id)
+        hub = find_shared_hub_bridge(col_a_id, col_b_id, connection_id=connection_id)
         if hub.get("hub_table") and hub.get("hub_column"):
             # A direct join between two hub-shared FK columns is only worth
             # flagging when NEITHER side is itself unique/PK-backed on its
@@ -403,8 +412,12 @@ def find_join_path_mismatches(
             # the hub row, so `A.col = B.col` directly is mathematically
             # identical to routing `A -> hub <- B` through the bridge — just
             # without the extra join.
-            keys_a = find_table_key_columns(table_a, database_name)
-            keys_b = find_table_key_columns(table_b, database_name)
+            keys_a = find_table_key_columns(
+                table_a, database_name, connection_id=connection_id
+            )
+            keys_b = find_table_key_columns(
+                table_b, database_name, connection_id=connection_id
+            )
             col_a_is_identity = left.name.lower() in (keys_a["pk"] + keys_a["unique"])
             col_b_is_identity = right.name.lower() in (keys_b["pk"] + keys_b["unique"])
             if col_a_is_identity or col_b_is_identity:
@@ -966,15 +979,26 @@ def _group_join_equalities_by_table_pair(
     return groups
 
 
-def _is_verified_edge(predicate: dict[str, Any], database_name: Optional[str]) -> bool:
+def _is_verified_edge(
+    predicate: dict[str, Any],
+    database_name: Optional[str],
+    *,
+    connection_id: str | None = None,
+) -> bool:
     """Whether *predicate* is exactly the graph-known relationship between its two tables."""
     left, right = predicate["left"], predicate["right"]
     table_left, table_right = predicate["table_left"], predicate["table_right"]
-    col_a_id = find_column_id_by_table_and_name(table_left, left.name, database_name)
-    col_b_id = find_column_id_by_table_and_name(table_right, right.name, database_name)
+    col_a_id = find_column_id_by_table_and_name(
+        table_left, left.name, database_name, connection_id=connection_id
+    )
+    col_b_id = find_column_id_by_table_and_name(
+        table_right, right.name, database_name, connection_id=connection_id
+    )
     if not col_a_id or not col_b_id:
         return False
-    hops = _find_join_path_either_direction(col_a_id, col_b_id)
+    hops = _find_join_path_either_direction(
+        col_a_id, col_b_id, connection_id=connection_id
+    )
     if len(hops) != 1:
         return False
     hop = hops[0]
@@ -1097,7 +1121,15 @@ def find_case_dirty_join_mismatches(
         if len(predicates) < 2 or not executor.budget_left:
             continue
 
-        verified = [p for p in predicates if _is_verified_edge(p, database_name)]
+        verified = [
+            p
+            for p in predicates
+            if _is_verified_edge(
+                p,
+                database_name,
+                connection_id=getattr(executor.connector, "connection_id", None),
+            )
+        ]
         verified_ids = {id(p) for p in verified}
         extra = [p for p in predicates if id(p) not in verified_ids]
         if not verified or not extra:

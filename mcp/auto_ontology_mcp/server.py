@@ -58,13 +58,24 @@ rows.
 The other tools exist so you can understand the vocabulary before you ask, and
 check your assumptions after. A productive sequence is usually:
 
-1. `search_terms` to find out what a business word means here. Deployments
+1. `list_sources` to discover active, credential-free source identities. When
+   several exist, select one explicitly by `connection_id` or unique
+   `connection_label`; never pick the first source or infer one from meaning.
+2. `search_terms` to find out what a business word means here. Deployments
    differ: "active customer" is a defined term with specific SQL behind it,
    not something to guess at.
-2. `check_answerable` if you are unsure the question is in scope. It is far
+3. `check_answerable` with the selected source if you are unsure the question is in scope. It is far
    cheaper than `ask_question` and tells you whether the semantic layer covers
    the entities involved.
-3. `ask_question` to get the answer.
+4. `ask_question` with the same source to get the answer. Check its `source`
+   provenance alongside the SQL and rows.
+
+Use the same source selector for semantic detail/projection tools. Omitting
+selectors there keeps a global glossary overview, not an executable source.
+An existing bound conversation inherits its immutable source when selectors
+are omitted. A conflicting source or a legacy conversation without a source
+requires a new conversation; never retry by switching sources. Source failures
+must not fall back to another connection.
 
 `check_readiness` answers a different question: whether this deployment can
 answer anything at all. A deployment with no database connection reads normally

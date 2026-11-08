@@ -54,13 +54,16 @@ def test_a_conflicting_upsert_does_not_rewrite_the_primary_key(db_name) -> None:
     row to the loser's UUID, so every id the winner was holding — already
     written into child rows and returned to callers — pointed at nothing.
     """
-    first = upsert_row(
-        "Database", {"name": db_name}, {"id": str(uuid.uuid4()), "name": db_name}
-    )
+    first, _ = _column(db_name, "orders", "id")
+    schema_id = store().query_read(
+        select(s.catalog_table.c.schema_id).where(s.catalog_table.c.id == first)
+    )[0]["schema_id"]
 
-    spec = registry.entity_spec("Database")
-    values = registry.projected("Database", {"id": str(uuid.uuid4()), "name": db_name})
-    skip = set(spec.natural_key) | {"id"}
+    spec = registry.entity_spec("Table")
+    values = registry.projected(
+        "Table", {"id": str(uuid.uuid4()), "name": "orders", "schema_id": schema_id}
+    )
+    skip = set(spec.natural_key) | {"id", "schema_id"}
     update = {k: v for k, v in values.items() if k not in skip}
     statement = insert(spec.table).values(**values)
     target = R._conflict_target(spec)
@@ -71,7 +74,7 @@ def test_a_conflicting_upsert_does_not_rewrite_the_primary_key(db_name) -> None:
     )
     store().query_write(statement)
 
-    assert resolve_id("Database", {"name": db_name}) == first
+    assert resolve_id("Table", {"name": "orders"}, parent_id=schema_id) == first
 
 
 def test_upsert_row_never_offers_id_for_update() -> None:
@@ -90,7 +93,11 @@ def test_upsert_row_never_offers_id_for_update() -> None:
 
 
 def _column(db_name: str, table: str, column: str) -> tuple[str, str]:
-    db = upsert_row("Database", {"name": db_name}, {"name": db_name})
+    db = upsert_row(
+        "Database",
+        {"id": f"root-{db_name}"},
+        {"id": f"root-{db_name}", "name": db_name, "display_label": db_name},
+    )
     schema = upsert_row("Schema", {"name": "s"}, {"name": "s"}, parent_id=db)
     tid = upsert_row("Table", {"name": table}, {"name": table}, parent_id=schema)
     cid = upsert_row("Column", {"name": column}, {"name": column}, parent_id=tid)
@@ -114,7 +121,10 @@ def test_a_join_link_records_its_reference(db_name) -> None:
     def node(cid: str) -> CatalogNode:
         return CatalogNode("c", label="Column", props={"id": cid}, existing_id=cid)
 
-    add_query([(node(left), node(right), {Props.JOIN: True, "refs": ["sql-1|a = b"]})])
+    add_query(
+        [(node(left), node(right), {Props.JOIN: True, "refs": ["sql-1|a = b"]})],
+        connection_id=f"root-{db_name}",
+    )
     rows = store().query_read(
         select(s.column__join.c.refs).where(s.column__join.c.source_column_id == left)
     )
@@ -138,7 +148,10 @@ def test_repeated_joins_accumulate_and_deduplicate(db_name) -> None:
         return CatalogNode("c", label="Column", props={"id": cid}, existing_id=cid)
 
     for ref in ("sql-1|a = b", "sql-2|a = b", "sql-1|a = b"):
-        add_query([(node(left), node(right), {Props.JOIN: True, "refs": [ref]})])
+        add_query(
+            [(node(left), node(right), {Props.JOIN: True, "refs": [ref]})],
+            connection_id=f"root-{db_name}",
+        )
 
     rows = store().query_read(
         select(s.column__join.c.refs).where(s.column__join.c.source_column_id == left)
@@ -146,52 +159,68 @@ def test_repeated_joins_accumulate_and_deduplicate(db_name) -> None:
     assert sorted(rows[0]["refs"]) == ["sql-1|a = b", "sql-2|a = b"]
 
 
-def test_a_reset_takes_the_statements_with_it(db_name) -> None:
-    """``sql_query`` has no foreign key into the catalog, so nothing cascades.
+def test_a_reset_takes_owned_statements_but_preserves_unresolved_legacy(
+    db_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CID-owned counters reset; NULL-owned SQL remains diagnostic, not a dedup target."""
+    from unittest.mock import Mock
+    from auto_ontology.dal import reset
 
-    Left behind, the rows are invisible but not inert: dedup matches on
-    ``md5(sql_full_query)``, so the next ingest merges into the stale row and
-    ``total_counter`` accumulates across resets.
-    """
-    from auto_ontology.dal.reset import _delete_orphaned_statements
+    for factory in ("get_data_vdb", "get_semantic_vdb"):
+        client = Mock()
+        client.delete_by_connection.return_value = []
+        monkeypatch.setattr(reset, factory, Mock(return_value=client))
 
     tid, cid = _column(db_name, "orders", "customer_id")
     statement = f"SELECT 1 -- {db_name}"
-    sql_id = upsert_row(
-        "Sql", {"sql_full_query": statement}, {"sql_full_query": statement}
-    )
+    # Simulate preserved legacy data, not a new ownerless write.
+    sql_id = store().query_write(
+        insert(s.sql_query).values(sql_full_query=statement).returning(s.sql_query.c.id)
+    )[0]["id"]
     store().query_write(
         insert(s.sql_query__table)
         .values(sql_query_id=sql_id, table_id=tid)
         .on_conflict_do_nothing()
     )
 
-    store().query_write(
-        s.catalog_database.delete().where(s.catalog_database.c.name == db_name)
+    owned = store().query_write(
+        insert(s.sql_query)
+        .values(connection_id=f"root-{db_name}", sql_full_query=statement)
+        .returning(s.sql_query.c.id)
+    )[0]["id"]
+    reset.delete_all_data(connection_id=f"root-{db_name}")
+    assert not store().query_read(
+        select(s.sql_query.c.id).where(s.sql_query.c.id == owned)
     )
-    # The link cascaded; the statement did not.
     assert store().query_read(
         select(s.sql_query.c.id).where(s.sql_query.c.id == sql_id)
     )
-
-    _delete_orphaned_statements()
-    assert not store().query_read(
-        select(s.sql_query.c.id).where(s.sql_query.c.id == sql_id)
+    assert store().query_read(
+        select(s.catalog_database.c.id).where(
+            s.catalog_database.c.id == f"root-{db_name}"
+        )
     )
+    store().query_write(s.sql_query.delete().where(s.sql_query.c.id == sql_id))
 
 
-def test_a_statement_owned_by_an_attribute_survives_the_sweep(db_name) -> None:
-    """The sweep must not reach the semantic tier.
+def test_unresolved_attribute_statement_survives_source_reset(
+    db_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source reset cannot claim ownership of legacy diagnostic definitions."""
+    from unittest.mock import Mock
+    from auto_ontology.dal import reset
 
-    A SqlAttribute's statement has no catalog link, so a sweep keyed on the
-    catalog links alone would delete it on every data-layer reset.
-    """
-    from auto_ontology.dal.reset import _delete_orphaned_statements
+    _column(db_name, "orders", "id")
+    for factory in ("get_data_vdb", "get_semantic_vdb"):
+        client = Mock()
+        client.delete_by_connection.return_value = []
+        monkeypatch.setattr(reset, factory, Mock(return_value=client))
 
     statement = f"SELECT 2 -- {db_name}"
-    sql_id = upsert_row(
-        "Sql", {"sql_full_query": statement}, {"sql_full_query": statement}
-    )
+    # Simulate preserved legacy data, not a new ownerless write.
+    sql_id = store().query_write(
+        insert(s.sql_query).values(sql_full_query=statement).returning(s.sql_query.c.id)
+    )[0]["id"]
     attr_id = store().query_write(
         s.sql_attribute.insert()
         .values(name=f"{db_name}-attr", expression=statement)
@@ -203,7 +232,7 @@ def test_a_statement_owned_by_an_attribute_survives_the_sweep(db_name) -> None:
         .on_conflict_do_nothing()
     )
     try:
-        _delete_orphaned_statements()
+        reset.delete_all_data(connection_id=f"root-{db_name}")
         assert store().query_read(
             select(s.sql_query.c.id).where(s.sql_query.c.id == sql_id)
         ), "a statement owned by a SqlAttribute must survive"

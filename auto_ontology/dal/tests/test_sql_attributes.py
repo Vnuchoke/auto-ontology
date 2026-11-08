@@ -57,7 +57,7 @@ def _link(table, **values) -> None:
 class World:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        self.database = _add(s.catalog_database, name=prefix)
+        self.database = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.database, name="public")
         self.tables: dict[str, str] = {}
         self.terms: dict[str, str] = {}
@@ -95,6 +95,7 @@ class World:
     ) -> str:
         aid = _add(
             s.sql_attribute,
+            connection_id=self.database,
             name=f"{self.prefix}-{name}",
             expression=expression,
             source=source,
@@ -102,7 +103,7 @@ class World:
         self.attributes[name] = aid
         _link(s.sql_attribute__term, attribute_id=aid, term_id=self.terms[term])
         if sql is not None:
-            qid = _add(s.sql_query, sql_full_query=sql)
+            qid = _add(s.sql_query, sql_full_query=sql, connection_id=self.database)
             self.queries.append(qid)
             _link(s.sql_attribute__sql, attribute_id=aid, sql_query_id=qid)
             for table in tables:
@@ -324,7 +325,7 @@ def test_several_statements_still_yield_one_row(world) -> None:
     """
     world.term("Revenue")
     attr = world.attribute("revenue", "Revenue", sql="SELECT 1")
-    second = _add(s.sql_query, sql_full_query="SELECT 2")
+    second = _add(s.sql_query, sql_full_query="SELECT 2", connection_id=world.database)
     world.queries.append(second)
     _link(s.sql_attribute__sql, attribute_id=attr, sql_query_id=second)
 
@@ -370,8 +371,15 @@ def test_find_by_name_excludes_the_attribute_being_edited(world) -> None:
     world.term("Revenue")
     attr = world.attribute("revenue", "Revenue", sql="SELECT 1")
 
-    assert sa.find_attr_by_name(f"{world.prefix}-revenue", exclude_id=attr) is None
-    found = sa.find_attr_by_name(f"{world.prefix}-revenue", exclude_id=None)
+    assert (
+        sa.find_attr_by_name(
+            f"{world.prefix}-revenue", exclude_id=attr, connection_id=world.database
+        )
+        is None
+    )
+    found = sa.find_attr_by_name(
+        f"{world.prefix}-revenue", exclude_id=None, connection_id=world.database
+    )
     assert found == {"id": attr, "name": f"{world.prefix}-revenue"}
 
 
@@ -385,6 +393,7 @@ def test_find_by_expression_ignores_case_and_whitespace(world) -> None:
         term_id=world.terms["Revenue"],
         expression="select sum(amount) from p",
         exclude_id=None,
+        connection_id=world.database,
     )
     assert hit == {"id": attr, "name": f"{world.prefix}-revenue"}
 
@@ -397,7 +406,10 @@ def test_find_by_expression_is_scoped_to_the_term(world) -> None:
 
     assert (
         sa.find_attr_by_expression(
-            term_id=world.terms["Profit"], expression="SELECT 1", exclude_id=None
+            term_id=world.terms["Profit"],
+            expression="SELECT 1",
+            exclude_id=None,
+            connection_id=world.database,
         )
         is None
     )
@@ -578,10 +590,11 @@ def test_with_sql_returns_one_row_per_attribute(world) -> None:
         "revenue", "Revenue", sql="SELECT 1", expression="sum(amount)"
     )
 
-    rows = sa.fetch_sql_attributes_with_sql([attr])
+    rows = sa.fetch_sql_attributes_with_sql([attr], connection_id=world.database)
     assert rows == [
         {
             "id": attr,
+            "connection_id": world.database,
             "name": f"{world.prefix}-revenue",
             "description": "",
             "expression": "sum(amount)",
@@ -601,7 +614,9 @@ def test_tables_from_attributes_dedupes_and_nests_columns(world) -> None:
     first = world.attribute("one", "Revenue", sql="SELECT 1", tables=("orders",))
     second = world.attribute("two", "Revenue", sql="SELECT 2", tables=("orders",))
 
-    tables = sa.fetch_tables_from_sql_attributes([first, second])
+    tables = sa.fetch_tables_from_sql_attributes(
+        [first, second], connection_id=world.database
+    )
     assert len(tables) == 1
     assert tables[0]["name"] == "orders"
     assert [c["name"] for c in tables[0]["columns"]] == ["id", "amount"]
@@ -627,7 +642,7 @@ def test_doc_text_format_is_reproduced_exactly(world) -> None:
     attr = world.attribute("revenue", "Revenue", sql="SELECT 1")
     sa.update_sql_attribute(attr, description="total revenue")
 
-    assert sa.fetch_sql_attribute_docs(attr) == [
+    assert sa.fetch_sql_attribute_docs(attr, connection_id=world.database) == [
         {
             "text": (
                 f"sql_attribute: {world.prefix}-revenue, "
@@ -641,6 +656,7 @@ def test_doc_text_format_is_reproduced_exactly(world) -> None:
             # the VDB metadata, where a None would have to be special-cased by
             # every reader.
             "source": "",
+            "connection_id": world.database,
         }
     ]
 
@@ -652,7 +668,10 @@ def test_doc_carries_the_attribute_source(world) -> None:
         "bridge", "Revenue", sql="SELECT 1", source=SQL_ATTR_SOURCE_BRIDGE
     )
 
-    assert sa.fetch_sql_attribute_docs(attr)[0]["source"] == SQL_ATTR_SOURCE_BRIDGE
+    assert (
+        sa.fetch_sql_attribute_docs(attr, connection_id=world.database)[0]["source"]
+        == SQL_ATTR_SOURCE_BRIDGE
+    )
 
 
 def test_a_blank_description_is_omitted_not_rendered_empty(world) -> None:
@@ -660,11 +679,16 @@ def test_a_blank_description_is_omitted_not_rendered_empty(world) -> None:
     attr = world.attribute("revenue", "Revenue", sql="SELECT 1")
     sa.update_sql_attribute(attr, description="   ")
 
-    text = sa.fetch_sql_attribute_docs(attr)[0]["text"]
+    text = sa.fetch_sql_attribute_docs(attr, connection_id=world.database)[0]["text"]
     assert "description:" not in text
     assert text.startswith(f"sql_attribute: {world.prefix}-revenue, term:")
 
 
 def test_docs_are_empty_without_a_statement(world) -> None:
     world.term("Revenue")
-    assert sa.fetch_sql_attribute_docs(world.attribute("orphan", "Revenue")) == []
+    assert (
+        sa.fetch_sql_attribute_docs(
+            world.attribute("orphan", "Revenue"), connection_id=world.database
+        )
+        == []
+    )

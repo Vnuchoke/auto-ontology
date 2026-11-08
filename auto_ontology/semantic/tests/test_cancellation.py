@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 import pytest
 
+from auto_ontology.connectors.sources import SourceDescriptor
+
 from auto_ontology.semantic import pipeline
 from auto_ontology.semantic.cancellation import (
     clear_cancel,
@@ -32,6 +34,14 @@ def _clean_flag() -> Iterator[None]:
     clear_cancel()
 
 
+@pytest.fixture(autouse=True)
+def active_source(monkeypatch):
+    monkeypatch.setattr(
+        "auto_ontology.connectors.sources.list_active_sources",
+        lambda: [SourceDescriptor("db", "Test", "sales", "postgres", "managed")],
+    )
+
+
 def test_flag_round_trips() -> None:
     assert is_cancelled() is False
     request_cancel()
@@ -41,7 +51,9 @@ def test_flag_round_trips() -> None:
 
 
 def _tables(n: int) -> list[dict[str, Any]]:
-    return [{"id": f"t{i}", "name": f"table_{i}"} for i in range(n)]
+    return [
+        {"id": f"t{i}", "name": f"table_{i}", "connection_id": "db"} for i in range(n)
+    ]
 
 
 def test_queued_tables_are_skipped_once_cancelled() -> None:
@@ -62,7 +74,9 @@ def test_queued_tables_are_skipped_once_cancelled() -> None:
             pipeline, "fetch_all_tables_without_term", return_value=_tables(25)
         ),
         patch.object(
-            pipeline, "fetch_table_context", return_value={"columns": [{"n": 1}]}
+            pipeline,
+            "fetch_table_context",
+            return_value={"columns": [{"n": 1}], "connection_id": "db"},
         ),
         patch.object(pipeline, "load_domain_summary", return_value=None),
         patch.object(pipeline, "is_distinct_value_probing_enabled", return_value=False),
@@ -91,7 +105,9 @@ def test_an_uncancelled_pass_still_processes_everything() -> None:
             pipeline, "fetch_all_tables_without_term", return_value=_tables(8)
         ),
         patch.object(
-            pipeline, "fetch_table_context", return_value={"columns": [{"n": 1}]}
+            pipeline,
+            "fetch_table_context",
+            return_value={"columns": [{"n": 1}], "connection_id": "db"},
         ),
         patch.object(pipeline, "load_domain_summary", return_value=None),
         patch.object(pipeline, "is_distinct_value_probing_enabled", return_value=False),
@@ -125,7 +141,9 @@ def test_cancelling_a_backlog_larger_than_the_pool_drains_cleanly() -> None:
             pipeline, "fetch_all_tables_without_term", return_value=_tables(40)
         ),
         patch.object(
-            pipeline, "fetch_table_context", return_value={"columns": [{"n": 1}]}
+            pipeline,
+            "fetch_table_context",
+            return_value={"columns": [{"n": 1}], "connection_id": "db"},
         ),
         patch.object(pipeline, "load_domain_summary", return_value=None),
         patch.object(pipeline, "is_distinct_value_probing_enabled", return_value=False),

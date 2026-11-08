@@ -12,7 +12,11 @@ import time
 
 from auto_ontology.semantic.bridge_tables import build_bridge_tables_sql_attributes
 from auto_ontology.semantic.cancellation import is_cancelled
-from auto_ontology.semantic.domain import DomainSummary, load_domain_summary
+from auto_ontology.semantic.domain import (
+    DomainSummary,
+    load_domain_summary,
+    selected_source,
+)
 from auto_ontology.semantic.embed import build_semantic_embedder
 from auto_ontology.semantic.semantic_fk import resolve_semantic_fks
 
@@ -31,7 +35,7 @@ SEMANTIC_LLM_MAX_INFLIGHT = int(os.environ.get("SEMANTIC_LLM_MAX_INFLIGHT", "6")
 
 
 def run_semantic_compilation(
-    database_name: str,
+    connection_id: str,
     *,
     domain_summary: DomainSummary | None = None,
 ) -> int:
@@ -40,19 +44,22 @@ def run_semantic_compilation(
     Returns the number of tables processed.
     """
     with limit_inflight(SEMANTIC_LLM_MAX_INFLIGHT):
-        return _run_semantic_compilation(database_name, domain_summary=domain_summary)
+        return _run_semantic_compilation(connection_id, domain_summary=domain_summary)
 
 
 def _run_semantic_compilation(
-    database_name: str,
+    connection_id: str,
     *,
     domain_summary: DomainSummary | None = None,
 ) -> int:
     """Body of :func:`run_semantic_compilation`, run under the concurrency bound."""
-    summary = domain_summary or load_domain_summary(database_name)
+    database_name = selected_source(connection_id).database_name
+    summary = domain_summary or load_domain_summary(connection_id)
 
     started = time.monotonic()
-    embedder = build_semantic_embedder(database_name, reset=False)
+    embedder = build_semantic_embedder(
+        database_name, connection_id=connection_id, reset=False
+    )
 
     logger.info("=" * 60)
     logger.info(
@@ -62,7 +69,7 @@ def _run_semantic_compilation(
     logger.info("=" * 60)
 
     count = compile_semantic_layer(
-        database_name,
+        connection_id,
         domain_summary=summary,
         embedder=embedder,
     )
@@ -88,7 +95,7 @@ def _run_semantic_compilation(
     logger.info("=" * 60)
     logger.info("Resolving semantic FK edges…")
     logger.info("=" * 60)
-    fk_count = resolve_semantic_fks(database_name)
+    fk_count = resolve_semantic_fks(connection_id)
     logger.info("Semantic FK edges created: %d", fk_count)
 
     from auto_ontology.semantic.sql_attribute_suggester import suggest_sql_attributes
@@ -96,13 +103,13 @@ def _run_semantic_compilation(
     logger.info("=" * 60)
     logger.info("Suggesting SqlAttributes from query history…")
     logger.info("=" * 60)
-    attr_count = suggest_sql_attributes(database_name)
+    attr_count = suggest_sql_attributes(connection_id)
     logger.info("New SqlAttribute nodes written: %d", attr_count)
 
     logger.info("=" * 60)
     logger.info("Building bridge tables sql attributes")
     logger.info("=" * 60)
-    bridge_table_count = build_bridge_tables_sql_attributes(database_name)
+    bridge_table_count = build_bridge_tables_sql_attributes(connection_id)
     logger.info("Bridge tables built: %d", bridge_table_count)
 
     # One line carrying every stage's result. Until now the last thing a

@@ -37,6 +37,7 @@ def _row(node_id: str, embedding: Any, text: str = "orders table") -> dict:
         name=node_id,
         schema_name="public",
         database_name="shop",
+        connection_id="shop-source",
     )
     if embedding is not None:
         row["metadata"]["embedding"] = embedding
@@ -109,7 +110,7 @@ def _unit(axis: int) -> list[float]:
 
 
 @pytest.fixture
-def vdb() -> Iterator["PostgresVDB"]:
+def vdb(identity_database: None) -> Iterator["PostgresVDB"]:
     connection_string = get_postgres_connection_string()
     try:
         psycopg.connect(connection_string, connect_timeout=3).close()
@@ -121,6 +122,7 @@ def vdb() -> Iterator["PostgresVDB"]:
         connection_string=connection_string,
         collection_name=name,
         schema_name="vdb",
+        connection_id="shop-source",
     )
     try:
         yield store

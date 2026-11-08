@@ -292,7 +292,14 @@ def _hits_to_semantic_rows(
             "label": lab,
             "score": score,
         }
-        for _field in ("name", "schema_name", "database_name", "data_type", "source"):
+        for _field in (
+            "name",
+            "schema_name",
+            "database_name",
+            "data_type",
+            "source",
+            "connection_id",
+        ):
             val = meta.get(_field)
             if val is not None:
                 row[_field] = val
@@ -307,6 +314,8 @@ def search_semantic_index(
     per_label_k: "int | dict[str, int]" = PER_LABEL_LIMIT,
     database_name: str | None = None,
     schema_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict]:
     """Vector search via the injected :class:`~auto_ontology.utils.retriever.Retriever`.
 
@@ -320,6 +329,23 @@ def search_semantic_index(
     The filter format (SQL string vs. dict) is read off the VDB the caller
     plugged into the retriever — see :func:`_metadata_filter_format`.
     """
+    from auto_ontology.vdb.postgres import PostgresVDB
+
+    vdb = (getattr(retriever, "vdb_kwargs", None) or {}).get("vdb")
+    global_pql = isinstance(vdb, PostgresVDB) and vdb.global_pql is True
+    if global_pql:
+        if connection_id is not None or label_filter != ["PqlAnalysis"]:
+            raise ValueError(
+                "invalid_global_pql: only PqlAnalysis vocabulary is allowed"
+            )
+    else:
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise ValueError("source_required: a single connection_id is required")
+        bound = getattr(vdb, "connection_id", None)
+        if bound is not None and bound != connection_id:
+            raise ValueError("source_conflict: connection_id differs from bound source")
+        if isinstance(vdb, PostgresVDB):
+            vdb._require_source_schema()
     fmt = _metadata_filter_format(retriever)
 
     allowed_labels = {str(x) for x in (label_filter or []) if x is not None} or None
@@ -333,6 +359,19 @@ def search_semantic_index(
             schema_name=schema_name,
             fmt=fmt,
         )
+        if fmt == "dict" and not global_pql:
+            where_clause = {**(where_clause or {}), "connection_id": connection_id}
+        elif fmt == "sql":
+            source_predicate = (
+                "connection_id IS NULL"
+                if global_pql
+                else f"connection_id = '{connection_id.replace(chr(39), chr(39) * 2)}'"
+            )
+            where_clause = (
+                f"({where_clause}) AND {source_predicate}"
+                if where_clause
+                else source_predicate
+            )
         vdb_kwargs = {"where": where_clause} if where_clause else None
         top_k = (
             _resolve_label_k(per_label_k, label)
@@ -341,7 +380,11 @@ def search_semantic_index(
         )
 
         hits = _query_with_retry(retriever, entity, top_k, vdb_kwargs)
-        all_hits.extend(hits)
+        all_hits.extend(
+            hit
+            for hit in hits
+            if _parse_hit_metadata(hit).get("connection_id") == connection_id
+        )
 
     return _hits_to_semantic_rows(
         all_hits, label_filter=allowed_labels, per_label_k=per_label_k

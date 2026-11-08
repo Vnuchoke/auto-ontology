@@ -498,7 +498,11 @@ function DatabaseBlock({
 				onToggle={() => setOpen((o) => !o)}
 				hasChildren={hasChildren}
 				loading={loadingSchemas}
-				name={database.name}
+				name={
+					database.display_label && database.display_label !== database.name
+						? `${database.display_label} (${database.name})`
+						: database.name
+				}
 				icon={catalogNodeInfo[DataModels.DB].icon}
 				title={catalogNodeInfo[DataModels.DB].title}
 				selected={selectedId === database.id}

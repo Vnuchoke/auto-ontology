@@ -29,6 +29,24 @@ from auto_ontology.semantic.visit_enter import (
     reset_sampling_breaker,
 )
 from auto_ontology.utils.sql_identifiers import qualified_name
+from auto_ontology.connectors.sources import SourceDescriptor
+
+
+@pytest.fixture(autouse=True)
+def _source_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "auto_ontology.semantic.visit_enter.list_active_sources",
+        lambda: [
+            SourceDescriptor("source-sales", "Sales", "sales", "postgres", "managed")
+        ],
+    )
+    monkeypatch.setattr(
+        "auto_ontology.semantic.visit_enter.get_connector", lambda _cid: None
+    )
+    monkeypatch.setattr(
+        "auto_ontology.semantic.visit_enter.fetch_terms_and_attributes_for_table",
+        lambda _table: ([], []),
+    )
 
 
 def _mock_connector(dialect: str = "postgres") -> MagicMock:
@@ -39,6 +57,7 @@ def _mock_connector(dialect: str = "postgres") -> MagicMock:
     assertion on the generated statement would pass vacuously.
     """
     connector = MagicMock()
+    connector.connection_id = "source-sales"
     connector.dialect = dialect
     connector.qualify.side_effect = lambda schema, table: qualified_name(
         schema, table, dialect=dialect
@@ -104,7 +123,12 @@ def test_calculate_columns_profiling_quotes_name_with_space(
     connector = _mock_connector("sqlite")
     connector.execute.return_value = df
 
-    table = {"id": "t1", "name": "Sales Orders", "schema_name": "main"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "Sales Orders",
+        "schema_name": "main",
+    }
     columns = [{"name": "OrderDate", "data_type": "TEXT"}]
 
     result = calculate_columns_profiling(table, columns, connector)
@@ -126,13 +150,19 @@ def test_profiling_probe_uses_the_connectors_qualification(
     # Building schema.table here instead sent the probe to the default catalog,
     # where the tables do not exist -- 197/197 tables failed, silently.
     connector = MagicMock()
+    connector.connection_id = "source-sales"
     connector.dialect = "spark"
     connector.qualify.side_effect = lambda schema, table: qualified_name(
         "nvapp", schema, table, dialect="spark"
     )
     connector.execute.return_value = pd.DataFrame({"id": [1, 2, 3]})
 
-    table = {"id": "t1", "name": "tbl_Click", "schema_name": "nvapp_client"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "tbl_Click",
+        "schema_name": "nvapp_client",
+    }
     columns = [{"name": "id", "data_type": "BIGINT"}]
 
     calculate_columns_profiling(table, columns, connector)
@@ -162,7 +192,12 @@ def test_calculate_columns_profiling_unhashable_values(
     connector = _mock_connector()
     connector.execute.return_value = df
 
-    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "schema_name": "public",
+    }
     columns = [
         {"name": "id", "data_type": "integer"},
         {"name": "tags", "data_type": "ARRAY"},
@@ -211,7 +246,12 @@ def test_calculate_columns_profiling_text_typed_array_column(
     connector = _mock_connector()
     connector.execute.return_value = df
 
-    table = {"id": "t1", "name": "events", "schema_name": "default"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "events",
+        "schema_name": "default",
+    }
     columns = [
         {"name": "id", "data_type": "Int64"},
         {"name": "labels", "data_type": "Array(String)"},
@@ -265,7 +305,12 @@ def test_calculate_columns_profiling(
     connector = _mock_connector()
     connector.execute.side_effect = _fake_execute
 
-    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "schema_name": "public",
+    }
     columns = [
         {"name": "id", "data_type": "integer"},
         {"name": "status", "data_type": "text"},
@@ -339,7 +384,12 @@ def test_calculate_columns_profiling_preserves_scalar_types(
     # column that triggers a DISTINCT probe; return empty to keep the top-N set.
     connector.execute.side_effect = [df, pd.DataFrame({"label": []})]
 
-    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "schema_name": "public",
+    }
     columns = [
         {"name": "amount", "data_type": "integer"},
         {"name": "ratio", "data_type": "numeric"},
@@ -385,9 +435,15 @@ def test_calculate_columns_profiling_infers_date_format(
         }
     )
     connector = MagicMock()
+    connector.connection_id = "source-sales"
     connector.execute.return_value = df
 
-    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "schema_name": "public",
+    }
     columns = [
         {"name": "id", "data_type": "integer"},
         {"name": "created_at", "data_type": "timestamp"},
@@ -425,9 +481,15 @@ def test_text_column_with_date_format_keeps_sample_values(
         }
     )
     connector = MagicMock()
+    connector.connection_id = "source-sales"
     connector.execute.return_value = df
 
-    table = {"id": "t1", "name": "users", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "users",
+        "schema_name": "public",
+    }
     columns = [
         {"name": "id", "data_type": "integer"},
         {"name": "signup_date", "data_type": "text"},
@@ -468,7 +530,12 @@ def test_calculate_columns_profiling_distinct_only_when_under_top_n(
     connector = _mock_connector()
     connector.execute.side_effect = [sample_df, status_distinct_df]
 
-    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "schema_name": "public",
+    }
     columns = [
         {"name": "city", "data_type": "string"},
         {"name": "status", "data_type": "text"},
@@ -521,14 +588,21 @@ def test_process_table_writes_term_and_attributes(
         ]
     )
 
-    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "public",
+    }
     ctx = {
+        "connection_id": "source-sales",
         "columns": [{"name": "amount", "data_type": "numeric"}],
         "fks": [],
     }
     mock_upsert_term.return_value = ("term-id", "Order (db.public.orders)")
 
-    process_table(table, ctx, domain_summary=None)
+    process_table(table, ctx, connection_id="source-sales", domain_summary=None)
 
     mock_upsert_term.assert_called_once_with("Order", "Order entity", "t1", synonyms=[])
     assert (
@@ -554,7 +628,12 @@ def test_distinct_probe_is_gated_but_the_row_sample_is_not(
     # sampled values, which is exactly the shape that triggers a DISTINCT probe.
     df = pd.DataFrame({"status": ["open", "open", "closed"]})
     columns = [{"name": "status", "data_type": "text"}]
-    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "schema_name": "public",
+    }
 
     off = _mock_connector()
     off.execute.return_value = df
@@ -573,7 +652,7 @@ def test_distinct_probe_is_gated_but_the_row_sample_is_not(
     assert sum("SELECT DISTINCT" in s for s in on_sql) == 1
 
 
-@patch("auto_ontology.semantic.visit_enter.get_connectors")
+@patch("auto_ontology.semantic.visit_enter.get_connector")
 @patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
 @patch("auto_ontology.semantic.visit_enter.upsert_table_term")
 @patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
@@ -583,11 +662,11 @@ def test_row_sample_runs_even_with_the_setting_off(
     mock_fk_suggest: MagicMock,
     mock_upsert_term: MagicMock,
     mock_merge_col_attr: MagicMock,
-    mock_get_connectors: MagicMock,
+    mock_get_connector: MagicMock,
 ) -> None:
     """``SELECT * ... LIMIT 1000`` is unconditional, end to end.
 
-    Asserted against the real connector-resolution path (``get_connectors``)
+    Asserted against the selected connector-resolution path (``get_connector``)
     rather than a patched ``_resolve_connector``, and by recording every SQL
     string the connector is asked to run.
     """
@@ -599,6 +678,7 @@ def test_row_sample_runs_even_with_the_setting_off(
     executed: list[str] = []
     spy = MagicMock()
     spy.database_name = "db"
+    spy.connection_id = "source-sales"
     spy.dialect = "spark"
     spy.qualify.side_effect = lambda s, t: f"`nvapp`.`{s}`.`{t}`"
 
@@ -607,14 +687,25 @@ def test_row_sample_runs_even_with_the_setting_off(
         return pd.DataFrame({"amount": [1, 2, 3]})
 
     spy.execute.side_effect = _record
-    mock_get_connectors.return_value = [spy]
+    mock_get_connector.return_value = spy
 
-    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
-    ctx = {"columns": [{"name": "amount", "data_type": "numeric"}], "fks": []}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "public",
+    }
+    ctx = {
+        "connection_id": "source-sales",
+        "columns": [{"name": "amount", "data_type": "numeric"}],
+        "fks": [],
+    }
 
     process_table(
         table,
         ctx,
+        connection_id="source-sales",
         domain_summary=None,
         database_name="db",
         probe_distinct_values=False,
@@ -642,11 +733,28 @@ def test_process_table_profiles_by_default(
     mock_fk_suggest.return_value = PotentialFkResult()
     mock_term.return_value = TableTermsResult(terms=[])
     mock_profiling.return_value = {}
+    mock_resolve.return_value = _mock_connector()
 
-    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
-    ctx = {"columns": [{"name": "amount", "data_type": "numeric"}], "fks": []}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "public",
+    }
+    ctx = {
+        "connection_id": "source-sales",
+        "columns": [{"name": "amount", "data_type": "numeric"}],
+        "fks": [],
+    }
 
-    process_table(table, ctx, domain_summary=None, database_name="db")
+    process_table(
+        table,
+        ctx,
+        connection_id="source-sales",
+        domain_summary=None,
+        database_name="db",
+    )
 
     mock_profiling.assert_called_once()
 
@@ -672,8 +780,15 @@ def test_process_table_skips_fk_columns(
         terms=[TermProposal(name="Order", description="", attributes=[])]
     )
 
-    table = {"id": "t1", "name": "orders", "description": "", "schema_name": ""}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "",
+    }
     ctx = {
+        "connection_id": "source-sales",
         "columns": [{"name": "customer_id", "data_type": "integer"}],
         "fks": [
             {
@@ -684,7 +799,7 @@ def test_process_table_skips_fk_columns(
         ],
     }
 
-    process_table(table, ctx, domain_summary=None)
+    process_table(table, ctx, connection_id="source-sales", domain_summary=None)
 
     mock_upsert_term.assert_not_called()
 
@@ -692,8 +807,14 @@ def test_process_table_skips_fk_columns(
 def test_process_table_marks_a_wide_llm_junction() -> None:
     from auto_ontology.semantic.models import PotentialFkResult
 
-    table = {"id": "line", "name": "order_product", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "line",
+        "name": "order_product",
+        "schema_name": "public",
+    }
     ctx = {
+        "connection_id": "source-sales",
         "columns": [
             {"name": "order_id", "data_type": "integer"},
             {"name": "product_id", "data_type": "integer"},
@@ -719,7 +840,7 @@ def test_process_table_marks_a_wide_llm_junction() -> None:
         ),
         patch("auto_ontology.semantic.visit_enter.mark_table_as_junction") as mock_mark,
     ):
-        process_table(table, ctx, domain_summary=None)
+        process_table(table, ctx, connection_id="source-sales", domain_summary=None)
 
     mock_mark.assert_called_once_with("line")
 
@@ -757,8 +878,13 @@ def test_process_table_rejects_insufficient_structural_junction_evidence(
         is_junction_table=True,
         junction_table_rationale="Intentionally over-positive LLM fixture.",
     )
-    table = {"id": "candidate", "name": "candidate", "schema_name": "public"}
-    ctx = {"columns": columns, "fks": declared_fks}
+    table = {
+        "connection_id": "source-sales",
+        "id": "candidate",
+        "name": "candidate",
+        "schema_name": "public",
+    }
+    ctx = {"connection_id": "source-sales", "columns": columns, "fks": declared_fks}
 
     with (
         patch(
@@ -770,7 +896,7 @@ def test_process_table_rejects_insufficient_structural_junction_evidence(
         ),
         patch("auto_ontology.semantic.visit_enter.mark_table_as_junction") as mock_mark,
     ):
-        process_table(table, ctx, domain_summary=None)
+        process_table(table, ctx, connection_id="source-sales", domain_summary=None)
 
     mock_mark.assert_not_called()
 
@@ -816,8 +942,15 @@ def test_process_table_multiple_terms(
         ]
     )
 
-    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "public",
+    }
     ctx = {
+        "connection_id": "source-sales",
         "columns": [
             {"name": "amount", "data_type": "numeric"},
             {"name": "created_at", "data_type": "timestamp"},
@@ -829,7 +962,7 @@ def test_process_table_multiple_terms(
         ("term-2", "Audit Metadata"),
     ]
 
-    process_table(table, ctx, domain_summary=None)
+    process_table(table, ctx, connection_id="source-sales", domain_summary=None)
 
     assert mock_upsert_term.call_count == 2
     assert mock_merge_col_attr.call_count == 2
@@ -845,6 +978,7 @@ class _CappedConnector:
 
     dialect = "spark"
     database_name = "nvdp"
+    connection_id = "source-sales"
     supports_statement_timeout = True
 
     def __init__(self, error: Exception | None = None) -> None:
@@ -861,15 +995,20 @@ class _CappedConnector:
         return pd.DataFrame({"id": [1, 2]})
 
 
-TABLE = {"id": "t1", "name": "elk_log", "schema_name": "raw"}
+TABLE = {
+    "connection_id": "source-sales",
+    "id": "t1",
+    "name": "elk_log",
+    "schema_name": "raw",
+}
 COLUMNS = [{"name": "id", "data_type": "bigint"}]
 
 
 @pytest.fixture(autouse=True)
 def _reset_breaker():
-    reset_sampling_breaker(_CappedConnector.database_name)
+    reset_sampling_breaker(_CappedConnector.connection_id)
     yield
-    reset_sampling_breaker(_CappedConnector.database_name)
+    reset_sampling_breaker(_CappedConnector.connection_id)
 
 
 @patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
@@ -930,7 +1069,7 @@ def test_one_success_clears_the_failure_streak(*_mocks) -> None:
     calculate_columns_profiling(TABLE, COLUMNS, failing)
     calculate_columns_profiling(TABLE, COLUMNS, failing)
 
-    # Both connectors share a key (the database name), so the success in the
+    # Both connectors share a connection ID, so the success in the
     # middle is what keeps the breaker closed here.
     assert not _sampling_breaker.is_open(failing)
 
@@ -993,20 +1132,31 @@ def test_a_tripped_breaker_stops_process_table_sampling(
         _sampling_breaker.record_failure(connector, TimeoutError("cancelled"))
     assert _sampling_breaker.is_open(connector)
 
-    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
-    ctx = {"columns": [{"name": "amount", "data_type": "numeric"}], "fks": []}
-    process_table(table, ctx, domain_summary=None, database_name="nvdp")
+    table = {
+        "connection_id": "source-sales",
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "public",
+    }
+    ctx = {
+        "connection_id": "source-sales",
+        "columns": [{"name": "amount", "data_type": "numeric"}],
+        "fks": [],
+    }
+    process_table(
+        table,
+        ctx,
+        connection_id="source-sales",
+        domain_summary=None,
+        database_name="nvdp",
+    )
 
     mock_profiling.assert_not_called()
 
 
-def test_the_breaker_key_matches_however_the_database_is_spelled() -> None:
-    """_resolve_connector matches case-insensitively, so the key must too.
-
-    A connector loaded from CONNECTION_STRINGS can spell its database
-    differently from the catalog name the run compiles under; a key that
-    disagreed with the reset would leave sampling off for every later run.
-    """
+def test_the_breaker_key_is_independent_of_physical_database_spelling() -> None:
+    """Different physical spelling cannot change the opaque source key."""
 
     class _Shouty(_CappedConnector):
         database_name = "NVDP"
@@ -1016,6 +1166,6 @@ def test_the_breaker_key_matches_however_the_database_is_spelled() -> None:
         _sampling_breaker.record_failure(dead, TimeoutError("cancelled"))
     assert _sampling_breaker.is_open(dead)
 
-    reset_sampling_breaker("nvdp")
+    reset_sampling_breaker("source-sales")
 
     assert not _sampling_breaker.is_open(dead)

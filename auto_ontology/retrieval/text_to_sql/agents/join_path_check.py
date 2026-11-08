@@ -138,8 +138,18 @@ class JoinPathCheckAgent(BaseAgent):
             if candidate_sql != sql_code:
                 reason = (
                     detect_degenerate_sql(candidate_sql, dialect)
-                    or detect_vacuous_group_by(candidate_sql, dialect, database_name)
-                    or detect_missing_aggregation(candidate_sql, dialect, database_name)
+                    or detect_vacuous_group_by(
+                        candidate_sql,
+                        dialect,
+                        database_name,
+                        connection_id=state["connection_id"],
+                    )
+                    or detect_missing_aggregation(
+                        candidate_sql,
+                        dialect,
+                        database_name,
+                        connection_id=state["connection_id"],
+                    )
                 )
                 if reason:
                     self.logger.info(
@@ -279,7 +289,9 @@ class JoinPathCheckAgent(BaseAgent):
         # co-resident database (see find_table_id_by_name).
         ids: list[str] = []
         for name in missing_names:
-            table_id = find_table_id_by_name(name, database_name)
+            table_id = find_table_id_by_name(
+                name, database_name, connection_id=path_state["connection_id"]
+            )
             if table_id:
                 ids.append(table_id)
 
@@ -287,7 +299,9 @@ class JoinPathCheckAgent(BaseAgent):
             path_state["relevant_tables"] = relevant_tables
             return
 
-        bridge_tables = fetch_tables_by_ids(ids)
+        bridge_tables = fetch_tables_by_ids(
+            ids, connection_id=path_state["connection_id"]
+        )
         existing_ids = {t.get("id") for t in relevant_tables}
         for tbl in bridge_tables:
             if tbl.get("id") not in existing_ids:

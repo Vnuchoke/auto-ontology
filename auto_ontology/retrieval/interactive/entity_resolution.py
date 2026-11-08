@@ -20,6 +20,8 @@ import re
 
 from langchain_core.messages import HumanMessage
 
+from auto_ontology.connectors.sources import SourceSelectionError
+
 from auto_ontology.retrieval.entity_coverage.graph import (
     create_graph as _create_entity_coverage_graph,
 )
@@ -155,12 +157,16 @@ def _run_entity_coverage_pipeline(
     question: str,
     semantic_retriever: object,
     db_name: str | None,
+    *,
+    connection_id: str | None = None,
 ) -> dict:
     """Invoke the entity-coverage LangGraph and return its final path_state.
 
     Uses the reasoning LLM (state["llm"]) for extraction per main's decision.
     Returns an empty dict on any failure so callers degrade gracefully.
     """
+    if not connection_id:
+        raise SourceSelectionError(422, "source_required")
     try:
         llm = get_llm_client()
     except Exception as exc:
@@ -173,10 +179,10 @@ def _run_entity_coverage_pipeline(
         "max_distance": CLARIFY_MAX_DISTANCE,
         "return_uncovered_entities": True,
     }
-    if db_name:
-        path_state["target_db"] = db_name
+    path_state["connection_id"] = connection_id
 
     state = {
+        "connection_id": connection_id,
         "llm": llm,
         "initial_question": question,
         "messages": [HumanMessage(content=question)],
@@ -245,6 +251,8 @@ def _collect_ambiguous_hits(
     semantic_retriever: object,
     db_name: str | None,
     ambiguous_entities: set[str],
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, list[dict]]:
     """Fresh, per-entity top-_AMBIGUOUS_HITS_TOP_K column-attribute candidates
     for each ambiguous entity, re-queried directly against the VDB.
@@ -265,7 +273,13 @@ def _collect_ambiguous_hits(
     needed.
     """
     return {
-        e: _entity_ranked_hits(e, semantic_retriever, db_name, k=_AMBIGUOUS_HITS_TOP_K)
+        e: _entity_ranked_hits(
+            e,
+            semantic_retriever,
+            db_name,
+            k=_AMBIGUOUS_HITS_TOP_K,
+            connection_id=connection_id,
+        )
         for e in ambiguous_entities
     }
 
@@ -384,7 +398,12 @@ def _distinct_columns_note(pairs: list[tuple[str, dict, str]]) -> str:
 
 
 def _entity_ranked_hits(
-    entity: str, semantic_retriever: object, db_name: str | None, k: int = 5
+    entity: str,
+    semantic_retriever: object,
+    db_name: str | None,
+    k: int = 5,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict]:
     """Fresh, per-entity ranked VDB candidates for *entity* (best first).
 
@@ -396,6 +415,8 @@ def _entity_ranked_hits(
     dedup. Re-querying is only done for entities that actually collide, so the
     extra VDB calls are rare.
     """
+    if not connection_id:
+        raise SourceSelectionError(422, "source_required")
     try:
         hits = search_semantic_index(
             semantic_retriever,
@@ -403,6 +424,7 @@ def _entity_ranked_hits(
             label_filter=[LABEL_COLUMN_ATTRIBUTE],
             per_label_k=k,
             database_name=db_name,
+            connection_id=connection_id,
         )
     except Exception:
         logger.warning(
@@ -693,6 +715,8 @@ def _resolve_collisions(
     hit_verdicts: dict[str, bool] | None = None,
     kb_text_by_norm: dict[str, tuple[str, str]] | None = None,
     adjudicated_norms_out: set[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[str]:
     """Resolve entities whose best VDB hit collides with another entity's, in place.
 
@@ -761,6 +785,8 @@ def _resolve_collisions(
       5. If the LLM call fails to parse: drop the lower-confidence entity from
          best_hit_per_entity entirely (treat as VDB-unresolved) rather than guess.
     """
+    if not connection_id:
+        raise SourceSelectionError(422, "source_required")
     notes: list[str] = []
     kb_covered_norms = kb_covered_norms or set()
     hit_verdicts = {} if hit_verdicts is None else hit_verdicts
@@ -832,7 +858,10 @@ def _resolve_collisions(
             # group as a participant, KB formula injected as a candidate for
             # whichever entities have one.
             fresh_hits = {
-                e: _entity_ranked_hits(e, semantic_retriever, db_name) for e in entities
+                e: _entity_ranked_hits(
+                    e, semantic_retriever, db_name, connection_id=connection_id
+                )
+                for e in entities
             }
             entity_candidates: dict[str, list[dict]] = {}
             for e in entities:
@@ -940,7 +969,10 @@ def _resolve_collisions(
 
         # Fresh per-entity queries — see _entity_ranked_hits for why col_hits can't be reused.
         fresh_hits = {
-            e: _entity_ranked_hits(e, semantic_retriever, db_name) for e in entities
+            e: _entity_ranked_hits(
+                e, semantic_retriever, db_name, connection_id=connection_id
+            )
+            for e in entities
         }
 
         def _score_for_shared(e: str) -> float:
@@ -1099,6 +1131,8 @@ def _find_unresolvable_entities(
     hit_verdicts: dict[str, bool] | None = None,
     ambiguous_hits_out: dict[str, list[dict]] | None = None,
     adjudicated_norms_out: set[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> tuple[
     list[tuple[str, str | None]],
     list[tuple[str, str, float, str]],
@@ -1159,7 +1193,9 @@ def _find_unresolvable_entities(
         return [], [], "", set(), {}, set(), []
 
     # --- Step 1: run entity-coverage pipeline ---
-    ec_path_state = _run_entity_coverage_pipeline(question, semantic_retriever, db_name)
+    ec_path_state = _run_entity_coverage_pipeline(
+        question, semantic_retriever, db_name, connection_id=connection_id
+    )
     if not ec_path_state:
         return [], [], "", set(), {}, set(), []
 
@@ -1210,7 +1246,12 @@ def _find_unresolvable_entities(
         # it fresh with exactly this call's ambiguous entities, nothing carried
         # over from an earlier turn's (possibly stale) working_question.
         ambiguous_hits_out.update(
-            _collect_ambiguous_hits(semantic_retriever, db_name, normalized_ambiguous)
+            _collect_ambiguous_hits(
+                semantic_retriever,
+                db_name,
+                normalized_ambiguous,
+                connection_id=connection_id,
+            )
         )
 
     # Build VDB-uncovered set: entities the pipeline marked uncovered + ambiguous ones.
@@ -1312,6 +1353,7 @@ def _find_unresolvable_entities(
         hit_verdicts,
         kb_text_by_norm,
         adjudicated_norms_out,
+        connection_id=connection_id,
     )
 
     # Reconcile needs_kb_rescue against what collision resolution actually did —

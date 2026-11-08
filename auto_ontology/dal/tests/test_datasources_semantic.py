@@ -65,7 +65,7 @@ class World:
 
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        self.db = _add(s.catalog_database, name=prefix)
+        self.db = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.db, name="shop")
         self.tables: dict[str, str] = {}
         self.columns: dict[str, str] = {}
@@ -260,13 +260,15 @@ def test_tables_for_schema_carries_each_tables_tags(world) -> None:
 
 
 def test_tables_without_term_excludes_termed_tables(world) -> None:
-    before = {r["name"] for r in d.fetch_all_tables_without_term(world.prefix)}
+    before = {
+        r["name"] for r in d.fetch_all_tables_without_term(connection_id=world.db)
+    }
     assert before == {"customers", "orders", "order_tag", "tags"}
 
     term = world.term("Order")
     _link(s.table__term, table_id=world.tables["orders"], term_id=term)
 
-    after = {r["name"] for r in d.fetch_all_tables_without_term(world.prefix)}
+    after = {r["name"] for r in d.fetch_all_tables_without_term(connection_id=world.db)}
     assert after == before - {"orders"}
 
 
@@ -280,11 +282,15 @@ def test_tables_without_term_scopes_to_one_database(world) -> None:
     # The second database is created here rather than assumed. The fixture
     # builds exactly one, so comparing against whatever else happens to be in
     # the store passes only on a dirty database and fails on a clean one.
-    other_db = _add(s.catalog_database, name=f"{world.prefix}-other")
+    other_db = _add(
+        s.catalog_database,
+        name=f"{world.prefix}-other",
+        display_label=f"{world.prefix}-other",
+    )
     other_schema = _add(s.catalog_schema, database_id=other_db, name="shop")
     _add(s.catalog_table, schema_id=other_schema, name="elsewhere")
     try:
-        scoped = d.fetch_all_tables_without_term(world.prefix)
+        scoped = d.fetch_all_tables_without_term(connection_id=world.db)
         everything = d.fetch_all_tables_without_term()
 
         scoped_names = {r["name"] for r in scoped}
@@ -301,7 +307,7 @@ def test_tables_without_term_scopes_to_one_database(world) -> None:
 
 def test_tables_without_term_reads_the_tables_own_description(world) -> None:
     """No Term means no Term description to fall back to, by construction."""
-    rows = _by_name(d.fetch_all_tables_without_term(world.prefix))
+    rows = _by_name(d.fetch_all_tables_without_term(connection_id=world.db))
     assert rows["customers"]["description"] == "People who buy"
     assert rows["orders"]["description"] is None
 
@@ -348,6 +354,11 @@ def test_columns_for_table_returns_none_for_a_missing_table() -> None:
 
 def test_columns_for_table_uses_the_description_fallback(world) -> None:
     attribute = world.attribute("order-total", "money, in cents")
+    store().query_write(
+        s.column_attribute.update()
+        .where(s.column_attribute.c.id == attribute)
+        .values(table_id=world.tables["orders"])
+    )
     _link(
         s.column__has_attribute,
         column_id=world.columns["orders.total"],
@@ -506,11 +517,11 @@ def test_a_table_id_pulls_in_all_of_its_columns(world) -> None:
     assert database == world.prefix
 
 
-def test_a_column_id_pulls_in_only_itself(world) -> None:
+def test_a_column_id_pulls_in_only_itself_and_owning_table_context(world) -> None:
     tables, columns, database = d.fetch_tables_and_columns_by_node_ids(
         [world.columns["orders.total"]]
     )
-    assert tables.empty
+    assert tables["id"].tolist() == [world.tables["orders"]]
     assert list(columns["column_name"]) == ["total"]
     # The database name still resolves, from the column frame.
     assert database == world.prefix
@@ -520,6 +531,36 @@ def test_no_ids_yields_empty_frames_and_no_database() -> None:
     tables, columns, database = d.fetch_tables_and_columns_by_node_ids([])
     assert tables.empty and columns.empty
     assert database == ""
+
+
+def test_column_refresh_does_not_embed_its_parent_table(world, monkeypatch) -> None:
+    from unittest.mock import Mock
+    from auto_ontology.server.datasources import service
+    from auto_ontology import utils, vdb
+    from auto_ontology.utils import embedding
+    from auto_ontology.vdb import records
+
+    captured = []
+    client = Mock()
+    monkeypatch.setattr(utils, "get_embed_params", lambda: None)
+    monkeypatch.setattr(vdb, "get_data_vdb", Mock(return_value=client))
+    monkeypatch.setattr(
+        embedding,
+        "embed_rows",
+        lambda rows, *args, **kwargs: captured.extend(rows) or rows,
+    )
+    monkeypatch.setattr(records, "write_embedded_rows", lambda client, rows: len(rows))
+    column = world.columns["orders.total"]
+    service._refresh_vdb_embeddings([column])
+    assert [
+        (
+            row["metadata"]["id"],
+            row["metadata"]["label"],
+            row["metadata"]["connection_id"],
+        )
+        for row in captured
+    ] == [(column, "Column", world.db)]
+    client.delete_by_id.assert_called_once_with(column, connection_id=world.db)
 
 
 def test_node_ids_uses_the_fallback_for_columns_but_not_tables(world) -> None:
@@ -532,6 +573,11 @@ def test_node_ids_uses_the_fallback_for_columns_but_not_tables(world) -> None:
     table__term = world.term("Order", "a purchase")
     _link(s.table__term, table_id=world.tables["orders"], term_id=table__term)
     attribute = world.attribute("order-total", "money, in cents")
+    store().query_write(
+        s.column_attribute.update()
+        .where(s.column_attribute.c.id == attribute)
+        .values(table_id=world.tables["orders"])
+    )
     _link(
         s.column__has_attribute,
         column_id=world.columns["orders.total"],
@@ -572,7 +618,7 @@ def test_mark_table_as_junction_is_idempotent_and_promote_only(world) -> None:
 
 
 def test_a_pure_junction_table_is_a_candidate(world) -> None:
-    rows = d.fetch_bridge_table_candidates(world.prefix)
+    rows = d.fetch_bridge_table_candidates(world.db)
     assert [r["table_name"] for r in rows] == ["order_tag"]
 
     pairs = sorted(rows[0]["fk_pairs"], key=lambda p: p["source_column"])
@@ -597,7 +643,7 @@ def test_a_pure_junction_table_is_a_candidate(world) -> None:
 def test_one_non_fk_column_disqualifies_the_table(world) -> None:
     """Exactly what rules out Pagila's `film_actor`: a `last_update` column."""
     world.column("order_tag", "last_update", 3)
-    assert d.fetch_bridge_table_candidates(world.prefix) == []
+    assert d.fetch_bridge_table_candidates(world.db) == []
 
 
 def test_an_existing_attribute_disqualifies_the_table(world) -> None:
@@ -608,21 +654,26 @@ def test_an_existing_attribute_disqualifies_the_table(world) -> None:
         column_id=world.columns["order_tag.tag_id"],
         attribute_id=attribute,
     )
-    assert d.fetch_bridge_table_candidates(world.prefix) == []
+    assert d.fetch_bridge_table_candidates(world.db) == []
 
 
 def test_an_existing_bridge_disqualifies_the_table(world) -> None:
     """Without this the suggester re-proposes a bridge it already created."""
-    query = _add(s.sql_query, sql_full_query=f"SELECT 2 -- {world.prefix}")
+    query = _add(
+        s.sql_query,
+        sql_full_query=f"SELECT 2 -- {world.prefix}",
+        connection_id=world.db,
+    )
     _link(s.sql_query__table, sql_query_id=query, table_id=world.tables["order_tag"])
     attribute = _add(
         s.sql_attribute,
         name=f"{world.prefix}-bridge",
         source=SQL_ATTR_SOURCE_BRIDGE,
+        connection_id=world.db,
     )
     _link(s.sql_attribute__sql, attribute_id=attribute, sql_query_id=query)
 
-    assert d.fetch_bridge_table_candidates(world.prefix) == []
+    assert d.fetch_bridge_table_candidates(world.db) == []
 
     store().query_write(s.sql_query.delete().where(s.sql_query.c.id == query))
 
@@ -636,7 +687,7 @@ def test_a_bridge_from_some_other_source_does_not_disqualify(world) -> None:
     )
     _link(s.sql_attribute__sql, attribute_id=attribute, sql_query_id=query)
 
-    assert [r["table_name"] for r in d.fetch_bridge_table_candidates(world.prefix)] == [
+    assert [r["table_name"] for r in d.fetch_bridge_table_candidates(world.db)] == [
         "order_tag"
     ]
 
@@ -673,7 +724,7 @@ def test_a_semantic_fk_counts_as_a_foreign_key(world) -> None:
         attribute_id=attribute,
     )
 
-    rows = {r["table_name"]: r for r in d.fetch_bridge_table_candidates(world.prefix)}
+    rows = {r["table_name"]: r for r in d.fetch_bridge_table_candidates(world.db)}
     assert "order_note" in rows
     semantic = next(
         p for p in rows["order_note"]["fk_pairs"] if p["source_column"] == "tag_ref"
@@ -694,7 +745,7 @@ def test_a_self_referential_bridge_is_allowed(world) -> None:
             target_column_id=world.columns["orders.order_id"],
         )
 
-    rows = {r["table_name"]: r for r in d.fetch_bridge_table_candidates(world.prefix)}
+    rows = {r["table_name"]: r for r in d.fetch_bridge_table_candidates(world.db)}
     assert "also_order" in rows
     assert {p["target_table"] for p in rows["also_order"]["fk_pairs"]} == {"orders"}
     assert len(rows["also_order"]["fk_pairs"]) == 2
@@ -709,7 +760,7 @@ def test_a_single_column_table_is_not_a_bridge(world) -> None:
         source_column_id=world.columns["solo.order_id"],
         target_column_id=world.columns["orders.order_id"],
     )
-    names = [r["table_name"] for r in d.fetch_bridge_table_candidates(world.prefix)]
+    names = [r["table_name"] for r in d.fetch_bridge_table_candidates(world.db)]
     assert "solo" not in names
 
 
@@ -736,7 +787,7 @@ def test_an_fk_pointing_outside_the_catalog_disqualifies(world) -> None:
         target_column_id=orphan,
     )
     assert "tag_link" in [
-        r["table_name"] for r in d.fetch_bridge_table_candidates(world.prefix)
+        r["table_name"] for r in d.fetch_bridge_table_candidates(world.db)
     ]
 
     # The FK row cascades away with its target, leaving other_id unresolvable.
@@ -744,5 +795,5 @@ def test_an_fk_pointing_outside_the_catalog_disqualifies(world) -> None:
         s.catalog_column.delete().where(s.catalog_column.c.id == orphan)
     )
     assert "tag_link" not in [
-        r["table_name"] for r in d.fetch_bridge_table_candidates(world.prefix)
+        r["table_name"] for r in d.fetch_bridge_table_candidates(world.db)
     ]

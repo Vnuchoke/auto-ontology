@@ -14,6 +14,21 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "IngestRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "connection_id": {
+            "pattern": "\\S",
+            "title": "Connection Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id"
+        ],
+        "title": "IngestRequest",
+        "type": "object"
+      },
       "SemanticRunningResponse": {
         "additionalProperties": true,
         "description": "The ingestion service's own status endpoint: whether a compilation pass\nis executing right now, when the last one finished successfully, and when\nit last failed (only set if more recent than the last success).",
@@ -118,15 +133,13 @@
   "paths": {
     "/ingest": {
       "post": {
-        "description": "Trigger a non-blocking ingest for a single connection.",
+        "description": "Queue one active source by opaque ID; no credentials or physical-name routing.\n\nValidate metadata before queueing work or opening drivers/models. Unknown\nor inactive IDs return 404, malformed selectors return 422.",
         "operationId": "ingest_connection_ingest_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": true,
-                "title": "Connection",
-                "type": "object"
+                "$ref": "#/components/schemas/IngestRequest"
               }
             }
           },
@@ -159,15 +172,16 @@
     },
     "/ingest/delete": {
       "post": {
-        "description": "Trigger a non-blocking reset of a database's ingested data.\n\n``database_name`` is required: this endpoint always targets one database.",
+        "description": "Queue final cleanup of one retired source by required opaque connection ID.\n\nNo active-source or credential lookup is performed. Unknown IDs are allowed\nfor idempotent cleanup after root removal; physical-name selectors are rejected.\nA 202 acknowledges queueing, not successful cleanup.",
         "operationId": "ingest_delete_ingest_delete_post",
         "parameters": [
           {
             "in": "query",
-            "name": "database_name",
+            "name": "connection_id",
             "required": true,
             "schema": {
-              "title": "Database Name",
+              "pattern": "\\S",
+              "title": "Connection Id",
               "type": "string"
             }
           }
@@ -218,23 +232,24 @@
     },
     "/semantic/reset": {
       "post": {
-        "description": "Trigger a non-blocking reset of a database's semantic layer.\n\nDeletes the semantic nodes and embeddings, then asks for a compilation pass\nso the layer is rebuilt without waiting for the scheduler's next run.\nOmitting ``database_name`` resets every database.\n\nThe three steps are strictly ordered \u2014 stop the running pass, wait for it to\nstop, delete, then rebuild \u2014 and run as a background task, so this returns\nimmediately while the wait can take minutes. They used to overlap, which\nlost data in both directions: a pass reads its work list once at the start,\nso one beginning before the delete finished saw every table still carrying a\nTerm and compiled nothing, while a pass still running during the delete kept\nwriting Terms it had already swept past.",
+        "description": "Queue a semantic reset by opaque connection ID, or all sources if omitted.\n\nDeletes the semantic nodes and embeddings, then asks for a compilation pass\nso the layer is rebuilt without waiting for the scheduler's next run.\nGlobal PQL vocabulary is preserved. Legacy physical-name selectors are\nrejected rather than silently causing a global reset. A 202 only acknowledges\nqueueing, not successful deletion or rebuild.\n\nThe three steps are strictly ordered \u2014 stop the running pass, wait for it to\nstop, delete, then rebuild \u2014 and run as a background task, so this returns\nimmediately while the wait can take minutes. They used to overlap, which\nlost data in both directions: a pass reads its work list once at the start,\nso one beginning before the delete finished saw every table still carrying a\nTerm and compiled nothing, while a pass still running during the delete kept\nwriting Terms it had already swept past.",
         "operationId": "semantic_reset_semantic_reset_post",
         "parameters": [
           {
             "in": "query",
-            "name": "database_name",
+            "name": "connection_id",
             "required": false,
             "schema": {
               "anyOf": [
                 {
+                  "pattern": "\\S",
                   "type": "string"
                 },
                 {
                   "type": "null"
                 }
               ],
-              "title": "Database Name"
+              "title": "Connection Id"
             }
           }
         ],

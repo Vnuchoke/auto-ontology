@@ -64,7 +64,7 @@ class _Catalog:
 
     def __init__(self, name: str) -> None:
         self.name = name
-        self.db = _add(s.catalog_database, name=name)
+        self.db = _add(s.catalog_database, name=name, display_label=name)
         self.schema = _add(s.catalog_schema, database_id=self.db, name="public")
         self.orders = _add(s.catalog_table, schema_id=self.schema, name="orders")
         self.items = _add(s.catalog_table, schema_id=self.schema, name="items")

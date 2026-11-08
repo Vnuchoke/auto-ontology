@@ -22,7 +22,15 @@ from auto_ontology.catalog.constants import Labels
 
 from auto_ontology.semantic.constants import LABEL_SQL_ATTRIBUTE
 
-from auto_ontology.dal.candidates import expand_info
+from auto_ontology.dal.custom_analyses import (
+    fetch_custom_analyses_with_sql,
+    fetch_tables_from_custom_analyses,
+)
+from auto_ontology.dal.sql_attributes import (
+    fetch_sql_attributes_with_sql,
+    fetch_tables_from_sql_attributes,
+)
+from auto_ontology.dal.datasources import fetch_col_table_contexts, fetch_tables_by_ids
 from auto_ontology.retrieval.data_access.relevant_tables import (
     _normalize_table_to_relevant_shape,
 )
@@ -39,13 +47,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def expand_info(ids_and_labels: list | None, *, connection_id: str | None) -> dict:
+    """Hydrate only verified owned nodes; hit metadata is not ownership evidence."""
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("source_required: a single connection_id is required")
+    result: dict = {}
+    for item in ids_and_labels or []:
+        node_id, label = item.get("id"), item.get("label")
+        if label == Labels.COLUMN:
+            context = fetch_col_table_contexts(
+                [node_id], connection_id=connection_id
+            ).get(node_id)
+            if not context:
+                continue
+            tables = fetch_tables_by_ids(
+                [context["table_id"]], connection_id=connection_id
+            )
+            result[node_id] = {**context, "relevant_tables": tables}
+        elif label in (Labels.CUSTOM_ANALYSIS, LABEL_SQL_ATTRIBUTE):
+            fetch, fetch_tables = (
+                (fetch_custom_analyses_with_sql, fetch_tables_from_custom_analyses)
+                if label == Labels.CUSTOM_ANALYSIS
+                else (fetch_sql_attributes_with_sql, fetch_tables_from_sql_attributes)
+            )
+            rows = fetch([node_id], connection_id=connection_id)
+            if rows:
+                result[node_id] = {
+                    **rows[0],
+                    "relevant_tables": fetch_tables(
+                        [node_id], connection_id=connection_id
+                    ),
+                }
+        elif label == Labels.TABLE:
+            tables = fetch_tables_by_ids([node_id], connection_id=connection_id)
+            if tables:
+                result[node_id] = tables[0]
+    return result
+
+
 def _get_candidates_information(
     retriever: "Retriever",
     entity: str,
     list_of_semantic: list | None = None,
     database_name: str | None = None,
     per_label_k: "int | dict[str, int]" = PER_LABEL_LIMIT,
-):
+    *,
+    connection_id: str | None = None,
+) -> list[dict]:
     """Vector search, then merge graph properties from :func:`expand_info`.
 
     Runs one query per label with a server-side ``where`` predicate
@@ -59,11 +107,13 @@ def _get_candidates_information(
             label_filter=list_of_semantic,
             database_name=database_name,
             per_label_k=per_label_k,
+            connection_id=connection_id,
         )
     )
 
     ids_and_labels = [{"label": x["label"], "id": x["id"]} for x in results]
-    props_by_id = expand_info(ids_and_labels)
+    props_by_id = expand_info(ids_and_labels, connection_id=connection_id)
+    results = [c for c in results if c["id"] in props_by_id]
     for c in results:
         cid = c.get("id")
         if cid is None:
@@ -117,6 +167,8 @@ def extract_candidates(
     entities: list[str],
     query_with_values: str = "",
     database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """One semantic search per pull string (``query_with_values`` and each entity name).
 
@@ -151,6 +203,7 @@ def extract_candidates(
                 list_of_semantic=target_labels,
                 database_name=database_name,
                 per_label_k=PER_LABEL_LIMITS,
+                connection_id=connection_id,
             )
             or []
         )

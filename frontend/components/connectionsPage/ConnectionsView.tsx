@@ -70,28 +70,28 @@ export const ConnectionsView = () => {
 		void invalidateConnectionList(queryClient);
 	};
 
-	const handleSsoFederationChange = async (databaseName: string, enabled: boolean) => {
+	const handleSsoFederationChange = async (connectionId: string, enabled: boolean) => {
 		setSsoError(null);
-		setSsoFederationPending(databaseName);
+		setSsoFederationPending(connectionId);
 
 		// Optimistic update — applied before the write so the checkbox doesn't
 		// snap back while it is out.
 		await patchConnections((prev) =>
 			prev.map((c) =>
-				c.database_name === databaseName
+				c.connection_id === connectionId
 					? { ...c, connection: { ...c.connection, sso_federation: enabled } }
 					: c,
 			),
 		);
 
-		const res = await connectionsApi.setSsoFederation(databaseName, enabled);
+		const res = await connectionsApi.setSsoFederation(connectionId, enabled);
 		setSsoFederationPending(null);
 
 		if (res.error) {
 			// Revert optimistic update on failure.
 			await patchConnections((prev) =>
 				prev.map((c) =>
-					c.database_name === databaseName
+					c.connection_id === connectionId
 						? { ...c, connection: { ...c.connection, sso_federation: !enabled } }
 						: c,
 				),
@@ -100,9 +100,9 @@ export const ConnectionsView = () => {
 		}
 	};
 
-	const handleDeleteRequest = (databaseName: string) => {
+	const handleDeleteRequest = (connectionId: string) => {
 		setDeleteError(null);
-		setDeletingConnection(databaseName);
+		setDeletingConnection(connectionId);
 	};
 
 	const handleDeleteClose = () => {
@@ -124,7 +124,7 @@ export const ConnectionsView = () => {
 		}
 
 		await patchConnections((prev) =>
-			prev.filter((c) => c.database_name !== deletingConnection),
+			prev.filter((c) => c.connection_id !== deletingConnection),
 		);
 		setDeletingConnection(null);
 	};
@@ -188,8 +188,8 @@ export const ConnectionsView = () => {
 						connections={connections}
 						onEdit={handleEditConnection}
 						onDelete={handleDeleteRequest}
-						onSsoFederationChange={(databaseName, enabled) => {
-							void handleSsoFederationChange(databaseName, enabled);
+						onSsoFederationChange={(connectionId, enabled) => {
+							void handleSsoFederationChange(connectionId, enabled);
 						}}
 						ssoFederationPending={ssoFederationPending}
 					/>
@@ -202,9 +202,14 @@ export const ConnectionsView = () => {
 				message={
 					deletingConnection ? (
 						<>
-							Are you sure you want to remove <strong>{deletingConnection}</strong>?
-							The connection goes away immediately; its ingested data is cleaned up in
-							the background. This action cannot be undone.
+							Are you sure you want to remove{' '}
+							<strong>
+								{connections.find(
+									(connection) => connection.connection_id === deletingConnection,
+								)?.display_label ?? 'this connection'}
+							</strong>
+							? The connection goes away immediately; its ingested data is cleaned up
+							in the background. This action cannot be undone.
 						</>
 					) : null
 				}
@@ -216,9 +221,10 @@ export const ConnectionsView = () => {
 			/>
 
 			<ConnectionModal
-				key={`${connectionModalOpen}:${editingConnection?.database_name ?? ''}`}
+				key={`${connectionModalOpen}:${editingConnection?.connection_id ?? ''}`}
 				open={connectionModalOpen}
 				connection={editingConnection}
+				existingConnections={connections}
 				onConfirm={handleConnectionModalConfirm}
 				onCancel={handleConnectionModalClose}
 			/>

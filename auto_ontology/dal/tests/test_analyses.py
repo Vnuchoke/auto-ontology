@@ -52,7 +52,7 @@ def _link(table, **values) -> None:
 class World:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        self.database = _add(s.catalog_database, name=prefix)
+        self.database = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.database, name="public")
         self.tables: dict[str, str] = {}
         self.analyses: dict[str, str] = {}
@@ -81,11 +81,14 @@ class World:
         description: str | None = None,
     ) -> str:
         aid = _add(
-            s.custom_analysis, name=f"{self.prefix}-{name}", description=description
+            s.custom_analysis,
+            name=f"{self.prefix}-{name}",
+            description=description,
+            connection_id=self.database,
         )
         self.analyses[name] = aid
         if sql is not None:
-            qid = _add(s.sql_query, sql_full_query=sql)
+            qid = _add(s.sql_query, sql_full_query=sql, connection_id=self.database)
             self.queries.append(qid)
             _link(s.custom_analysis__sql, analysis_id=aid, sql_query_id=qid)
             for table in tables:
@@ -165,10 +168,11 @@ def test_but_fetch_with_sql_still_returns_it(world) -> None:
     notice than one with an empty ``sql``.
     """
     orphan = world.analysis("orphan")
-    rows = ca.fetch_custom_analyses_with_sql([orphan])
+    rows = ca.fetch_custom_analyses_with_sql([orphan], connection_id=world.database)
     assert rows == [
         {
             "id": orphan,
+            "connection_id": world.database,
             "name": f"{world.prefix}-orphan",
             "description": "",
             "sql": "",
@@ -181,7 +185,9 @@ def test_domain_rules_fold_the_sql_into_the_description(world) -> None:
     world.analysis("revenue", sql="SELECT 1", description="how revenue is counted")
 
     rule = next(
-        r for r in ca.fetch_custom_analyses() if r["name"].startswith(world.prefix)
+        r
+        for r in ca.fetch_custom_analyses(connection_id=world.database)
+        if r["name"].startswith(world.prefix)
     )
     assert rule == {
         "name": f"{world.prefix}-revenue",
@@ -192,15 +198,24 @@ def test_domain_rules_fold_the_sql_into_the_description(world) -> None:
 def test_a_rule_with_no_description_is_still_a_rule(world) -> None:
     world.analysis("bare", sql="SELECT 1")
     rule = next(
-        r for r in ca.fetch_custom_analyses() if r["name"].startswith(world.prefix)
+        r
+        for r in ca.fetch_custom_analyses(connection_id=world.database)
+        if r["name"].startswith(world.prefix)
     )
     assert rule["description"] == "SQL: SELECT 1"
 
 
 def test_find_by_name_excludes_the_analysis_being_edited(world) -> None:
     analysis = world.analysis("revenue", sql="SELECT 1")
-    assert ca.find_analysis_by_name(f"{world.prefix}-revenue", analysis) is None
-    assert ca.find_analysis_by_name(f"{world.prefix}-revenue", None) == {
+    assert (
+        ca.find_analysis_by_name(
+            f"{world.prefix}-revenue", analysis, connection_id=world.database
+        )
+        is None
+    )
+    assert ca.find_analysis_by_name(
+        f"{world.prefix}-revenue", None, connection_id=world.database
+    ) == {
         "id": analysis,
         "name": f"{world.prefix}-revenue",
     }
@@ -212,11 +227,13 @@ def test_find_by_sql_matches_exact_text_only(world) -> None:
     Loosening it here would start rejecting saves that succeed today.
     """
     analysis = world.analysis("revenue", sql="SELECT  1")
-    assert ca.find_analysis_by_sql("SELECT  1", None) == {
+    assert ca.find_analysis_by_sql("SELECT  1", None, connection_id=world.database) == {
         "id": analysis,
         "name": f"{world.prefix}-revenue",
     }
-    assert ca.find_analysis_by_sql("select 1", None) is None
+    assert (
+        ca.find_analysis_by_sql("select 1", None, connection_id=world.database) is None
+    )
 
 
 def test_get_by_id_is_an_existence_check(world) -> None:
@@ -230,7 +247,9 @@ def test_tables_from_analyses_nests_columns(world) -> None:
     first = world.analysis("one", sql="SELECT 1", tables=("orders",))
     second = world.analysis("two", sql="SELECT 2", tables=("orders",))
 
-    tables = ca.fetch_tables_from_custom_analyses([first, second])
+    tables = ca.fetch_tables_from_custom_analyses(
+        [first, second], connection_id=world.database
+    )
     assert len(tables) == 1
     assert [c["name"] for c in tables[0]["columns"]] == ["id", "amount"]
 
@@ -252,7 +271,12 @@ def test_detaching_sql_leaves_the_statement_alone(world) -> None:
 
     ca.detach_existing_sql_edges(analysis)
 
-    assert ca.fetch_custom_analyses_with_sql([analysis])[0]["sql"] == ""
+    assert (
+        ca.fetch_custom_analyses_with_sql([analysis], connection_id=world.database)[0][
+            "sql"
+        ]
+        == ""
+    )
     assert store().query_read(
         select(s.sql_query.c.id).where(s.sql_query.c.id == query_id)
     )
@@ -299,7 +323,7 @@ def test_analysis_doc_text_is_reproduced_exactly(world) -> None:
     """Changing a separator silently invalidates every stored vector."""
     analysis = world.analysis("revenue", sql="SELECT 1", description="total revenue")
 
-    assert ca._custom_analysis_docs(analysis) == [
+    assert ca._custom_analysis_docs(analysis, connection_id=world.database) == [
         {
             "text": (
                 f"custom_analysis: {world.prefix}-revenue, "
@@ -308,13 +332,14 @@ def test_analysis_doc_text_is_reproduced_exactly(world) -> None:
             "name": f"{world.prefix}-revenue",
             "label": "CustomAnalysis",
             "id": analysis,
+            "connection_id": world.database,
         }
     ]
 
 
 def test_a_blank_analysis_description_is_omitted(world) -> None:
     analysis = world.analysis("revenue", sql="SELECT 1", description="   ")
-    text = ca._custom_analysis_docs(analysis)[0]["text"]
+    text = ca._custom_analysis_docs(analysis, connection_id=world.database)[0]["text"]
     assert "description:" not in text
 
 
@@ -399,7 +424,10 @@ def test_insert_connection_creates_the_database_if_absent(world) -> None:
     name = f"{world.prefix}-fresh"
     try:
         result = conn.insert_connection(
-            connection='{"host": "db.example", "port": 5432}', database_name=name
+            connection_id=str(uuid.uuid4()),
+            display_label=name,
+            connection='{"host": "db.example", "port": 5432}',
+            database_name=name,
         )
         assert result["name"] == name
         assert result["connection"] == {"host": "db.example", "port": 5432}
@@ -410,8 +438,23 @@ def test_insert_connection_creates_the_database_if_absent(world) -> None:
 
 
 def test_insert_connection_updates_an_existing_database(world) -> None:
-    conn.insert_connection(connection='{"host": "first"}', database_name=world.prefix)
-    conn.insert_connection(connection='{"host": "second"}', database_name=world.prefix)
+    store().query_write(
+        s.catalog_database.update()
+        .where(s.catalog_database.c.id == world.database)
+        .values(configuration_origin="managed")
+    )
+    conn.insert_connection(
+        connection_id=world.database,
+        display_label=world.prefix,
+        connection='{"host": "first"}',
+        database_name=world.prefix,
+    )
+    conn.insert_connection(
+        connection_id=world.database,
+        display_label=world.prefix,
+        connection='{"host": "second"}',
+        database_name=world.prefix,
+    )
     row = store().query_read(
         select(s.catalog_database.c.connection).where(
             s.catalog_database.c.id == world.database
@@ -426,22 +469,54 @@ def test_databases_without_a_connection_are_skipped(world, monkeypatch) -> None:
     monkeypatch.setattr(conn, "read_secret", lambda name: None)
     before = conn.list_connections()
 
-    conn.insert_connection(connection='{"host": "db"}', database_name=world.prefix)
+    store().query_write(
+        s.catalog_database.update()
+        .where(s.catalog_database.c.id == world.database)
+        .values(configuration_origin="managed")
+    )
+    conn.insert_connection(
+        connection_id=world.database,
+        display_label=world.prefix,
+        connection='{"type": "postgresql", "host": "db"}',
+        database_name=world.prefix,
+    )
     after = conn.list_connections()
 
-    assert {"host": "db"} in after
+    assert next(row for row in after if row["connection_id"] == world.database)[
+        "connection"
+    ] == {"type": "postgresql", "host": "db"}
     assert len(after) == len(before) + 1
 
 
-def test_a_vault_secret_wins_over_the_stored_connection(world, monkeypatch) -> None:
-    conn.insert_connection(connection='{"host": "stored"}', database_name=world.prefix)
+def test_an_explicit_vault_reference_wins_over_the_stored_connection(
+    world, monkeypatch
+) -> None:
+    store().query_write(
+        s.catalog_database.update()
+        .where(s.catalog_database.c.id == world.database)
+        .values(configuration_origin="managed")
+    )
+    reference = f"legacy/{world.database}"
+    conn.insert_connection(
+        connection_id=world.database,
+        display_label=world.prefix,
+        connection='{"type": "postgresql", "host": "stored"}',
+        database_name=world.prefix,
+        credential_ref=reference,
+    )
     monkeypatch.setattr(
         conn,
         "read_secret",
-        lambda name: {"host": "vault"} if name == world.prefix else None,
+        lambda path: (
+            {"type": "postgresql", "host": "vault"}
+            if path == reference
+            else pytest.fail("unexpected Vault ref")
+        ),
     )
-    assert {"host": "vault"} in conn.list_connections()
-    assert {"host": "stored"} not in conn.list_connections()
+    record = next(
+        row for row in conn.list_connections() if row["connection_id"] == world.database
+    )
+    assert record["connection"] == {"type": "postgresql", "host": "vault"}
 
 
 def test_verify_connectivity_succeeds_against_a_live_store() -> None:

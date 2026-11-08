@@ -15,9 +15,9 @@ type ConnectionsInfoCardViewProps = {
 	connections: Connection[];
 	loading?: boolean;
 	onEdit?: (connection: Connection) => void;
-	onDelete?: (databaseName: string) => void;
-	onSsoFederationChange?: (databaseName: string, enabled: boolean) => void;
-	/** Database name whose SSO-federation request is currently in flight. */
+	onDelete?: (connectionId: string) => void;
+	onSsoFederationChange?: (connectionId: string, enabled: boolean) => void;
+	/** Connection ID whose SSO-federation request is currently in flight. */
 	ssoFederationPending?: string | null;
 };
 
@@ -53,12 +53,12 @@ export const ConnectionsInfoCardView = ({
 		<div className="grid w-full grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
 			{connections.map((connection) => (
 				<ConnectionInfoCard
-					key={connection.database_name}
+					key={connection.connection_id}
 					connection={connection}
 					onEdit={onEdit}
 					onDelete={onDelete}
 					onSsoFederationChange={onSsoFederationChange}
-					ssoFederationPending={ssoFederationPending === connection.database_name}
+					ssoFederationPending={ssoFederationPending === connection.connection_id}
 				/>
 			))}
 		</div>

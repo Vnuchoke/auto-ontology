@@ -18,13 +18,14 @@ generator client {
 }
 
 model Conversation {
-  id         String    @id @default(uuid()) @db.Uuid
-  user_id    String    @map("user_id")
-  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
-  title      String    @default("")
-  created_at DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updated_at DateTime  @updatedAt @map("updated_at") @db.Timestamptz
-  messages   Message[]
+  connection_id String?
+  id            String    @id @default(uuid()) @db.Uuid
+  user_id       String    @map("user_id")
+  user          User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  title         String    @default("")
+  created_at    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updated_at    DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  messages      Message[]
 
   @@index([user_id])
   @@map("conversations")

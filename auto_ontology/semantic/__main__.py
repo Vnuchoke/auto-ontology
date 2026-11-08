@@ -5,7 +5,7 @@
 """CLI entry point for semantic layer compilation.
 
 Usage:
-    python -m auto_ontology.semantic --database-name <database_name>
+    python -m auto_ontology.semantic --connection-id <connection_id>
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ def main() -> None:
         description="Compile business taxonomy (Term, ColumnAttribute, sample values)"
     )
     parser.add_argument(
-        "--database-name",
+        "--connection-id",
         required=True,
-        help="Database name — must match the SQL connector and tabular ingest.",
+        help="Registered active connection ID (not the physical database name).",
     )
     parser.add_argument(
         "--log-level",
@@ -41,8 +41,12 @@ def main() -> None:
     )
 
     from auto_ontology.semantic.compile import run_semantic_compilation
+    from auto_ontology.connectors.sources import bootstrap_sources
+    from auto_ontology.dal.schema_version import require_current_schema
 
-    run_semantic_compilation(args.database_name)
+    require_current_schema()
+    bootstrap_sources()
+    run_semantic_compilation(args.connection_id)
 
 
 if __name__ == "__main__":

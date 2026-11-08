@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
+from uuid import uuid4
 
 from auto_ontology.connectors.connection_string_factory import build_connection_string
 from auto_ontology.catalog.table_filter import FILTER_KEYS, from_connection
@@ -26,7 +28,13 @@ from auto_ontology.server.chat.worker import refresh_chat_workers
 from auto_ontology.dal.connections import (
     clear_connection,
     insert_connection,
-    list_connections,
+    list_connections as list_connections,
+    list_source_metadata,
+    load_source_connection,
+    normalize_source_labels,
+    get_connection_storage,
+    update_connection_label,
+    LabelConflictError,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,27 +49,140 @@ SECRET_FIELDS = frozenset(
         "private_key",
         "private_key_passphrase",
         "truststore_password",
+        "access_token_override",
     }
 )
 
 
-def _database_already_connected(database_name: str) -> bool:
-    """True if a UI-managed connection already exists for this database."""
-    return any(
-        str(conn.get("database") or "").strip().lower() == database_name.lower()
-        for conn in list_connections()
-    )
+class AmbiguousConnectionError(ValueError):
+    """A legacy physical-name selector identifies more than one source."""
 
 
-def _stored_connection(database_name: str) -> dict[str, Any] | None:
-    """The stored connection for a catalog database, or ``None`` if there is none."""
-    return next(
-        (
-            conn
-            for conn in list_connections()
-            if str(conn.get("database") or "").strip() == database_name
-        ),
-        None,
+class SourceUnavailableError(ValueError):
+    """The selected source's credential storage is unavailable."""
+
+
+class ConnectionNotFoundError(LookupError, ValueError):
+    """Missing managed source; retains both legacy missing-source contracts."""
+
+
+def _require_managed_mode() -> None:
+    if os.environ.get("CONNECTION_STRINGS", "").strip():
+        raise ValueError("source_conflict: connections are environment-managed")
+
+
+def _selected_source(
+    connection_id: str | None, database_name: str | None
+) -> dict[str, Any]:
+    _require_managed_mode()
+    if (connection_id is None) == (database_name is None):
+        raise ValueError("invalid_source_selector")
+    try:
+        metadata = list_source_metadata()
+    except Exception:
+        raise SourceUnavailableError(
+            "source_unavailable: metadata unavailable"
+        ) from None
+    rows = [
+        row
+        for row in metadata
+        if row["configuration_origin"] == "managed"
+        and (
+            row["id"] == connection_id
+            if connection_id is not None
+            else row["name"] == database_name
+        )
+    ]
+    if len(rows) > 1:
+        raise AmbiguousConnectionError("ambiguous_source: use connection_id")
+    if not rows:
+        raise ConnectionNotFoundError("source_not_found: No connection found")
+    return rows[0]
+
+
+def _stored_connection(connection_id: str) -> dict[str, Any]:
+    try:
+        return load_source_connection(connection_id)
+    except Exception:
+        raise SourceUnavailableError(
+            "source_unavailable: credentials unavailable"
+        ) from None
+
+
+def _check_label(display_label: str, connection_id: str | None = None) -> str:
+    if not isinstance(display_label, str) or not display_label.strip(" "):
+        raise ValueError("invalid_label: label must not be blank")
+    label = display_label.strip(" ")
+    try:
+        normalized = normalize_source_labels([label])[0]
+        metadata = list_source_metadata()
+    except Exception:
+        raise SourceUnavailableError(
+            "source_unavailable: metadata unavailable"
+        ) from None
+    if any(
+        row["id"] != connection_id and row["normalized_label"] == normalized
+        for row in metadata
+    ):
+        raise LabelConflictError("label_conflict: label already exists")
+    return label
+
+
+def _driver_settings(connection: dict[str, Any]) -> dict[str, Any]:
+    metadata = {
+        "id",
+        "name",
+        "connection_id",
+        "database_name",
+        "display_label",
+        "configuration_origin",
+        "origin",
+        "credential_ref",
+        "dialect",
+        "normalized_label",
+        "metadata_connection_id",
+        "metadata_label",
+        "schema",
+    }
+    return {key: value for key, value in connection.items() if key not in metadata}
+
+
+def _envelope(
+    source: dict[str, Any], connection: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    result = {
+        "connection_id": source["id"],
+        "display_label": source["display_label"],
+        "database_name": source["name"],
+    }
+    if connection is not None:
+        result["connection"] = connection
+    return result
+
+
+def _persist(
+    source: dict[str, Any], connection: dict[str, Any], *, migrate_inline: bool = True
+) -> None:
+    storage = get_connection_storage(source["id"])
+    reference = storage["credential_ref"]
+    if reference is not None or (migrate_inline and is_vault_configured()):
+        reference = (
+            reference if reference is not None else f"connections/{source['id']}"
+        )
+        try:
+            if not is_vault_configured():
+                raise ValueError
+            write_secret(reference, connection)
+        except Exception:
+            raise SourceUnavailableError(
+                "source_unavailable: credential write failed"
+            ) from None
+    insert_connection(
+        connection_id=source["id"],
+        database_name=source["name"],
+        display_label=source["display_label"],
+        credential_ref=reference,
+        connection="" if reference is not None else json.dumps(connection),
     )
 
 
@@ -119,11 +240,14 @@ def _refresh_connection_caches() -> None:
         try:
             refresh()
         except Exception:
-            logger.exception("Failed to refresh the %s cache", name)
+            logger.warning("cache_refresh_failed: %s", name)
 
 
 def test_connection(
-    connection: dict[str, Any], *, replacing: str | None = None
+    connection: dict[str, Any],
+    *,
+    replacing_connection_id: str | None = None,
+    replacing: str | None = None,
 ) -> list[str]:
     """Validate credentials for the settings UI test action.
 
@@ -136,37 +260,39 @@ def test_connection(
     exists — the UI then skips schema selection, so a typo would otherwise only
     surface much later as an ingest that silently finds nothing.
 
-    ``replacing`` names the connection an edit is about to overwrite: the
-    "already connected" guard would otherwise reject a connection for being
-    itself, and blank credentials are filled from the stored ones so the test
-    exercises exactly what the update would save.
+    ``replacing_connection_id`` selects the source whose blank credentials are
+    retained; ``replacing`` is the unambiguous legacy physical-name adapter.
+    New connections may share a physical name.
     """
     database_name = str(connection.get("database") or "").strip()
     if not database_name:
         raise ValueError("Database name is required")
 
-    if replacing is None:
-        if _database_already_connected(database_name):
-            raise ValueError(
-                f"A connection for database {database_name!r} already exists"
-            )
-    else:
-        stored = _stored_connection(replacing)
-        if stored is None:
-            raise LookupError(f"No connection found for database {replacing!r}")
-        if database_name != replacing:
-            raise ValueError("A connection's database name cannot be changed")
-        connection = _with_stored_secrets(connection, stored)
-
     requested_schema = str(connection.get("schema") or "").strip()
+    connection = _driver_settings(connection)
+    if requested_schema:
+        connection["schema"] = requested_schema
+    if replacing is not None or replacing_connection_id is not None:
+        source = _selected_source(replacing_connection_id, replacing)
+        stored = _stored_connection(source["id"])
+        if database_name != source["name"]:
+            raise ValueError("A connection's database name cannot be changed")
+        if connection.get("type") != stored.get("type"):
+            raise ValueError("A connection's type cannot be changed")
+        connection = _with_stored_secrets(connection, stored)
 
     # Surface a bad allow/deny pattern here, while the operator is still looking
     # at the form. Left to ingestion it would be logged and skipped, and the
     # tables they meant to exclude would be ingested anyway.
     from_connection(connection)
 
-    connection_string = build_connection_string(connection)
-    connector = create_connector(connection_string)
+    try:
+        connection_string = build_connection_string(connection)
+        connector = create_connector(connection_string)
+    except Exception:
+        raise SourceUnavailableError(
+            "source_unavailable: connection test failed"
+        ) from None
     try:
         # ``get_schemas`` runs a real query, so it validates connectivity and
         # credentials just like ``ping`` while also returning the schema list.
@@ -176,80 +302,113 @@ def test_connection(
             return []
 
         schemas = list(get_schemas())
-        if requested_schema and not any(
-            str(name).strip().casefold() == requested_schema.casefold()
-            for name in schemas
-        ):
-            raise ValueError(
-                f"Schema {requested_schema!r} was not found in {database_name!r}."
-            )
-        return schemas
+    except Exception:
+        raise SourceUnavailableError(
+            "source_unavailable: connection test failed"
+        ) from None
     finally:
-        connector.close()
+        try:
+            connector.close()
+        except Exception:
+            logger.warning("connector_close_failed")
+    if requested_schema and not any(
+        str(name).strip().casefold() == requested_schema.casefold() for name in schemas
+    ):
+        raise ValueError(
+            f"Schema {requested_schema!r} was not found in {database_name!r}."
+        )
+    return schemas
 
 
 def create_connection(
-    *,
     connection: dict[str, Any],
+    display_label: str | None = None,
 ) -> dict[str, Any]:
     """Create a UI-managed connection stored on the catalog database row."""
 
     # ``schema`` is the form's shorthand for a single-schema allowlist; the caller
     # turns it into ``schemas``. Storing the raw field too would leave two sources of
     # truth for what gets ingested, so drop it.
-    connection = {key: value for key, value in connection.items() if key != "schema"}
+    _require_managed_mode()
+    connection = _driver_settings(connection)
 
-    database_name = str(connection.get("database"))
-    if not database_name:
+    database_name = connection.get("database")
+    if not isinstance(database_name, str) or not database_name.strip():
         raise ValueError("Database name is required")
 
     # Raises InvalidTableFilterError (a ValueError) -> 422, rather than storing
     # a pattern that can never be honoured.
     from_connection(connection)
 
-    if _database_already_connected(database_name):
-        raise ValueError(f"A connection for database {database_name!r} already exists")
+    label = _check_label(database_name if display_label is None else display_label)
+    connection_id = str(uuid4())
 
     # With Vault configured, store credentials in Vault and keep them off the
     # catalog row; otherwise fall back to persisting the JSON on the row.
     vault_configured = is_vault_configured()
+    reference = f"connections/{connection_id}" if vault_configured else None
     if vault_configured:
-        write_secret(database_name, connection)
-    insert_connection(
-        connection=json.dumps(connection) if not vault_configured else "",
-        database_name=database_name,
-    )
+        try:
+            write_secret(reference, connection)
+        except Exception:
+            raise SourceUnavailableError(
+                "source_unavailable: credential write failed"
+            ) from None
+    try:
+        insert_connection(
+            connection_id=connection_id,
+            display_label=label,
+            credential_ref=reference,
+            connection=json.dumps(connection) if reference is None else "",
+            database_name=database_name,
+        )
+    except Exception as exc:
+        if reference is not None:
+            try:
+                delete_secrets(reference)
+            except Exception:
+                logger.warning("orphan_secret: connection_id=%s", connection_id)
+        if isinstance(exc, LabelConflictError):
+            raise LabelConflictError("label_conflict: label already exists") from None
+        raise ValueError("source_conflict: connection create failed") from None
 
     _refresh_connection_caches()
 
-    trigger_ingest(connection)
+    trigger_ingest(connection_id)
 
-    return connection
+    return _envelope(
+        {"id": connection_id, "display_label": label, "name": database_name}, connection
+    )
 
 
 def update_connection(
-    *,
-    database_name: str,
-    connection: dict[str, Any],
+    connection_id: str | None = None,
+    database_name: str | None = None,
+    connection: dict[str, Any] | None = None,
+    display_label: str | None = None,
 ) -> dict[str, Any]:
     """Rewrite an existing connection's settings, keeping its identity.
 
-    ``database`` and ``type`` are the connection's identity — the catalog row is
-    keyed by the name, and its ingested graph was built by that connector — so
-    pointing the record at a different database or driver is a new connection,
-    not an edit. Everything else, credentials included, can change.
+    The row is selected by stable ID. Physical ``database`` and driver ``type``
+    cannot change. A label-only edit never loads credentials or refreshes workers.
 
-    Re-ingest only when the schema allowlist moved. Rotating a token or fixing a
+    Re-ingest only when the schema/table filters moved. Rotating a token or fixing a
     hostname leaves the ingested graph correct, and re-ingesting it would be a
     long, surprising side effect of saving a form.
     """
     # Same shorthand the create path drops: `schema` is the single-schema form
     # of `schemas`, and storing both leaves two sources of truth.
-    connection = {key: value for key, value in connection.items() if key != "schema"}
-
-    stored = _stored_connection(database_name)
-    if stored is None:
-        raise LookupError(f"No connection found for database {database_name!r}")
+    source = _selected_source(connection_id, database_name)
+    if display_label is not None:
+        source = {**source, "display_label": _check_label(display_label, source["id"])}
+    if connection is None:
+        update_connection_label(
+            connection_id=source["id"], display_label=source["display_label"]
+        )
+        return _envelope(source, {})
+    connection = _driver_settings(connection)
+    stored = _stored_connection(source["id"])
+    database_name = source["name"]
 
     incoming_database = str(connection.get("database") or "").strip()
     if incoming_database and incoming_database != database_name:
@@ -268,27 +427,20 @@ def update_connection(
         },
         stored,
     )
-
-    if is_vault_configured():
-        write_secret(database_name, updated)
-        # Blank out any credentials the row still carries from before Vault was
-        # configured, so there is only ever one copy of them.
-        insert_connection(connection="", database_name=database_name)
-    else:
-        insert_connection(
-            connection=json.dumps(updated),
-            database_name=database_name,
-        )
+    from_connection(updated)
+    _persist(source, updated)
 
     _refresh_connection_caches()
 
     if _ingest_scope(updated) != _ingest_scope(stored):
-        trigger_ingest(updated)
+        trigger_ingest(source["id"])
 
-    return updated
+    return _envelope(source, updated)
 
 
-def set_sso_federation(*, database_name: str, enabled: bool) -> dict[str, Any]:
+def set_sso_federation(
+    *, connection_id: str | None = None, database_name: str | None = None, enabled: bool
+) -> dict[str, Any]:
     """Toggle "authenticate as signed-in user" on an existing connection.
 
     Deliberately narrow: it rewrites only the ``sso_federation`` flag on the
@@ -296,29 +448,24 @@ def set_sso_federation(*, database_name: str, enabled: bool) -> dict[str, Any]:
     it. Ingestion is unaffected — it always uses the stored access token — so
     no re-ingest is triggered.
     """
-    connection = _stored_connection(database_name)
-    if connection is None:
-        raise ValueError(f"No connection found for database {database_name!r}")
+    source = _selected_source(connection_id, database_name)
+    connection = _stored_connection(source["id"])
 
     updated = {**connection, "sso_federation": enabled}
 
-    if is_vault_configured():
-        write_secret(database_name, updated)
-    else:
-        insert_connection(
-            connection=json.dumps(updated),
-            database_name=database_name,
-        )
+    _persist(source, updated, migrate_inline=False)
 
     # Connectors cache the credential, chat workers hold connectors, and the
     # chat endpoint caches this very flag, so all three have to be rebuilt for
     # the change to take effect on the next question rather than after a TTL.
     _refresh_connection_caches()
 
-    return {"database_name": database_name, "sso_federation": enabled}
+    return {**_envelope(source, updated), "sso_federation": enabled}
 
 
-def delete_connection(database_name: str) -> dict[str, str] | None:
+def delete_connection(
+    database_name: str | None = None, *, connection_id: str | None = None
+) -> dict[str, Any] | None:
     """Delete a UI-managed connection and tear down its ingested database graph.
 
     ``None`` when no connection carries that name, which the route turns into a
@@ -334,19 +481,27 @@ def delete_connection(database_name: str) -> dict[str, str] | None:
     It is the slow half, and failing it leaves stale data rather than a
     connection that comes back from the dead.
     """
-    if _stored_connection(database_name) is None:
+    try:
+        source = _selected_source(connection_id, database_name)
+    except LookupError:
         return None
 
-    # Vault first: `list_connections` prefers a secret over the row, so failing
-    # after the row is cleared would resurrect the connection, while failing
-    # after the secret is gone cannot.
-    if is_vault_configured():
-        delete_secrets(database_name)
+    # Keep the binding available for a retry if exact-reference deletion fails.
+    reference = get_connection_storage(source["id"])["credential_ref"]
+    if reference is not None:
+        try:
+            if not is_vault_configured():
+                raise ValueError
+            delete_secrets(reference)
+        except Exception:
+            raise SourceUnavailableError(
+                "source_unavailable: credential delete failed"
+            ) from None
 
-    clear_connection(database_name=database_name)
+    clear_connection(connection_id=source["id"])
 
     _refresh_connection_caches()
 
-    trigger_reset(database_name)
+    trigger_reset(source["id"])
 
-    return {"database_name": database_name}
+    return _envelope(source)

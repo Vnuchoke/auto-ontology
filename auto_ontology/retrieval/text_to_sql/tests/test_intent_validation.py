@@ -321,6 +321,7 @@ def test_parse_failure_does_not_call_intent_llm(
         },
     }
 
+    state["connection_id"] = "test-source"
     result = agent.execute(state)
 
     assert result["decision"] == "invalid_sql"
@@ -346,13 +347,17 @@ def test_parse_result_populates_catalog_ids_and_qualified_names(
     )
 
     result = SQLValidationAgent._sql_parse_validation(
-        {"public": schema}, "SELECT total FROM orders", ["postgres"]
+        {"public": schema},
+        "SELECT total FROM orders",
+        ["postgres"],
+        connection_id="source",
     )
 
     assert result["sql_tables"] == ["table-id"]
     assert result["sql_columns"] == ["column-id"]
     assert result["used_tables"] == ["public.orders"]
     assert result["used_columns"] == ["public.orders.total"]
+    assert mock_parse.call_args.kwargs["connection_id"] == "source"
 
 
 @patch(
@@ -361,11 +366,22 @@ def test_parse_result_populates_catalog_ids_and_qualified_names(
 )
 def test_parse_result_without_catalog_table_is_invalid(_mock_parse: MagicMock) -> None:
     result = SQLValidationAgent._sql_parse_validation(
-        {}, "SELECT * FROM missing", ["postgres"]
+        {}, "SELECT * FROM missing", ["postgres"], connection_id="source"
     )
 
     assert "error" in result
     assert "known to the catalog" in result["error"]
+
+
+@patch(
+    "auto_ontology.retrieval.text_to_sql.agents.sql_parse_validation.parse_query_single"
+)
+def test_static_validation_requires_source_before_parser(mock_parse: MagicMock) -> None:
+    result = SQLValidationAgent._sql_parse_validation(
+        {}, "SELECT * FROM orders", ["postgres"]
+    )
+    assert "source_required" in result.get("error", "")
+    mock_parse.assert_not_called()
 
 
 @patch(
@@ -407,6 +423,7 @@ def test_retry_threshold_still_runs_intent_llm(
         },
     }
 
+    state["connection_id"] = "test-source"
     result = agent.execute(state)
 
     assert result["decision"] == "valid_sql"
@@ -455,6 +472,7 @@ def test_final_full_pipeline_attempt_still_runs_intent_llm(
         },
     }
 
+    state["connection_id"] = "test-source"
     result = agent.execute(state)
 
     assert result["decision"] == "valid_sql"

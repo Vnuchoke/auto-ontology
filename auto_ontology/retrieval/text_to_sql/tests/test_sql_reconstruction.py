@@ -71,8 +71,10 @@ def test_table_discovery_uses_target_database(
         *,
         k: int,
         database_name: str | None,
+        connection_id: str,
     ) -> list[dict]:
         assert k == 3
+        assert connection_id == "test-source"
         database_names.append(database_name)
         return []
 
@@ -86,6 +88,7 @@ def test_table_discovery_uses_target_database(
         {
             "data_retriever": object(),
             "path_state": {"target_db": "target-db"},
+            "connection_id": "test-source",
         },
     )
 

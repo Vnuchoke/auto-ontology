@@ -60,7 +60,9 @@ def catalog():
         )[0]["id"]
 
     for n in (1, 2):
-        db_id = insert(s.catalog_database, name=f"{prefix}-db{n}")
+        db_id = insert(
+            s.catalog_database, name=f"{prefix}-db{n}", display_label=f"{prefix}-db{n}"
+        )
         schema_id = insert(s.catalog_schema, database_id=db_id, name="shop")
         table_id = insert(s.catalog_table, schema_id=schema_id, name="customer")
         ids[f"db{n}"] = db_id

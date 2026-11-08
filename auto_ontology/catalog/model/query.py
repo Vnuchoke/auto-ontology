@@ -16,7 +16,12 @@ class Query:
         sql_text,
         ltimestamp,
         count,
+        *,
+        connection_id: str,
     ):
+        if not connection_id:
+            raise ValueError("SQL requires connection_id")
+        self.connection_id = connection_id
         self.id = id
         self.tables: list = []
         self.tables_ids: list[str] = []
@@ -29,6 +34,7 @@ class Query:
         month = ltimestamp.month
         year = ltimestamp.year
         props = {
+            "connection_id": connection_id,
             "name": f"query_{str(id)}",
             f"count_{month}_{year}": count,
             "total_counter": count,
@@ -36,7 +42,11 @@ class Query:
             "last_query_timestamp": ltimestamp,
         }
         self.sql_node = CatalogNode(
-            name="query_" + str(id), label=Labels.SQL, props=props, existing_id=id
+            name="query_" + str(id),
+            label=Labels.SQL,
+            props=props,
+            existing_id=id,
+            match_props={"connection_id": connection_id, "sql_full_query": sql_text},
         )
 
     def add_table_to_query(self, table_node, table_name: str):

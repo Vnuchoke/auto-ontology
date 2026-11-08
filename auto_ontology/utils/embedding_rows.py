@@ -55,8 +55,11 @@ class CatalogEmbeddingRowsOp:
     * one ``Column`` row per column.
     """
 
-    def __init__(self, *, database_name: str) -> None:
+    def __init__(self, *, database_name: str, connection_id: str) -> None:
+        if not connection_id:
+            raise ValueError("connection_id is required for catalog embeddings")
         self._database_name = database_name
+        self._connection_id = connection_id
 
     def __call__(self, data: Any) -> pd.DataFrame:
         return self.process(data)
@@ -69,6 +72,18 @@ class CatalogEmbeddingRowsOp:
             )
 
         tables_df, columns_df = data
+        frames = []
+        for frame in (tables_df, columns_df):
+            if not frame.empty:
+                if (
+                    "connection_id" not in frame
+                    or frame["connection_id"].isna().any()
+                    or (frame["connection_id"] == "").any()
+                ):
+                    raise ValueError("Nonempty catalog frames require connection_id")
+                frame = frame.loc[frame["connection_id"] == self._connection_id]
+            frames.append(frame)
+        tables_df, columns_df = frames
         rows = list(self._build_rows(tables_df, columns_df))
         if rows:
             return pd.DataFrame(rows)
@@ -116,6 +131,7 @@ class CatalogEmbeddingRowsOp:
                     name=table_name,
                     schema_name=schema_name,
                     database_name=self._database_name,
+                    connection_id=self._connection_id,
                 )
             )
 
@@ -146,6 +162,7 @@ class CatalogEmbeddingRowsOp:
                         name=column_name,
                         schema_name=schema_name,
                         database_name=self._database_name,
+                        connection_id=self._connection_id,
                     )
                 )
         return rows
@@ -230,8 +247,11 @@ def build_embed_row(
     name: str,
     schema_name: str,
     database_name: str | None,
+    connection_id: str,
 ) -> dict[str, Any]:
     """Wrap embedding *text* in the row shape the embed → VDB path expects."""
+    if not connection_id:
+        raise ValueError("connection_id is required for embedding rows")
     path = f"auto_ontology:{node_id}" if node_id else "auto_ontology:unknown"
     # Retrieval reads the top-level copies: the store keeps the whole metadata
     # dict. The copies under content_metadata are kept so rows written now look
@@ -243,6 +263,7 @@ def build_embed_row(
         "source_path": path,
         "schema_name": schema_name,
         "database_name": database_name,
+        "connection_id": connection_id,
     }
     return {
         "text": text.strip(),

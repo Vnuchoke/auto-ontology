@@ -62,7 +62,7 @@ def catalog():
 
     for db_n in (1, 2):
         db_name = f"{prefix}-db{db_n}"
-        db_id = insert(s.catalog_database, name=db_name)
+        db_id = insert(s.catalog_database, name=db_name, display_label=db_name)
         ids[f"db{db_n}"] = db_id
         for sch_n in (1, 2):
             schema_id = insert(s.catalog_schema, database_id=db_id, name=f"sch{sch_n}")

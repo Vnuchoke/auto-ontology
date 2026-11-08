@@ -272,6 +272,7 @@ def should_clarify(
             session._collision_hit_verdicts,
             session._last_ambiguous_hits,
             session._kb_vdb_adjudicated_norms,
+            connection_id=session.require_connection_id(),
         )
         session._cached_unresolvable = unresolvable
         session._cached_unresolvable_for = session.working_question
@@ -589,6 +590,7 @@ def refresh_grounded_knowledge(session: "InteractiveSessionState") -> None:
         session._collision_hit_verdicts,
         session._last_ambiguous_hits,
         session._kb_vdb_adjudicated_norms,
+        connection_id=session.require_connection_id(),
     )
     session._cached_unresolvable = unresolvable
     session._cached_unresolvable_for = session.working_question

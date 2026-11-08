@@ -2,10 +2,8 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { NextResponse } from 'next/server';
-import { getPrisma } from '@/lib/prisma';
 import { withPermission } from '@/auth/with-auth';
-import { messageSelect } from '@/lib/apiSelects';
+import { proxyToBackend } from '@/auth/proxy-backend';
 
 type Ctx = { params: Promise<{ id: string }> };
 
@@ -19,34 +17,16 @@ export const POST = withPermission<Ctx>({ conversation: ['write'] })(async (
 	req,
 	{ params, user },
 ) => {
-	const prisma = getPrisma();
 	const { id } = await params;
-	const body = await req.json();
-
-	// Only allow adding messages to a conversation the user owns.
-	const owned = await prisma.conversation.findFirst({
-		where: { id, user_id: user.id },
-		select: { id: true },
-	});
-	if (!owned) {
-		return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
-	}
-
-	const message = await prisma.message.create({
-		data: {
-			conversation_id: id,
-			role: body.role,
-			content: body.content ?? '',
-			sql_code: body.sql_code ?? null,
-			sql_response: body.sql_response ?? null,
-		},
-		select: messageSelect,
-	});
-
-	await prisma.conversation.update({
-		where: { id },
-		data: { updated_at: new Date() },
-	});
-
-	return NextResponse.json(message, { status: 201 });
+	const target = new URL(req.url);
+	target.pathname = `/api/chat/conversations/${encodeURIComponent(id)}/messages`;
+	// Ownership and immutable source binding are one backend transaction.
+	return proxyToBackend(
+		new Request(target, {
+			method: 'POST',
+			headers: req.headers,
+			body: await req.text(),
+		}),
+		{ userId: user.id, source: req.headers.get('x-auto-ontology-source') ?? 'api' },
+	);
 });

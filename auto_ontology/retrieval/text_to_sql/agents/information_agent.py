@@ -343,6 +343,7 @@ class InformationAgent(BaseAgent):
                     action.tool,
                     arguments,
                     semantic_retriever=state.get("semantic_retriever"),
+                    connection_id=state["connection_id"],
                 )
             except Exception as exc:
                 self.logger.exception("Information metadata tool failed")

@@ -19,6 +19,8 @@ from auto_ontology.retrieval.entity_coverage.state import (
 )
 from auto_ontology.retrieval.text_to_sql.state import AgentState
 from auto_ontology.utils.llm_invoke import get_llm_client
+from auto_ontology.connectors.sources import SourceDescriptor
+from auto_ontology.retrieval.source_context import resolve_query_source
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +34,14 @@ graph = create_graph()
 app = graph.compile()
 
 
-def _build_state(payload: EntityCoveragePayload) -> AgentState:
-    connectors = payload.get("connectors", [])
+def _build_state(
+    payload: EntityCoveragePayload, source: SourceDescriptor
+) -> AgentState:
+    connectors = [
+        connector
+        for connector in payload.get("connectors", [])
+        if getattr(connector, "connection_id", None) == source.connection_id
+    ]
     if not connectors:
         raise ValueError(
             "EntityCoveragePayload is missing required 'connectors'. "
@@ -51,7 +59,9 @@ def _build_state(payload: EntityCoveragePayload) -> AgentState:
         )
 
     acronyms = payload.get("acronyms", [])
-    domain_rules = fetch_custom_analyses() + list(acronyms or [])
+    domain_rules = fetch_custom_analyses(connection_id=source.connection_id) + list(
+        acronyms or []
+    )
 
     initial_path_state = dict(payload.get("path_state") or {})
     max_distance = payload.get("max_distance", DEFAULT_MAX_DISTANCE)
@@ -60,13 +70,13 @@ def _build_state(payload: EntityCoveragePayload) -> AgentState:
         payload.get("return_uncovered_entities", False)
     )
 
-    target_db = payload.get("target_db")
-    if target_db:
-        initial_path_state["target_db"] = target_db
-    elif len(connectors) == 1:
-        connector_db = getattr(connectors[0], "database_name", None)
-        if connector_db:
-            initial_path_state["target_db"] = connector_db
+    initial_path_state["connection_id"] = source.connection_id
+    initial_path_state["target_db"] = source.database_name
+    provenance = {
+        "connection_id": source.connection_id,
+        "display_label": source.display_label,
+        "database_name": source.database_name,
+    }
 
     state: dict[str, Any] = {
         "llm": llm_client,
@@ -79,25 +89,33 @@ def _build_state(payload: EntityCoveragePayload) -> AgentState:
         "decision": "",
         "domain_rules": domain_rules,
         "glossary": list(acronyms or []),
+        "connection_id": source.connection_id,
+        "source": provenance,
     }
     return state  # type: ignore[return-value]
 
 
 def get_coverage_response(payload: EntityCoveragePayload) -> dict:
     """Run the entity-coverage graph and return coverage and ranked candidates."""
+    source = resolve_query_source(
+        connection_id=payload.get("connection_id"),
+        connection_label=payload.get("connection_label"),
+        target_db=payload.get("target_db"),
+    )
     if llm_client is None:
         raise RuntimeError("LLM client is not configured.")
 
-    state = _build_state(payload)
+    state = _build_state(payload, source)
     final_state = app.invoke(state, config={"recursion_limit": 10})
 
     path_state = final_state.get("path_state", {})
     final_response = path_state.get("final_response")
     if isinstance(final_response, dict):
-        return final_response
+        return {**final_response, "source": state["source"]}
     return {
         "coverage": 0.0,
         "candidates": [],
+        "source": state["source"],
     }
 
 

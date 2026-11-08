@@ -4,6 +4,12 @@
 
 """Unit tests for shaping persisted messages into safe agent context."""
 
+from unittest.mock import Mock
+
+import pytest
+
+from auto_ontology.connectors.sources import SourceDescriptor, SourceSelectionError
+from auto_ontology.server.chat import conversation_dal as dal
 from auto_ontology.server.chat.conversation_dal import _rows_to_history
 
 
@@ -87,3 +93,31 @@ def test_one_large_turn_is_bounded() -> None:
 
     turn = history[0]
     assert len(turn.question) + len(turn.response) + len(turn.sql_code or "") <= 12_000
+
+
+def test_late_source_mismatch_does_not_resolve_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve = Mock()
+    monkeypatch.setattr(dal, "resolve_source", resolve)
+    with pytest.raises(SourceSelectionError, match="source_conflict") as error:
+        dal._validate_result_source({"connection_id": "accepted-id"}, "other-id")
+    assert error.value.status_code == 409
+    resolve.assert_not_called()
+
+
+def test_late_source_uses_active_metadata_not_query_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = SourceDescriptor(
+        "accepted-id", "Sales A", "sales", "postgres", "managed"
+    )
+    resolve = Mock(return_value=selected)
+    query = Mock(side_effect=AssertionError("late errors must not require vectors"))
+    monkeypatch.setattr(dal, "resolve_source", resolve)
+    monkeypatch.setattr(dal, "resolve_query_source", query)
+    dal._validate_result_source(
+        {"connection_id": selected.connection_id}, selected.connection_id
+    )
+    resolve.assert_called_once_with(connection_id=selected.connection_id)
+    query.assert_not_called()

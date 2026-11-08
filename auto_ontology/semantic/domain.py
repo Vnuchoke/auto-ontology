@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
+
+from auto_ontology.connectors import sources
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +28,16 @@ class DomainSummary(BaseModel):
     business_rules: list[str] = Field(default_factory=list)
 
 
-def load_domain_summary(database_name: str) -> DomainSummary | None:
-    path = _SUMMARY_DIR / f"{database_name}.json"
+def selected_source(connection_id: str) -> sources.SourceDescriptor:
+    """Validate runtime identity using metadata only, before any model or probe."""
+    for source in sources.list_active_sources():
+        if source.connection_id == connection_id:
+            return source
+    raise ValueError("Semantic compilation requires an active connection_id")
+
+
+def load_domain_summary(connection_id: str) -> DomainSummary | None:
+    path = _SUMMARY_DIR / f"{quote(connection_id, safe='')}.json"
     if not path.exists():
         return None
     try:

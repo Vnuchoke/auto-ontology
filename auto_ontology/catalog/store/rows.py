@@ -7,10 +7,10 @@
 Every writer needs the same thing: *find a row by its identity columns, create
 it with these values if absent, update it if present*.
 
-The upsert is keyed on the **natural** key, not on ``id`` — two runs of the
-parser against the same source must converge on one row, and only the natural
-key can decide that. ``Schema``, ``Table`` and ``Column`` are unique *within
-their parent*, which is why :func:`upsert_row` takes ``parent_id``.
+Roots are keyed by their registered ID. Descendants converge on their natural
+key within that root: ``Schema``, ``Table`` and ``Column`` are unique *within
+their parent*, which is why :func:`upsert_row` takes ``parent_id``. Existing IDs
+must agree with that parent; a caller cannot reassign a foreign-source node.
 
 **One deliberate divergence: the stored id is never overwritten.** In a property
 graph, ``id`` is an ordinary property and relationships bind to internal nodes,
@@ -35,7 +35,11 @@ from sqlalchemy import Text, and_, literal, select
 from sqlalchemy.dialects.postgresql import insert
 
 from auto_ontology.catalog.store import registry
-from auto_ontology.dal.session import store
+from auto_ontology.dal.connections import (
+    assert_connection_id_available,
+    lock_source_registration,
+)
+from auto_ontology.dal.session import store, write_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -78,29 +82,62 @@ def resolve_id(
 ) -> str | None:
     """Find an existing row's id from whatever the caller matched on.
 
-    ``match_props`` is not uniform across labels — ``Table`` and ``Column``
-    carry a pre-generated ``id``, ``Schema`` carries ``(database_name, name)``
-    where ``database_name`` is not a column on the row at all, and ``Database``
-    carries ``name``. Each shape is handled explicitly rather than guessed at.
+    Roots require an ID, schemas a connection_id (or parent_id), and descendants
+    their parent ID. An existing ID never bypasses a supplied ancestry check;
+    physical names are not source selectors.
     """
     spec = registry.entity_spec(label)
 
+    if "connection_id" in spec.natural_key and not match_props.get("connection_id"):
+        raise ValueError("SQL identity requires connection_id")
+
+    if spec.label == registry.Labels.DB and not match_props.get("id"):
+        raise ValueError("Database identity requires connection_id as id")
+    if spec.parent_label == registry.Labels.DB:
+        source_id = match_props.get("connection_id")
+        if source_id and parent_id and source_id != parent_id:
+            raise ValueError("Schema connection_id conflicts with parent")
+        parent_id = source_id or parent_id
+        if parent_id is None and not match_props.get("id"):
+            raise ValueError("Schema identity requires a connection_id or parent")
+
     if "id" in match_props and match_props["id"]:
+        identity_columns = [spec.table.c.id]
+        if "connection_id" in spec.natural_key:
+            identity_columns.append(spec.table.c.connection_id)
+        if spec.parent_column:
+            identity_columns.append(spec.table.c[spec.parent_column])
+        if "name" in spec.columns:
+            identity_columns.append(spec.table.c.name)
         rows = store().query_read(
-            select(spec.table.c.id).where(spec.table.c.id == match_props["id"])
+            select(*identity_columns).where(spec.table.c.id == match_props["id"])
         )
         if rows:
+            if (
+                "connection_id" in spec.natural_key
+                and rows[0]["connection_id"] != match_props["connection_id"]
+            ):
+                raise ValueError(
+                    "SQL ID belongs to another source or unresolved legacy"
+                )
+            if (
+                spec.parent_column
+                and parent_id is not None
+                and rows[0][spec.parent_column] != parent_id
+            ):
+                raise ValueError("Catalog ID belongs to another parent/source")
+            if (
+                match_props.get("name") is not None
+                and rows[0].get("name") != match_props["name"]
+            ):
+                raise ValueError("Catalog ID conflicts with the supplied name")
             return rows[0]["id"]
         # Fall through: a parser-generated id that is not in the store yet is
         # the normal case for a new node, so identity falls back to the
         # natural key rather than declaring the row absent.
 
-    if "database_name" in match_props and spec.parent_label == registry.Labels.DB:
-        parent_id = resolve_id(
-            registry.Labels.DB, {"name": match_props["database_name"]}
-        )
-        if parent_id is None:
-            return None
+    if spec.parent_column and parent_id is None:
+        return None
 
     if not spec.natural_key:
         return None
@@ -114,6 +151,29 @@ def resolve_id(
 
 
 def upsert_row(
+    label: str | list[str] | tuple[str, ...],
+    match_props: dict[str, Any],
+    properties: dict[str, Any],
+    *,
+    parent_id: str | None = None,
+    on_match: dict[str, Any] | None = None,
+) -> str:
+    """Upsert a row; root identity checks and writes share the registration lock."""
+    label = registry.entity_spec(label).label
+    if label == registry.Labels.DB:
+        with write_transaction():
+            lock_source_registration()
+            if match_props.get("id"):
+                assert_connection_id_available(match_props["id"])
+            return _upsert_row(
+                label, match_props, properties, parent_id=parent_id, on_match=on_match
+            )
+    return _upsert_row(
+        label, match_props, properties, parent_id=parent_id, on_match=on_match
+    )
+
+
+def _upsert_row(
     label: str,
     match_props: dict[str, Any],
     properties: dict[str, Any],
@@ -130,11 +190,59 @@ def upsert_row(
     """
     spec = registry.entity_spec(label)
     values = registry.projected(label, properties)
+    if "connection_id" in spec.natural_key:
+        owner = match_props.get("connection_id")
+        if not owner or values.get("connection_id") != owner:
+            raise ValueError("SQL properties require the matched connection_id")
+        if (on_match or {}).get("connection_id", owner) != owner:
+            raise ValueError("SQL ownership cannot change")
+    if spec.label == registry.Labels.DB and values.get("id") != match_props.get("id"):
+        raise ValueError("Database properties must carry the matched connection_id")
+
+    if spec.parent_label == registry.Labels.DB:
+        source_id = match_props.get("connection_id")
+        if source_id and parent_id and source_id != parent_id:
+            raise ValueError("Schema connection_id conflicts with parent")
+        parent_id = source_id or parent_id
+    if spec.parent_column and parent_id is None:
+        parent_id = values.get(spec.parent_column)
+    if spec.parent_column and parent_id is not None:
+        if values.get(spec.parent_column) not in (None, parent_id):
+            raise ValueError("Catalog properties conflict with supplied parent/source")
+    incoming_id = values.get("id")
+    if incoming_id and incoming_id != match_props.get("id"):
+        # Properties must not smuggle an existing foreign ID past match_props.
+        resolve_id(
+            spec.label,
+            {
+                "id": incoming_id,
+                **(
+                    {"connection_id": values["connection_id"]}
+                    if "connection_id" in spec.natural_key
+                    else {}
+                ),
+            },
+            parent_id=parent_id,
+        )
 
     if spec.parent_column and parent_id is not None:
         values[spec.parent_column] = parent_id
 
     existing_id = resolve_id(label, match_props, parent_id=parent_id)
+    if spec.parent_column and (on_match or {}).get(spec.parent_column) not in (
+        None,
+        parent_id,
+    ):
+        raise ValueError("Catalog update conflicts with supplied parent/source")
+
+    if existing_id is not None and spec.label == registry.Labels.DB:
+        roots = store().query_read(
+            select(spec.table.c.name).where(spec.table.c.id == existing_id)
+        )
+        if values.get("name") not in (None, roots[0]["name"]):
+            raise ValueError("Database name conflicts with registered connection_id")
+        # Connection metadata belongs exclusively to bootstrap/lifecycle, not ingest.
+        on_match = {k: v for k, v in (on_match or {}).items() if k == "pulled"}
 
     if existing_id is None:
         # Let the natural key arbitrate a race rather than checking first and
@@ -151,7 +259,11 @@ def upsert_row(
                 # overwrite it.
                 | {"id"}
             )
-            update = {k: v for k, v in values.items() if k not in skip}
+            update = (
+                {}
+                if spec.label == registry.Labels.DB
+                else {k: v for k, v in values.items() if k not in skip}
+            )
             statement = (
                 statement.on_conflict_do_update(
                     index_elements=conflict_target, set_=update
@@ -221,7 +333,7 @@ def _conflict_target(spec: registry.EntitySpec) -> list:
     specification", because Postgres matches the target against an index.
     """
     if spec.conflict_expression is not None:
-        return [spec.conflict_expression]
+        return [spec.table.c.connection_id, spec.conflict_expression]
     if not spec.natural_key:
         return []
     columns = [

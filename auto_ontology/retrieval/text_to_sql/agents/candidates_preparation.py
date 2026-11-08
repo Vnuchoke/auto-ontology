@@ -54,6 +54,9 @@ from auto_ontology.retrieval.data_access.relevant_tables import (
 )
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent, record_thought
+from auto_ontology.retrieval.text_to_sql.source_hits import source_owned_hits
+from auto_ontology.catalog.constants import Labels
+from auto_ontology.semantic.constants import LABEL_COLUMN_ATTRIBUTE, LABEL_SQL_ATTRIBUTE
 from auto_ontology.retrieval.text_to_sql.formatters_util import qualify_table
 from auto_ontology.retrieval.text_to_sql.models import (
     AnchorColumnModel,
@@ -290,6 +293,7 @@ class CandidatePreparationAgent(BaseAgent):
         """
         path_state = state.get("path_state", {})
         question = get_question_for_processing(state)
+        connection_id = state["connection_id"]
         target_db = path_state.get("target_db")
         if not target_db:
             connectors = state.get("connectors") or []
@@ -298,13 +302,24 @@ class CandidatePreparationAgent(BaseAgent):
         custom_analyses = list(path_state.get("retrieved_custom_analyses") or [])
         column_attributes = list(path_state.get("retrieved_column_attributes") or [])
         sql_attributes_raw = list(path_state.get("retrieved_sql_attributes") or [])
+        custom_analyses = source_owned_hits(
+            custom_analyses, Labels.CUSTOM_ANALYSIS, connection_id=connection_id
+        )
+        column_attributes = source_owned_hits(
+            column_attributes, LABEL_COLUMN_ATTRIBUTE, connection_id=connection_id
+        )
+        sql_attributes_raw = source_owned_hits(
+            sql_attributes_raw, LABEL_SQL_ATTRIBUTE, connection_id=connection_id
+        )
         candidates = custom_analyses + column_attributes + sql_attributes_raw
 
         # --- 1. Custom analyses ---
         self.logger.info("Retrieved %d custom analyses", len(custom_analyses))
 
         analysis_ids = [str(ca["id"]) for ca in custom_analyses if ca.get("id")]
-        relevant_queries = fetch_custom_analyses_with_sql(analysis_ids)
+        relevant_queries = fetch_custom_analyses_with_sql(
+            analysis_ids, connection_id=connection_id
+        )
         self.logger.info(
             "Found %d relevant queries from custom analyses", len(relevant_queries)
         )
@@ -321,6 +336,7 @@ class CandidatePreparationAgent(BaseAgent):
             question,
             path_state.get("entities") or [],
             target_db,
+            connection_id=connection_id,
         )
 
         # --- 2. Enrich ColumnAttributes with store context and build join paths ---
@@ -345,13 +361,16 @@ class CandidatePreparationAgent(BaseAgent):
                 attr_contexts = fetch_attr_column_contexts(
                     attr_ids,
                     database_name=target_db,
+                    connection_id=connection_id,
                 )
                 self.logger.info(
                     "Fetched store context for %d/%d column attributes",
                     len(attr_contexts),
                     len(attr_ids),
                 )
-                term_synonyms = fetch_term_synonyms(attr_ids)
+                term_synonyms = fetch_term_synonyms(
+                    attr_ids, connection_id=connection_id
+                )
                 self.logger.info("Fetched synonyms for %d term(s)", len(term_synonyms))
 
                 anchor_id, anchor_reasoning = self._identify_anchor(
@@ -388,7 +407,10 @@ class CandidatePreparationAgent(BaseAgent):
                     with ThreadPoolExecutor(max_workers=workers) as pool:
                         futures = {
                             pool.submit(
-                                find_join_path, anchor_ctx["col_id"], dctx["col_id"]
+                                find_join_path,
+                                anchor_ctx["col_id"],
+                                dctx["col_id"],
+                                connection_id=connection_id,
                             ): (did, dctx)
                             for did, dctx in dest_items
                         }
@@ -430,7 +452,9 @@ class CandidatePreparationAgent(BaseAgent):
                         # after ranking, in _rank_and_cap_hub_siblings, instead of
                         # on the DAL's arbitrary return order.
                         hub_sibling_hops, _ = find_anchor_hub_siblings(
-                            anchor_table_id, max_siblings=None
+                            anchor_table_id,
+                            max_siblings=None,
+                            connection_id=connection_id,
                         )
                         hub_sibling_hops, hub_sibling_truncated = (
                             self._rank_and_cap_hub_siblings(
@@ -461,7 +485,9 @@ class CandidatePreparationAgent(BaseAgent):
                     )
 
             # --- 4. Retrieve relevant tables ---
-            relevant_tables = get_relevant_tables_from_candidates(candidates)
+            relevant_tables = get_relevant_tables_from_candidates(
+                candidates, connection_id=connection_id
+            )
 
             if attr_contexts:
                 ca_table_ids = list(
@@ -471,7 +497,9 @@ class CandidatePreparationAgent(BaseAgent):
                         if ctx.get("table_id")
                     )
                 )
-                ca_tables = fetch_tables_by_ids(ca_table_ids)
+                ca_tables = fetch_tables_by_ids(
+                    ca_table_ids, connection_id=connection_id
+                )
                 existing_ids = {t.get("id") for t in relevant_tables}
                 for tbl in ca_tables:
                     if tbl.get("id") not in existing_ids:
@@ -484,7 +512,18 @@ class CandidatePreparationAgent(BaseAgent):
 
             additional_tables: list[dict] = []
             try:
-                additional_tables = extra_future.result()
+                additional_ids = list(
+                    dict.fromkeys(
+                        str(table["id"])
+                        for table in extra_future.result()
+                        if table.get("id")
+                    )
+                )
+                if additional_ids:
+                    # Vector payloads are not persisted ownership or schema evidence.
+                    additional_tables = fetch_tables_by_ids(
+                        additional_ids, connection_id=connection_id
+                    )
             except Exception:
                 self.logger.warning("Additional table retrieval failed", exc_info=True)
         finally:
@@ -509,7 +548,9 @@ class CandidatePreparationAgent(BaseAgent):
         # --- 4a. Add tables referenced by custom analyses via the store ---
         if custom_analyses:
             ca_ids = [str(ca["id"]) for ca in custom_analyses if ca.get("id")]
-            ca_linked_tables = fetch_tables_from_custom_analyses(ca_ids)
+            ca_linked_tables = fetch_tables_from_custom_analyses(
+                ca_ids, connection_id=connection_id
+            )
             prev_len = len(relevant_tables)
             relevant_tables = _merge_tables(relevant_tables, ca_linked_tables)
             self.logger.info(
@@ -525,14 +566,18 @@ class CandidatePreparationAgent(BaseAgent):
                 str(hit.get("id") or "") for hit in sql_attributes_raw if hit.get("id")
             ]
             sa_ids = list(dict.fromkeys(sa_ids))
-            sql_attributes = fetch_sql_attributes_with_sql(sa_ids)
+            sql_attributes = fetch_sql_attributes_with_sql(
+                sa_ids, connection_id=connection_id
+            )
             self.logger.info(
                 "Fetched %d/%d SqlAttribute details from the store",
                 len(sql_attributes),
                 len(sa_ids),
             )
 
-            sa_linked_tables = fetch_tables_from_sql_attributes(sa_ids)
+            sa_linked_tables = fetch_tables_from_sql_attributes(
+                sa_ids, connection_id=connection_id
+            )
             prev_len = len(relevant_tables)
             relevant_tables = _merge_tables(relevant_tables, sa_linked_tables)
             self.logger.info(
@@ -547,11 +592,15 @@ class CandidatePreparationAgent(BaseAgent):
             str(subject_term.get("id") or "") if isinstance(subject_term, dict) else ""
         )
         if subject_term_id:
-            pairs = fetch_term_table_pairs(term_ids=[subject_term_id])
+            pairs = fetch_term_table_pairs(
+                term_ids=[subject_term_id], connection_id=connection_id
+            )
             subject_table_ids = list(
                 dict.fromkeys(str(p["table_id"]) for p in pairs if p.get("table_id"))
             )
-            subject_tables = fetch_tables_by_ids(subject_table_ids)
+            subject_tables = fetch_tables_by_ids(
+                subject_table_ids, connection_id=connection_id
+            )
             existing_ids = {t.get("id") for t in relevant_tables}
             added = 0
             for tbl in subject_tables:
@@ -578,7 +627,7 @@ class CandidatePreparationAgent(BaseAgent):
         anchor_table_ids = [
             table_id
             for table_id in (
-                find_table_id_by_name(name, target_db)
+                find_table_id_by_name(name, target_db, connection_id=connection_id)
                 for name in anchor_tables_missing_from_scope(
                     incoming_anchors, relevant_tables
                 )
@@ -586,7 +635,9 @@ class CandidatePreparationAgent(BaseAgent):
             if table_id
         ]
         if anchor_table_ids:
-            anchor_tables = fetch_tables_by_ids(anchor_table_ids)
+            anchor_tables = fetch_tables_by_ids(
+                anchor_table_ids, connection_id=connection_id
+            )
             prev_len = len(relevant_tables)
             relevant_tables = _merge_tables(relevant_tables, anchor_tables)
             self.logger.info(
@@ -605,7 +656,7 @@ class CandidatePreparationAgent(BaseAgent):
             relevant_tables = [
                 table
                 for table in relevant_tables
-                if table.get("database_name") == target_db
+                if table.get("connection_id") == connection_id
             ]
 
         # --- 4e. Back-fill rich per-column metadata after every table source ---
@@ -619,7 +670,9 @@ class CandidatePreparationAgent(BaseAgent):
             if table.get("id") and _needs_column_metadata_backfill(table)
         ]
         if metadata_incomplete_ids:
-            enriched = fetch_tables_by_ids(metadata_incomplete_ids)
+            enriched = fetch_tables_by_ids(
+                metadata_incomplete_ids, connection_id=connection_id
+            )
             relevant_tables = _merge_tables(relevant_tables, enriched)
             self.logger.info(
                 "Back-filled column metadata for %d/%d table(s)",
@@ -658,7 +711,7 @@ class CandidatePreparationAgent(BaseAgent):
         # tables that were not in the pre-filter candidate pool.
         kept_ids = [t["id"] for t in relevant_tables if t.get("id")]
         connected_junctions, connected_junction_paths = find_connected_junction_tables(
-            kept_ids
+            kept_ids, connection_id=connection_id
         )
         if connected_junctions:
             forced_table_ids.update(t["id"] for t in connected_junctions)
@@ -690,7 +743,7 @@ class CandidatePreparationAgent(BaseAgent):
         #       filter was never shown in the first place.
         kept_ids = [t["id"] for t in relevant_tables if t.get("id")]
         bridge_tables, bridge_paths, skipped_pairs = find_kept_table_bridges(
-            kept_ids, pre_filter_candidate_ids
+            kept_ids, pre_filter_candidate_ids, connection_id=connection_id
         )
         if bridge_tables:
             forced_table_ids.update(t["id"] for t in bridge_tables)
@@ -718,7 +771,9 @@ class CandidatePreparationAgent(BaseAgent):
 
         forced_table_ids -= {t.get("id") for t in relevant_tables}
         if forced_table_ids:
-            forced_tables = fetch_tables_by_ids(list(forced_table_ids))
+            forced_tables = fetch_tables_by_ids(
+                list(forced_table_ids), connection_id=connection_id
+            )
             relevant_tables = _merge_tables(relevant_tables, forced_tables)
             self.logger.info(
                 "Force-included %d table(s) after relevance filter (deterministic "
@@ -840,6 +895,7 @@ class CandidatePreparationAgent(BaseAgent):
                     label_filter=["ColumnAttribute"],
                     per_label_k=_HUB_SIBLING_RANK_K,
                     database_name=target_db,
+                    connection_id=state["connection_id"],
                 )
                 attr_ids = [r["id"] for r in rows if r.get("id")]
                 if not attr_ids:
@@ -847,6 +903,7 @@ class CandidatePreparationAgent(BaseAgent):
                 ctx = fetch_attr_column_contexts(
                     attr_ids,
                     database_name=target_db,
+                    connection_id=state["connection_id"],
                 )
                 for r in rows:
                     c = ctx.get(r.get("id"))
@@ -882,6 +939,8 @@ class CandidatePreparationAgent(BaseAgent):
         question: str,
         entities: list[str],
         target_db: str | None,
+        *,
+        connection_id: str,
     ) -> list[dict]:
         """Embed the question and entities and search for extra Table hits.
 
@@ -897,6 +956,7 @@ class CandidatePreparationAgent(BaseAgent):
                 query,
                 k=k_per_query,
                 database_name=target_db,
+                connection_id=connection_id,
             )
 
         additional_tables: list[dict] = []

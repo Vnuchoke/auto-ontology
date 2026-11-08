@@ -2,351 +2,131 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 
-from auto_ontology.retrieval.text_to_sql.agents import candidates_retrieval
-from auto_ontology.retrieval.text_to_sql.agents.candidates_retrieval import (
-    CandidateRetrievalAgent,
-    _select_candidate_database,
-)
-from auto_ontology.retrieval.text_to_sql.state import AgentState
-from auto_ontology.semantic.constants import LABEL_COLUMN_ATTRIBUTE, LABEL_SQL_ATTRIBUTE
+from auto_ontology.retrieval.text_to_sql.agents import candidates_retrieval as module
+from auto_ontology.retrieval.text_to_sql import source_hits
 
 
-def _hit(
-    hit_id: str,
-    database_name: str | None,
-    score: float,
-    *,
-    query_entity: str | None = None,
-    source: str | None = None,
-) -> dict[str, Any]:
-    hit: dict[str, Any] = {
-        "id": hit_id,
-        "text": hit_id,
-        "score": score,
-    }
-    if database_name is not None:
-        hit["database_name"] = database_name
-    if query_entity is not None:
-        hit["query_entity"] = query_entity
-    if source is not None:
-        hit["source"] = source
-    return hit
+@pytest.fixture(autouse=True)
+def owned_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    def rows(ids: list[str], *, connection_id: str) -> list[dict]:
+        assert connection_id == "a"
+        return [{"id": node_id} for node_id in ids if node_id != "foreign"]
 
-
-def _state(
-    entities: list[str],
-    *,
-    target_db: str | None = None,
-    evidence: str | None = None,
-) -> AgentState:
-    path_state: dict[str, Any] = {"entities": entities}
-    if target_db is not None:
-        path_state["target_db"] = target_db
-    state = {
-        "initial_question": "question",
-        "llm": object(),
-        "path_state": path_state,
-        "semantic_retriever": object(),
-    }
-    if evidence is not None:
-        state["evidence"] = evidence
-    return cast(AgentState, state)
-
-
-def test_selects_database_by_entity_coverage_before_total_hits() -> None:
-    column_hits = [
-        _hit("a-revenue", "db-a", 0.3, query_entity="revenue"),
-        _hit("a-region", "db-a", 0.4, query_entity="region"),
-        _hit("b-revenue-1", "db-b", 0.1, query_entity="revenue"),
-        _hit("b-revenue-2", "db-b", 0.1, query_entity="revenue"),
-    ]
-    custom_hits = [
-        _hit("b-custom-1", "db-b", 0.1),
-        _hit("b-custom-2", "db-b", 0.1),
-    ]
-
-    selected, _ = _select_candidate_database(column_hits, custom_hits, [])
-
-    assert selected == "db-a"
-
-
-@pytest.mark.parametrize(
-    ("column_hits", "custom_hits", "expected"),
-    [
-        (
-            [
-                _hit("a", "db-a", 0.3, query_entity="revenue"),
-                _hit("b", "db-b", 0.3, query_entity="revenue"),
-            ],
-            [_hit("b-custom", "db-b", 0.9)],
-            "db-b",
+    monkeypatch.setattr(source_hits, "fetch_custom_analyses_with_sql", rows)
+    monkeypatch.setattr(source_hits, "fetch_sql_attributes_with_sql", rows)
+    monkeypatch.setattr(
+        source_hits,
+        "fetch_attr_column_contexts",
+        lambda ids, *, connection_id: {
+            row["id"]: row for row in rows(ids, connection_id=connection_id)
+        },
+    )
+    monkeypatch.setattr(
+        source_hits,
+        "get_full_term_by_id",
+        lambda node_id, *, connection_id: (
+            {"id": node_id} if node_id != "foreign" else None
         ),
-        (
-            [
-                _hit("a", "db-a", 0.2, query_entity="revenue"),
-                _hit("b", "db-b", 0.4, query_entity="revenue"),
-            ],
-            [],
-            "db-a",
-        ),
-        (
-            [
-                _hit("a", "db-a", 0.2, query_entity="revenue"),
-                _hit("b", "db-b", 0.2, query_entity="revenue"),
-            ],
-            [],
-            "db-a",
-        ),
-    ],
-)
-def test_database_selection_ties_are_deterministic(
-    column_hits: list[dict],
-    custom_hits: list[dict],
-    expected: str,
-) -> None:
-    selected, _ = _select_candidate_database(column_hits, custom_hits, [])
-
-    assert selected == expected
+    )
 
 
-def test_unscoped_retrieval_filters_database_and_backfills_entities(
+def test_retrieval_requires_resolved_source_before_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, str | None]] = []
+    search = Mock()
+    monkeypatch.setattr(module, "search_semantic_index", search)
+    with pytest.raises(KeyError, match="connection_id"):
+        module.CandidateRetrievalAgent().execute({"llm": object(), "path_state": {}})
+    search.assert_not_called()
 
-    def fake_search(
-        _retriever: object,
-        entity: str,
-        label: str,
-        _k: int,
-        database_name: str | None = None,
-    ) -> list[dict]:
-        calls.append((entity, label, database_name))
-        if database_name == "db-a":
-            assert label == LABEL_COLUMN_ATTRIBUTE
-            return [_hit(f"a-{entity}", "db-a", 0.1)]
-        if label == LABEL_COLUMN_ATTRIBUTE:
-            initial_hits = {
-                "revenue": [
-                    _hit("a-revenue", "db-a", 0.2),
-                    _hit("b-revenue", "db-b", 0.1),
-                    _hit("missing-db", None, 0.01),
-                ],
-                "region": [
-                    _hit("a-region", "db-a", 0.2),
-                    _hit("b-region", "db-b", 0.1),
-                ],
-                "customer": [_hit("missing-customer-db", None, 0.1)],
-            }
-            return initial_hits[entity]
-        if label == LABEL_SQL_ATTRIBUTE:
-            return [
-                _hit("a-sql", "db-a", 0.2),
-                _hit("b-sql", "db-b", 0.1),
-            ]
+
+@pytest.mark.parametrize("evidence", ["", "status means active"])
+def test_every_search_is_cid_scoped_and_foreign_hits_never_reach_model(
+    monkeypatch: pytest.MonkeyPatch, evidence: str
+) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    def search(retriever: object, query: str, **kwargs: object) -> list[dict]:
+        calls.append((query, kwargs))
+        label = kwargs["label_filter"][0]
         return [
-            _hit("a-custom", "db-a", 0.2),
-            _hit("a-custom-2", "db-a", 0.3),
-            _hit("b-custom", "db-b", 0.1),
+            {"id": label, "connection_id": "a", "database_name": "sales", "score": 0.2},
+            {
+                "id": "foreign",
+                "connection_id": "a",
+                "database_name": "sales",
+                "text": "FOREIGN B SQL",
+                "score": 0.01,
+            },
         ]
 
-    filtered_inputs: dict[str, list[dict]] = {}
-
-    def fake_filter(
-        _llm: object,
-        _question: str,
-        custom_hits: list[dict],
-        sql_hits: list[dict],
+    def filter_hits(
+        llm: object, question: str, custom: list[dict], attrs: list[dict]
     ) -> tuple[list[dict], list[dict]]:
-        filtered_inputs["custom"] = custom_hits
-        filtered_inputs["sql"] = sql_hits
-        return custom_hits, sql_hits
+        assert all(hit["connection_id"] == "a" for hit in custom + attrs)
+        assert all(hit["id"] != "foreign" for hit in custom + attrs)
+        return custom, attrs
 
-    monkeypatch.setattr(candidates_retrieval, "_search_by_label", fake_search)
-    monkeypatch.setattr(candidates_retrieval, "_llm_filter_both", fake_filter)
-    monkeypatch.setattr(candidates_retrieval, "custom_analysis_exists", lambda *_: True)
-
-    result = CandidateRetrievalAgent().execute(
-        _state(["revenue", "region", "customer"])
+    monkeypatch.setattr(module, "search_semantic_index", search)
+    monkeypatch.setattr(
+        module, "custom_analysis_exists", lambda *, connection_id: connection_id == "a"
     )
-    path_state = result["path_state"]
-
-    assert path_state["target_db"] == "db-a"
+    monkeypatch.setattr(module, "_llm_filter_both", filter_hits)
+    result = module.CandidateRetrievalAgent().execute(
+        {
+            "connection_id": "a",
+            "llm": object(),
+            "initial_question": "revenue",
+            "evidence": evidence,
+            "semantic_retriever": object(),
+            "path_state": {
+                "connection_id": "a",
+                "target_db": "sales",
+                "entities": ["revenue"],
+                "subject": "orders",
+            },
+        }
+    )
+    assert calls
+    assert all(kwargs["connection_id"] == "a" for _, kwargs in calls)
+    assert (evidence in [query for query, _ in calls]) == bool(evidence)
+    assert result["path_state"]["target_db"] == "sales"
+    assert result["path_state"]["retrieved_subject_term"]["connection_id"] == "a"
     for key in (
         "retrieved_column_attributes",
         "retrieved_custom_analyses",
         "retrieved_sql_attributes",
     ):
-        assert {hit["database_name"] for hit in path_state[key]} == {"db-a"}
-
-    assert filtered_inputs["custom"] == [
-        _hit("a-custom", "db-a", 0.2),
-        _hit("a-custom-2", "db-a", 0.3),
-    ]
-    assert filtered_inputs["sql"] == [_hit("a-sql", "db-a", 0.2)]
-    assert ("customer", LABEL_COLUMN_ATTRIBUTE, "db-a") in calls
-    assert not any(
-        entity in {"revenue", "region"} and database_name == "db-a"
-        for entity, label, database_name in calls
-        if label == LABEL_COLUMN_ATTRIBUTE
-    )
-
-    column_by_id = {hit["id"]: hit for hit in path_state["retrieved_column_attributes"]}
-    assert column_by_id["a-customer"]["query_entities"] == ["customer"]
-    assert "missing-db" not in column_by_id
+        assert all(hit["connection_id"] == "a" for hit in result["path_state"][key])
+        assert all(hit["id"] != "foreign" for hit in result["path_state"][key])
 
 
-def test_all_bridge_sourced_true_when_every_hit_is_bridge() -> None:
-    hits = [
-        _hit("bridge-1", "db-a", 0.1, source="bridgeTable"),
-        _hit("bridge-2", "db-a", 0.2, source="bridgeTable"),
-    ]
-
-    assert candidates_retrieval._all_bridge_sourced(hits) is True
-
-
-@pytest.mark.parametrize(
-    "sources",
-    [
-        ("bridgeTable", "sql"),
-        ("sql", "sql"),
-        (None, None),
-    ],
-)
-def test_all_bridge_sourced_false_for_mixed_missing_or_non_bridge(
-    sources: tuple[str | None, str | None],
-) -> None:
-    hits = [
-        _hit("a", "db-a", 0.1, source=sources[0]),
-        _hit("b", "db-a", 0.2, source=sources[1]),
-    ]
-
-    assert candidates_retrieval._all_bridge_sourced(hits) is False
-
-
-def test_all_bridge_sourced_false_for_empty_hits() -> None:
-    assert candidates_retrieval._all_bridge_sourced([]) is False
-
-
-def test_bridge_sourced_sql_attrs_skip_llm_filter_but_custom_still_filtered(
+def test_bridge_attributes_skip_combined_model_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_search(
-        _retriever: object,
-        entity: str,
-        label: str,
-        _k: int,
-        database_name: str | None = None,
-    ) -> list[dict]:
-        if label == LABEL_SQL_ATTRIBUTE:
-            return [_hit("bridge-1", "db-a", 0.1, source="bridgeTable")]
-        if label == LABEL_COLUMN_ATTRIBUTE:
-            return [_hit(f"a-{entity}", "db-a", 0.1)]
-        return [_hit("a-custom", "db-a", 0.2)]
+    from auto_ontology.semantic.constants import SQL_ATTR_SOURCE_BRIDGE
 
-    both_calls: list[object] = []
-    single_calls: list[tuple[list[dict], str]] = []
-
-    monkeypatch.setattr(candidates_retrieval, "_search_by_label", fake_search)
+    monkeypatch.setattr(module, "custom_analysis_exists", lambda **kwargs: False)
     monkeypatch.setattr(
-        candidates_retrieval,
-        "_llm_filter_both",
-        lambda *args: both_calls.append(args) or (args[2], args[3]),
+        module,
+        "search_semantic_index",
+        lambda *args, **kwargs: [
+            {"id": "bridge", "connection_id": "a", "source": SQL_ATTR_SOURCE_BRIDGE}
+        ],
     )
-
-    def fake_single_filter(
-        _llm: object, _question: str, candidates: list[dict], candidate_type: str
-    ) -> list[dict]:
-        single_calls.append((candidates, candidate_type))
-        return candidates
-
-    monkeypatch.setattr(
-        candidates_retrieval, "_llm_filter_candidates", fake_single_filter
+    combined = Mock(side_effect=AssertionError("bridge should not invoke model"))
+    monkeypatch.setattr(module, "_llm_filter_both", combined)
+    module.CandidateRetrievalAgent().execute(
+        {
+            "connection_id": "a",
+            "llm": object(),
+            "initial_question": "q",
+            "semantic_retriever": object(),
+            "path_state": {"target_db": "sales"},
+        }
     )
-
-    result = CandidateRetrievalAgent().execute(_state(["revenue"], target_db="db-a"))
-
-    assert not both_calls
-    assert len(single_calls) == 1
-    assert single_calls[0][1] == "custom analyses"
-    assert [h["id"] for h in result["path_state"]["retrieved_sql_attributes"]] == [
-        "bridge-1"
-    ]
-
-
-def test_explicit_target_db_preserves_existing_search_behavior(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, str, str | None]] = []
-
-    def fake_search(
-        _retriever: object,
-        entity: str,
-        label: str,
-        _k: int,
-        database_name: str | None = None,
-    ) -> list[dict]:
-        calls.append((entity, label, database_name))
-        return [_hit(f"{label}-{entity}", "db-a", 0.2)]
-
-    monkeypatch.setattr(candidates_retrieval, "_search_by_label", fake_search)
-    monkeypatch.setattr(
-        candidates_retrieval,
-        "_llm_filter_both",
-        lambda _llm, _question, custom, sql: (custom, sql),
-    )
-    monkeypatch.setattr(candidates_retrieval, "custom_analysis_exists", lambda *_: True)
-
-    result = CandidateRetrievalAgent().execute(
-        _state(["revenue", "region"], target_db="db-a")
-    )
-
-    assert len(calls) == 4
-    assert {database_name for _, _, database_name in calls} == {"db-a"}
-    assert result["path_state"]["target_db"] == "db-a"
-    assert len(result["path_state"]["retrieved_column_attributes"]) == 2
-
-
-def test_full_evidence_adds_column_attribute_vector_results(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    evidence = "Eligible rate equals eligible count divided by total enrollment."
-    calls: list[tuple[str, str, int, str | None]] = []
-
-    def fake_search(
-        _retriever: object,
-        query: str,
-        label: str,
-        k: int,
-        database_name: str | None = None,
-    ) -> list[dict]:
-        calls.append((query, label, k, database_name))
-        if label == LABEL_COLUMN_ATTRIBUTE:
-            score = 0.1 if query == evidence else 0.2
-            return [_hit("eligible-rate", "db-a", score)]
-        return []
-
-    monkeypatch.setattr(candidates_retrieval, "_search_by_label", fake_search)
-    monkeypatch.setattr(
-        candidates_retrieval,
-        "_llm_filter_both",
-        lambda _llm, _question, custom, sql: (custom, sql),
-    )
-    monkeypatch.setattr(
-        candidates_retrieval, "custom_analysis_exists", lambda *_: False
-    )
-
-    result = CandidateRetrievalAgent().execute(
-        _state(["eligible rate"], target_db="db-a", evidence=evidence)
-    )
-
-    assert (evidence, LABEL_COLUMN_ATTRIBUTE, 3, "db-a") in calls
-    hits = result["path_state"]["retrieved_column_attributes"]
-    assert len(hits) == 1
-    assert hits[0]["id"] == "eligible-rate"
-    assert hits[0]["query_evidence"] == evidence
-    assert hits[0]["query_entities"] == ["eligible rate"]
+    combined.assert_not_called()

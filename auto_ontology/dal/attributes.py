@@ -17,7 +17,6 @@ import logging
 from typing import Any
 
 from sqlalchemy import (
-    and_,
     any_,
     bindparam,
     case,
@@ -280,7 +279,8 @@ def find_column_attribute_by_column_id(column_id: str) -> str | None:
 def fetch_attr_column_contexts(
     attr_ids: list[str],
     *,
-    database_name: str | None,
+    database_name: str | None = None,
+    connection_id: str | None = None,
 ) -> dict[str, dict]:
     """Catalog context for each attribute id, keyed by that id.
 
@@ -300,19 +300,16 @@ def fetch_attr_column_contexts(
     That distinction matters. The attribute *describes* its owning column, so
     returning a referencing column's name and table as the attribute's context
     is simply wrong.
+
+    Executable callers pass ``connection_id``: only the canonical owned
+    table/column in that source is eligible, with no referencing-column
+    fallback. Unscoped inspection retains orphan entries and owner-first order.
+    Physical-name filtering is legacy administrative inspection only.
     """
     if not attr_ids:
         return {}
 
-    # The database filter lives in the JOIN condition, not the WHERE. In the
-    # WHERE it would delete the attribute's row outright when its column belongs
-    # to another database. On the join it leaves the attribute in place with a
-    # null database, and the empty-string defaults below take over. Callers read
-    # these keys directly, so the difference would show up as a missing entry
-    # rather than an error.
     database_join = s.catalog_database.c.id == s.catalog_schema.c.database_id
-    if database_name is not None:
-        database_join = and_(database_join, s.catalog_database.c.name == database_name)
 
     # 0 for the owning link, 1 for a referencing one -- the sort key that makes
     # "which column describes this attribute" a decision rather than an accident.
@@ -343,6 +340,7 @@ def fetch_attr_column_contexts(
             s.catalog_table.c.name.label("table_name"),
             s.catalog_schema.c.name.label("schema_name"),
             s.catalog_database.c.name.label("database_name"),
+            s.catalog_database.c.id.label("connection_id"),
             s.term.c.name.label("term_name"),
         )
         .select_from(
@@ -366,6 +364,15 @@ def fetch_attr_column_contexts(
         .where(s.column_attribute.c.id.in_(list(attr_ids)))
         .order_by(s.column_attribute.c.id, link.c.rank, s.catalog_column.c.id)
     )
+    if database_name is not None:
+        statement = statement.where(s.catalog_database.c.name == database_name)
+    if connection_id is not None:
+        statement = statement.where(
+            s.catalog_schema.c.database_id == connection_id,
+            s.catalog_table.c.id == s.column_attribute.c.table_id,
+            s.catalog_column.c.name == s.column_attribute.c.source_column,
+            link.c.rank == 0,
+        )
     try:
         rows = store().query_read(statement)
     except Exception:
@@ -390,6 +397,7 @@ def fetch_attr_column_contexts(
                 "table_name": row["table_name"] or "",
                 "schema_name": row["schema_name"] or "",
                 "database_name": row["database_name"] or "",
+                "connection_id": row["connection_id"],
                 "term_name": row["term_name"] or "",
                 "datatype": row["datatype"] or "",
             },
@@ -402,7 +410,9 @@ def fetch_attr_column_contexts(
 # ---------------------------------------------------------------------------
 
 
-def column_participates_in_semantic_fk(col_id: str) -> bool:
+def column_participates_in_semantic_fk(
+    col_id: str, *, connection_id: str | None = None
+) -> bool:
     """Whether *col_id* is already known to the FK graph, on either side.
 
     True if the column is itself an FK-holder (outgoing ``SEMANTIC_FK``) or is
@@ -412,8 +422,46 @@ def column_participates_in_semantic_fk(col_id: str) -> bool:
     FK-shaped, rather than flagging arbitrary equality joins (date ranges,
     status matches, business logic) the catalog was never meant to model.
     """
-    if not col_id:
+    if not col_id or connection_id == "":
         return False
+    if connection_id is not None:
+        target_column = s.catalog_column.alias("participating_target_column")
+        target_table = s.catalog_table.alias("participating_target_table")
+        target_schema = s.catalog_schema.alias("participating_target_schema")
+        statement = (
+            select(literal(1))
+            .select_from(
+                s.column__semantic_fk.join(
+                    s.catalog_column,
+                    s.catalog_column.c.id == s.column__semantic_fk.c.column_id,
+                )
+                .join(s.catalog_table)
+                .join(s.catalog_schema)
+                .join(
+                    s.column_attribute,
+                    s.column_attribute.c.id == s.column__semantic_fk.c.attribute_id,
+                )
+                .join(
+                    s.column__has_attribute,
+                    s.column__has_attribute.c.attribute_id == s.column_attribute.c.id,
+                )
+                .join(
+                    target_column,
+                    target_column.c.id == s.column__has_attribute.c.column_id,
+                )
+                .join(target_table, target_table.c.id == target_column.c.table_id)
+                .join(target_schema, target_schema.c.id == target_table.c.schema_id)
+            )
+            .where(
+                or_(s.catalog_column.c.id == col_id, target_column.c.id == col_id),
+                s.catalog_schema.c.database_id == connection_id,
+                target_schema.c.database_id == connection_id,
+                s.column_attribute.c.table_id == target_table.c.id,
+                s.column_attribute.c.source_column == target_column.c.name,
+            )
+            .limit(1)
+        )
+        return bool(store().query_read(statement))
     direct = (
         select(literal(1)).where(s.column__semantic_fk.c.column_id == col_id).exists()
     )
@@ -446,22 +494,42 @@ _fk_target_table = s.catalog_table.alias("fk_target_table")
 
 def find_unlinked_fk_columns(
     database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Columns carrying neither a SEMANTIC_FK nor a HAS_ATTRIBUTE link.
 
-    The work list for FK resolution. Scoped to one database when asked, for the
-    same reason as ``fetch_all_tables_without_term``: several databases share a
-    store, and a compile pass tags its output with one database's name.
-
-    When *database_name* is provided, only columns belonging to that database
-    are returned. Multiple databases can be co-resident in the same store, so
-    scoping keeps each compile pass' FK-resolution isolated to a single
-    database. When omitted, every unlinked FK column is returned.
+    Runtime compilation passes ``connection_id``. Optional physical-name or
+    unscoped reads remain administrative inspection only. Corrupt declared
+    keys crossing a root boundary exclude the entire source column.
 
     ``fk_target_col_id`` comes from an outer join, so a column with no declared
     foreign key still appears with ``None`` — those are exactly the ones the
     semantic resolver is for.
     """
+    target_column = s.catalog_column.alias("declared_target_column")
+    target_table = s.catalog_table.alias("declared_target_table")
+    target_schema = s.catalog_schema.alias("declared_target_schema")
+    invalid_declared_key = (
+        select(literal(1))
+        .select_from(
+            s.column__foreign_key.outerjoin(
+                target_column,
+                target_column.c.id == s.column__foreign_key.c.target_column_id,
+            )
+            .outerjoin(target_table, target_table.c.id == target_column.c.table_id)
+            .outerjoin(target_schema, target_schema.c.id == target_table.c.schema_id)
+        )
+        .where(
+            s.column__foreign_key.c.source_column_id == s.catalog_column.c.id,
+            or_(
+                target_schema.c.database_id != s.catalog_schema.c.database_id,
+                target_schema.c.database_id.is_(None),
+            ),
+        )
+        .correlate(s.catalog_column, s.catalog_schema)
+        .exists()
+    )
     statement = (
         select(
             s.catalog_column.c.id,
@@ -471,6 +539,7 @@ def find_unlinked_fk_columns(
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_schema.c.database_id.label("connection_id"),
             s.column__foreign_key.c.target_column_id.label("fk_target_col_id"),
             # The FK target's *table*, not just its column: `resolve_semantic_fks`
             # skips a candidate whose target table is the source table, which it
@@ -480,6 +549,9 @@ def find_unlinked_fk_columns(
         .select_from(
             s.catalog_column.join(
                 s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id
+            )
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
             )
             .outerjoin(
                 s.column__foreign_key,
@@ -495,6 +567,7 @@ def find_unlinked_fk_columns(
             )
         )
         .where(
+            ~invalid_declared_key,
             ~select(s.column__semantic_fk.c.attribute_id)
             .where(s.column__semantic_fk.c.column_id == s.catalog_column.c.id)
             .exists(),
@@ -504,33 +577,44 @@ def find_unlinked_fk_columns(
         )
     )
     if database_name is not None:
-        statement = statement.select_from(
-            s.catalog_schema.join(
-                s.catalog_database,
-                s.catalog_database.c.id == s.catalog_schema.c.database_id,
-            )
-        ).where(
-            s.catalog_table.c.schema_id == s.catalog_schema.c.id,
+        statement = statement.select_from(s.catalog_database).where(
+            s.catalog_database.c.id == s.catalog_schema.c.database_id,
             s.catalog_database.c.name == database_name,
         )
+    if connection_id is not None:
+        statement = statement.where(s.catalog_schema.c.database_id == connection_id)
 
     return [dict(r) for r in store().query_read(statement)]
 
 
 def _same_database(src_column_id: str, tgt_attr_id: str) -> bool:
-    """Whether *src_column_id* and *tgt_attr_id* belong to the same database."""
-    col_ctx = fetch_col_table_contexts([src_column_id])
-    attr_ctx = fetch_attr_column_contexts([tgt_attr_id], database_name=None)
-    col_db = col_ctx.get(src_column_id, {}).get("database_name")
-    attr_db = attr_ctx.get(tgt_attr_id, {}).get("database_name")
-    return bool(col_db) and col_db == attr_db
+    """Compare persisted column ancestry with the attribute's canonical table."""
+    target_table = s.catalog_table.alias("attribute_owner_table")
+    target_schema = s.catalog_schema.alias("attribute_owner_schema")
+    rows = store().query_read(
+        select(literal(1))
+        .select_from(
+            s.catalog_column.join(s.catalog_table)
+            .join(s.catalog_schema)
+            .join(s.column_attribute, s.column_attribute.c.id == tgt_attr_id)
+            .join(target_table, target_table.c.id == s.column_attribute.c.table_id)
+            .join(target_schema, target_schema.c.id == target_table.c.schema_id)
+        )
+        .where(
+            s.catalog_column.c.id == src_column_id,
+            s.catalog_schema.c.database_id == target_schema.c.database_id,
+        )
+        .limit(1)
+    )
+    return bool(rows)
 
 
 def merge_semantic_fk(src_column_id: str, tgt_attr_id: str) -> bool:
     """Point a column at the attribute it references. Idempotent.
 
     Refuses — writes nothing, returns ``False`` — when the two belong to
-    different ingested databases. This is the one place a ``SEMANTIC_FK``
+    different catalog root IDs (even with identical physical names), or the
+    canonical attribute table cannot be resolved. This is the one place a ``SEMANTIC_FK``
     edge is created, so it is the one place that has to enforce that it never
     crosses a database boundary: a path built from such an edge would later
     name a table that doesn't exist in the query's target database. Enforcing
@@ -563,7 +647,7 @@ def delete_semantic_fk(src_column_id: str, tgt_attr_id: str) -> None:
     )
 
 
-def fetch_semantic_fk_join_groups(database_name: str) -> list[dict[str, Any]]:
+def fetch_semantic_fk_join_groups(*, connection_id: str) -> list[dict[str, Any]]:
     """Return semantic FKs with the context needed to choose one join default."""
     source_column = s.catalog_column.alias("join_default_source_column")
     source_table = s.catalog_table.alias("join_default_source_table")
@@ -579,6 +663,7 @@ def fetch_semantic_fk_join_groups(database_name: str) -> list[dict[str, Any]]:
             source_table.c.name.label("source_table_name"),
             source_table.c.description.label("source_table_description"),
             source_schema.c.name.label("source_schema_name"),
+            source_schema.c.database_id.label("connection_id"),
             source_column.c.id.label("source_column_id"),
             source_column.c.name.label("source_column_name"),
             source_column.c.description.label("source_column_description"),
@@ -621,7 +706,11 @@ def fetch_semantic_fk_join_groups(database_name: str) -> list[dict[str, Any]]:
             .join(target_table, target_table.c.id == target_column.c.table_id)
             .join(target_schema, target_schema.c.id == target_table.c.schema_id)
         )
-        .where(source_database.c.name == database_name)
+        .where(
+            source_schema.c.database_id == connection_id,
+            target_schema.c.database_id == connection_id,
+            s.column_attribute.c.table_id == target_table.c.id,
+        )
         .order_by(
             source_table.c.id,
             s.column__semantic_fk.c.attribute_id,
@@ -793,6 +882,8 @@ def _find_table_join_hops(
     anchor_table_id: str,
     dest_table_id: str,
     database_id: str,
+    *,
+    connection_id: str | None = None,
 ) -> list[tuple[str, str]]:
     """Find table-to-table joins, oriented from anchor table to destination.
 
@@ -811,8 +902,19 @@ def _find_table_join_hops(
     can't reach (both endpoints are FK columns *into* the same identity hub,
     so there's no forward edge on either side to start from).
     """
+    statement = _SEMANTIC_TABLE_EDGES
+    if connection_id is not None:
+        statement = statement.join(
+            s.column_attribute,
+            s.column_attribute.c.id == s.column__semantic_fk.c.attribute_id,
+        ).where(
+            _fk_schema.c.database_id == connection_id,
+            _owner_schema.c.database_id == connection_id,
+            s.column_attribute.c.table_id == _owner_table.c.id,
+            s.column_attribute.c.source_column == _owner_column.c.name,
+        )
     rows = store().query_read(
-        _SEMANTIC_TABLE_EDGES,
+        statement,
         {"database_id": database_id},
     )
     adjacency: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
@@ -855,7 +957,9 @@ def _find_table_join_hops(
     return []
 
 
-def _table_database_id(table_id: str) -> str | None:
+def _table_database_id(
+    table_id: str, *, connection_id: str | None = None
+) -> str | None:
     """The database a table belongs to, for scoping :func:`_find_table_join_hops`."""
     rows = store().query_read(
         select(s.catalog_schema.c.database_id)
@@ -864,39 +968,54 @@ def _table_database_id(table_id: str) -> str | None:
                 s.catalog_schema, s.catalog_table.c.schema_id == s.catalog_schema.c.id
             )
         )
-        .where(s.catalog_table.c.id == table_id)
+        .where(
+            s.catalog_table.c.id == table_id,
+            *(
+                [s.catalog_schema.c.database_id == connection_id]
+                if connection_id is not None
+                else []
+            ),
+        )
     )
     return rows[0]["database_id"] if rows else None
 
 
-def _name_columns(node_ids: list[str]) -> dict[str, str]:
+def _name_columns(
+    node_ids: list[str], *, connection_id: str | None = None
+) -> dict[str, str]:
     if not node_ids:
         return {}
+    statement = select(s.catalog_column.c.id, s.catalog_column.c.name)
+    if connection_id is not None:
+        statement = statement.select_from(
+            s.catalog_column.join(s.catalog_table).join(s.catalog_schema)
+        ).where(s.catalog_schema.c.database_id == connection_id)
     return {
         r["id"]: r["name"]
         for r in store().query_read(
-            select(s.catalog_column.c.id, s.catalog_column.c.name).where(
-                s.catalog_column.c.id.in_(node_ids)
-            )
+            statement.where(s.catalog_column.c.id.in_(node_ids))
         )
     }
 
 
-def _name_tables(node_ids: list[str]) -> dict[str, str]:
+def _name_tables(
+    node_ids: list[str], *, connection_id: str | None = None
+) -> dict[str, str]:
     if not node_ids:
         return {}
+    statement = select(s.catalog_table.c.id, s.catalog_table.c.name)
+    if connection_id is not None:
+        statement = statement.select_from(s.catalog_table.join(s.catalog_schema)).where(
+            s.catalog_schema.c.database_id == connection_id
+        )
     return {
         r["id"]: r["name"]
-        for r in store().query_read(
-            select(s.catalog_table.c.id, s.catalog_table.c.name).where(
-                s.catalog_table.c.id.in_(node_ids)
-            )
-        )
+        for r in store().query_read(statement.where(s.catalog_table.c.id.in_(node_ids)))
     }
 
 
 def find_connected_junction_tables(
-    table_ids: list[str],
+    table_ids: list[str], *, connection_id: str | None = None
 ) -> tuple[list[dict], list[list[dict]]]:
     """Return junction tables with a one-hop FK into any supplied table.
 
@@ -905,7 +1024,7 @@ def find_connected_junction_tables(
     callers can safely expose the added table to SQL generation.
     """
     kept_ids = list(dict.fromkeys(table_id for table_id in table_ids if table_id))
-    if not kept_ids:
+    if not kept_ids or connection_id == "":
         return [], []
 
     junction_column = s.catalog_column.alias("connected_junction_column")
@@ -976,6 +1095,21 @@ def find_connected_junction_tables(
         )
     )
 
+    if connection_id is not None:
+        declared = declared.where(
+            junction_schema.c.database_id == connection_id,
+            target_schema.c.database_id == connection_id,
+        )
+        semantic = semantic.join(
+            s.column_attribute,
+            s.column_attribute.c.id == s.column__semantic_fk.c.attribute_id,
+        ).where(
+            junction_schema.c.database_id == connection_id,
+            target_schema.c.database_id == connection_id,
+            s.column_attribute.c.table_id == target_table.c.id,
+            s.column_attribute.c.source_column == target_column.c.name,
+        )
+
     try:
         rows = store().query_read(declared.union(semantic))
     except Exception:
@@ -1001,8 +1135,8 @@ def find_connected_junction_tables(
             for column_id in (row["source_column_id"], row["target_column_id"])
         )
     )
-    names = _name_columns(column_ids)
-    contexts = fetch_col_table_contexts(column_ids)
+    names = _name_columns(column_ids, connection_id=connection_id)
+    contexts = fetch_col_table_contexts(column_ids, connection_id=connection_id)
     junctions: dict[str, dict] = {}
     paths: list[list[dict]] = []
     for row in rows:
@@ -1034,7 +1168,9 @@ def find_connected_junction_tables(
     return list(junctions.values()), paths
 
 
-def find_join_path(anchor_col_id: str, dest_col_id: str) -> list[dict]:
+def find_join_path(
+    anchor_col_id: str, dest_col_id: str, *, connection_id: str | None = None
+) -> list[dict]:
     """The shortest semantic join route between the columns' tables.
 
     The endpoint columns identify the tables to connect; they do not have to be
@@ -1047,7 +1183,9 @@ def find_join_path(anchor_col_id: str, dest_col_id: str) -> list[dict]:
     if anchor_col_id == dest_col_id:
         return []
 
-    endpoint_contexts = fetch_col_table_contexts([anchor_col_id, dest_col_id])
+    endpoint_contexts = fetch_col_table_contexts(
+        [anchor_col_id, dest_col_id], connection_id=connection_id
+    )
     anchor_context = endpoint_contexts.get(anchor_col_id)
     dest_context = endpoint_contexts.get(dest_col_id)
     if not anchor_context or not dest_context:
@@ -1067,6 +1205,7 @@ def find_join_path(anchor_col_id: str, dest_col_id: str) -> list[dict]:
             anchor_context["table_id"],
             dest_context["table_id"],
             anchor_context["database_id"],
+            connection_id=connection_id,
         )
     except Exception:
         logger.warning(
@@ -1081,8 +1220,10 @@ def find_join_path(anchor_col_id: str, dest_col_id: str) -> list[dict]:
         return []
 
     col_ids = list(dict.fromkeys(col_id for pair in hop_pairs for col_id in pair))
-    names = _name_columns(col_ids)
-    contexts = fetch_col_table_contexts(col_ids)
+    names = _name_columns(col_ids, connection_id=connection_id)
+    contexts = fetch_col_table_contexts(col_ids, connection_id=connection_id)
+    if set(contexts) != set(col_ids):
+        return []
 
     hops: list[dict] = []
     for source_id, target_id in hop_pairs:
@@ -1103,7 +1244,9 @@ def find_join_path(anchor_col_id: str, dest_col_id: str) -> list[dict]:
     return hops
 
 
-def find_shared_hub_bridge(col_a_id: str, col_b_id: str) -> dict:
+def find_shared_hub_bridge(
+    col_a_id: str, col_b_id: str, *, connection_id: str | None = None
+) -> dict:
     """Find a genuine shared-identity hub connecting two FK columns that
     :func:`find_join_path` cannot reach.
 
@@ -1135,6 +1278,12 @@ def find_shared_hub_bridge(col_a_id: str, col_b_id: str) -> dict:
     """
     if col_a_id == col_b_id:
         return {}
+    if connection_id is not None:
+        endpoints = fetch_col_table_contexts(
+            [col_a_id, col_b_id], connection_id=connection_id
+        )
+        if set(endpoints) != {col_a_id, col_b_id}:
+            return {}
 
     fk_a = s.column__semantic_fk.alias("fk_a")
     fk_b = s.column__semantic_fk.alias("fk_b")
@@ -1167,6 +1316,19 @@ def find_shared_hub_bridge(col_a_id: str, col_b_id: str) -> dict:
         )
         .limit(1)
     )
+    if connection_id is not None:
+        statement = (
+            statement.join(s.catalog_schema)
+            .join(
+                s.column_attribute,
+                s.column_attribute.c.id == fk_a.c.attribute_id,
+            )
+            .where(
+                s.catalog_schema.c.database_id == connection_id,
+                s.column_attribute.c.table_id == s.catalog_table.c.id,
+                s.column_attribute.c.source_column == s.catalog_column.c.name,
+            )
+        )
     try:
         rows = store().query_read(statement)
     except Exception:
@@ -1186,7 +1348,10 @@ def find_shared_hub_bridge(col_a_id: str, col_b_id: str) -> dict:
 
 
 def find_anchor_hub_siblings(
-    anchor_table_id: str, max_siblings: int | None = 6
+    anchor_table_id: str,
+    max_siblings: int | None = 6,
+    *,
+    connection_id: str | None = None,
 ) -> tuple[list[dict], int]:
     """Find tables that share a hub table with *anchor_table_id* via FK.
 
@@ -1233,6 +1398,8 @@ def find_anchor_hub_siblings(
     the sibling name. ``truncated_count`` is how many sibling tables were
     dropped by the cap (0 if none were).
     """
+    if connection_id == "":
+        return [], 0
     fk_col = s.catalog_column.alias("fk_col")
     hub_col = s.catalog_column.alias("hub_col")
     hub_table = s.catalog_table.alias("hub_table")
@@ -1279,6 +1446,27 @@ def find_anchor_hub_siblings(
             sibling_table.c.id != s.catalog_table.c.id,
         )
     )
+    if connection_id is not None:
+        hub_schema = s.catalog_schema.alias("sibling_hub_schema")
+        sibling_schema = s.catalog_schema.alias("sibling_source_schema")
+        statement = (
+            statement.join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+            .join(hub_schema, hub_schema.c.id == hub_table.c.schema_id)
+            .join(sibling_schema, sibling_schema.c.id == sibling_table.c.schema_id)
+            .join(
+                s.column_attribute,
+                s.column_attribute.c.id == s.column__semantic_fk.c.attribute_id,
+            )
+            .where(
+                s.catalog_schema.c.database_id == connection_id,
+                hub_schema.c.database_id == connection_id,
+                sibling_schema.c.database_id == connection_id,
+                s.column_attribute.c.table_id == hub_table.c.id,
+                s.column_attribute.c.source_column == hub_col.c.name,
+            )
+        )
     try:
         rows = store().query_read(statement)
     except Exception:
@@ -1337,6 +1525,8 @@ def find_table_bridge(
     table_a_id: str,
     table_b_id: str,
     allowed_table_ids: set[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Find bridge tables AND their join hops (if any) needed to connect two tables.
 
@@ -1381,12 +1571,19 @@ def find_table_bridge(
     either direction, or the only path found steps outside
     *allowed_table_ids*.
     """
+    if connection_id is not None and any(
+        _table_database_id(tid, connection_id=connection_id) != connection_id
+        for tid in (table_a_id, table_b_id)
+    ):
+        return [], []
     for src, dst in ((table_a_id, table_b_id), (table_b_id, table_a_id)):
-        database_id = _table_database_id(src)
+        database_id = _table_database_id(src, connection_id=connection_id)
         if not database_id:
             continue
         try:
-            hop_pairs = _find_table_join_hops(src, dst, database_id)
+            hop_pairs = _find_table_join_hops(
+                src, dst, database_id, connection_id=connection_id
+            )
         except Exception:
             logger.warning(
                 "find_table_bridge: query failed for %s -> %s",
@@ -1399,8 +1596,10 @@ def find_table_bridge(
             continue
 
         col_ids = list(dict.fromkeys(cid for pair in hop_pairs for cid in pair))
-        names = _name_columns(col_ids)
-        col_ctx = fetch_col_table_contexts(col_ids)
+        names = _name_columns(col_ids, connection_id=connection_id)
+        col_ctx = fetch_col_table_contexts(col_ids, connection_id=connection_id)
+        if set(col_ctx) != set(col_ids):
+            continue
 
         # Every hop's target table is the next table on the path; the last
         # hop's target is dst itself, so everything before it is a bridge.
@@ -1438,7 +1637,7 @@ def find_table_bridge(
                     "target_column": names.get(target_id, ""),
                 }
             )
-        table_names = _name_tables(bridge_ids)
+        table_names = _name_tables(bridge_ids, connection_id=connection_id)
         bridge_tables = [
             {"id": tid, "name": table_names.get(tid, "")} for tid in bridge_ids
         ]
@@ -1450,6 +1649,8 @@ def find_kept_table_bridges(
     table_ids: list[str],
     allowed_table_ids: set[str] | None = None,
     max_bridge_tables: int = 5,
+    *,
+    connection_id: str | None = None,
 ) -> tuple[list[dict], list[list[dict]], int]:
     """Find bridge tables AND their join hops needed to connect pairs of
     already-kept tables.
@@ -1497,7 +1698,9 @@ def find_kept_table_bridges(
         if len(found) >= max_bridge_tables:
             break
         checked += 1
-        bridge_tables, hops = find_table_bridge(a_id, b_id, allowed_table_ids)
+        bridge_tables, hops = find_table_bridge(
+            a_id, b_id, allowed_table_ids, connection_id=connection_id
+        )
         for t in bridge_tables:
             if t["id"] in already_kept:
                 continue

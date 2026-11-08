@@ -44,13 +44,17 @@ __all__ = [
 
 def _embed(analysis_id: str) -> None:
     from auto_ontology.utils import get_embed_params
-    from auto_ontology.vdb import get_semantic_vdb
+    from auto_ontology.vdb import get_global_pql_vdb
 
-    embed_pql_analyses(
-        embed_params=get_embed_params(),
-        vdb=get_semantic_vdb(),
-        analysis_id=analysis_id,
-    )
+    vdb = get_global_pql_vdb()
+    try:
+        embed_pql_analyses(
+            embed_params=get_embed_params(),
+            vdb=vdb,
+            analysis_id=analysis_id,
+        )
+    finally:
+        vdb.close()
 
 
 def create_pql_analysis(
@@ -115,9 +119,6 @@ def update_pql_analysis(
 
     upsert_pql_analysis_node(analysis_id, name, description, pql)
 
-    from auto_ontology.vdb import get_semantic_vdb
-
-    get_semantic_vdb().delete_by_id(analysis_id)
     _embed(analysis_id)
 
     return {"id": analysis_id, "name": name, "description": description, "pql": pql}
@@ -133,8 +134,12 @@ def delete_pql_analysis(analysis_id: str) -> dict[str, str] | None:
 
     delete_pql_analysis_node(analysis_id)
 
-    from auto_ontology.vdb import get_semantic_vdb
+    from auto_ontology.vdb import get_global_pql_vdb
 
-    get_semantic_vdb().delete_by_id(analysis_id)
+    vdb = get_global_pql_vdb()
+    try:
+        vdb.delete_by_id(analysis_id)
+    finally:
+        vdb.close()
 
     return {"id": analysis_id}

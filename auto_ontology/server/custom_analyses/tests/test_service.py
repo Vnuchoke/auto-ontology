@@ -12,6 +12,10 @@ from auto_ontology.server.custom_analyses import service
 
 
 @patch("auto_ontology.server.custom_analyses.service.embed_custom_analyses")
+@patch(
+    "auto_ontology.dal.custom_analyses.get_custom_analysis_connection_id",
+    return_value="source",
+)
 @patch("auto_ontology.server.custom_analyses.service.fetch_database_name_for_analysis")
 @patch("auto_ontology.vdb.get_semantic_vdb")
 @patch("auto_ontology.utils.get_embed_params")
@@ -19,6 +23,7 @@ def test_embed_scopes_the_row_to_the_referenced_database(
     _embed_params: MagicMock,
     _vdb: MagicMock,
     fetch_database: MagicMock,
+    _connection_id: MagicMock,
     embed: MagicMock,
 ) -> None:
     fetch_database.return_value = "WWI"
@@ -28,21 +33,26 @@ def test_embed_scopes_the_row_to_the_referenced_database(
     assert embed.call_count == 1
     assert embed.call_args.kwargs["database_name"] == "WWI"
     assert embed.call_args.kwargs["analysis_id"] == "analysis-1"
+    assert embed.call_args.kwargs["connection_id"] == "source"
 
 
 @patch("auto_ontology.server.custom_analyses.service.embed_custom_analyses")
+@patch(
+    "auto_ontology.dal.custom_analyses.get_custom_analysis_connection_id",
+    return_value="source",
+)
 @patch("auto_ontology.server.custom_analyses.service.fetch_database_name_for_analysis")
 @patch("auto_ontology.vdb.get_semantic_vdb")
 @patch("auto_ontology.utils.get_embed_params")
-def test_unresolvable_database_still_embeds_but_warns(
+def test_unresolvable_database_is_not_embedded(
     _embed_params: MagicMock,
     _vdb: MagicMock,
     fetch_database: MagicMock,
+    _connection_id: MagicMock,
     embed: MagicMock,
 ) -> None:
     fetch_database.return_value = None
 
     service._embed_analysis("analysis-3")
 
-    assert embed.call_count == 1
-    assert embed.call_args.kwargs["database_name"] is None
+    embed.assert_not_called()

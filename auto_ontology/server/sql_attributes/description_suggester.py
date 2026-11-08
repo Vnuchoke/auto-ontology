@@ -11,6 +11,7 @@ import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
+from auto_ontology.connectors import sources
 from auto_ontology.dal.sql_attributes import (
     get_full_sql_attribute_by_id,
     set_sql_attribute_description_suggestion,
@@ -80,6 +81,8 @@ def suggest_sql_attribute_description(attr_id: str) -> str | None:
     is already stored on the node, it is returned as-is (no LLM call).
     Otherwise the LLM drafts one, it is persisted on the node via
     :func:`set_sql_attribute_description_suggestion`, and returned.
+    Fresh suggestions require stored ownership in an active source; legacy
+    cached metadata remains inspectable without entering a model prompt.
 
     Returns ``None`` when the attribute doesn't exist or the LLM call
     fails/returns nothing usable — callers should treat that as "no
@@ -92,6 +95,13 @@ def suggest_sql_attribute_description(attr_id: str) -> str | None:
     cached = row.get("description_suggestion")
     if cached:
         return cached
+
+    connection_id = row.get("connection_id")
+    if connection_id is None or not any(
+        source.connection_id == connection_id
+        for source in sources.list_active_sources()
+    ):
+        return None
 
     prompt = (
         f"The attribute: '{row.get('name', '')}', "

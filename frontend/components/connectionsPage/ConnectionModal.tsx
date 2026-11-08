@@ -17,6 +17,7 @@ import {
 	type ConnectionFieldKey,
 } from '@/enums/connection';
 import type { Connection, ConnectionInput, ConnectionParams } from '@/types/connection';
+import { isConnectionLabelTaken, proposeConnectionLabel } from './connectionLabels';
 
 const TYPE_STEP = 'Select Connector';
 const CONNECT_STEP = 'Connect';
@@ -54,10 +55,11 @@ const toFieldValues = (params: ConnectionParams): FieldValues => {
 export type ConnectionModalProps = {
 	open: boolean;
 	/**
-	 * Editing when set. The connector type and database name are the connection's
-	 * identity on the backend, so both are fixed for the life of the record.
+	 * Editing by connection_id when set. Physical database and connector type
+	 * are immutable driver settings, not the connection's identity.
 	 */
 	connection?: Connection | null;
+	existingConnections: readonly Connection[];
 	onConfirm: () => void;
 	onCancel: () => void;
 };
@@ -65,6 +67,7 @@ export type ConnectionModalProps = {
 export const ConnectionModal = ({
 	open,
 	connection = null,
+	existingConnections,
 	onConfirm,
 	onCancel,
 }: ConnectionModalProps) => {
@@ -72,6 +75,7 @@ export const ConnectionModal = ({
 
 	const [loading, setLoading] = useState(false);
 	const [testingConnection, setTestingConnection] = useState(false);
+	const [readingFile, setReadingFile] = useState(false);
 	const [isConnectionTested, setIsConnectionTested] = useState(false);
 	const [testSuccessMessage, setTestSuccessMessage] = useState<string | null>(null);
 	const [activeStep, setActiveStep] = useState(0);
@@ -82,6 +86,20 @@ export const ConnectionModal = ({
 		connection == null ? {} : toFieldValues(connection.connection),
 	);
 	const [alert, setAlert] = useState<string | null>(null);
+	const [settingsDirty, setSettingsDirty] = useState(false);
+	const [labelEdited, setLabelEdited] = useState(false);
+	const [label, setLabel] = useState(connection?.display_label ?? '');
+	const displayLabel =
+		!editing && !labelEdited
+			? proposeConnectionLabel(values.database ?? '', existingConnections)
+			: label;
+	const normalizedLabel = displayLabel.trim();
+	const labelConflict =
+		normalizedLabel !== '' &&
+		isConnectionLabelTaken(normalizedLabel, existingConnections, connection?.connection_id);
+	const labelValid = normalizedLabel !== '' && !labelConflict;
+	const labelOnly = editing && !settingsDirty;
+	const busy = loading || testingConnection || readingFile;
 
 	// The stored allowlist is what the picker reopens on, and what a re-test
 	// falls back to rather than silently dropping the connection's scope.
@@ -175,7 +193,7 @@ export const ConnectionModal = ({
 	}, [connectionType, values, keepCurrentKeys]);
 
 	const onTypeStep = steps[activeStep] === TYPE_STEP;
-	const canContinue = onTypeStep ? false : fieldsComplete;
+	const canContinue = !onTypeStep && labelValid && (labelOnly || fieldsComplete);
 
 	const handleNext = useCallback((): void => {
 		setAlert(null);
@@ -193,6 +211,7 @@ export const ConnectionModal = ({
 	}, [initialSchemas]);
 
 	const handleSelectType = (type: ConnectionType): void => {
+		if (busy) return;
 		setConnectionType(type);
 		setValues({});
 		setAlert(null);
@@ -203,6 +222,8 @@ export const ConnectionModal = ({
 	};
 
 	const handleFieldChange = (key: ConnectionFieldKey, value: string): void => {
+		if (busy) return;
+		setSettingsDirty(true);
 		setValues((prev) => ({ ...prev, [key]: value }));
 		setIsConnectionTested(false);
 		setTestSuccessMessage(null);
@@ -212,13 +233,14 @@ export const ConnectionModal = ({
 	};
 
 	const handleTestConnection = useCallback(async (): Promise<void> => {
+		if (busy || !fieldsComplete) return;
 		setTestingConnection(true);
 		setAlert(null);
 		setTestSuccessMessage(null);
 
 		const res = await connectionsApi.test(
 			buildConnection({ forTest: true }),
-			connection?.database_name,
+			connection?.connection_id,
 		);
 		setTestingConnection(false);
 
@@ -239,21 +261,27 @@ export const ConnectionModal = ({
 		// The test response carries the connection's schemas — feed the picker.
 		setAvailableSchemas(res.schemas);
 		setAlert(null);
-	}, [buildConnection, connection]);
+	}, [buildConnection, busy, connection, fieldsComplete]);
 
 	const handleSubmit = useCallback(async (): Promise<void> => {
-		if (!isConnectionTested) {
+		if (busy || !labelValid) return;
+		if (!labelOnly && (!fieldsComplete || !isConnectionTested)) {
 			setAlert(`Connection must be tested before ${editing ? 'saving' : 'creating'}.`);
 			return;
 		}
 
 		setLoading(true);
 		setAlert(null);
-		const input = buildConnection();
 		const res =
 			connection == null
-				? await connectionsApi.create(input)
-				: await connectionsApi.update(connection.database_name, input);
+				? await connectionsApi.create(buildConnection(), normalizedLabel)
+				: labelOnly
+					? await connectionsApi.rename(connection.connection_id, normalizedLabel)
+					: await connectionsApi.update(
+							connection.connection_id,
+							buildConnection(),
+							normalizedLabel,
+						);
 		setLoading(false);
 
 		if ('error' in res && res.error) {
@@ -262,27 +290,70 @@ export const ConnectionModal = ({
 		}
 
 		onConfirm();
-	}, [buildConnection, connection, editing, isConnectionTested, onConfirm]);
+	}, [
+		buildConnection,
+		busy,
+		connection,
+		editing,
+		fieldsComplete,
+		isConnectionTested,
+		labelOnly,
+		labelValid,
+		normalizedLabel,
+		onConfirm,
+	]);
 
 	const renderStepContent = (step: number) => {
 		switch (steps[step]) {
 			case TYPE_STEP:
-				return <ConnectionTypeStep onSelect={handleSelectType} />;
+				return (
+					<fieldset disabled={busy}>
+						<ConnectionTypeStep onSelect={handleSelectType} />
+					</fieldset>
+				);
 			case CONNECT_STEP:
 				return (
-					<ConnectionConnectStep
-						connectionType={connectionType}
-						values={values}
-						onFieldChange={handleFieldChange}
-						readOnlyKeys={readOnlyKeys}
-						keepCurrentKeys={keepCurrentKeys}
-						testSuccessMessage={testSuccessMessage}
-						onTestConnection={() => {
-							void handleTestConnection();
-						}}
-						testDisabled={!fieldsComplete || loading}
-						testingConnection={testingConnection}
-					/>
+					<div className="flex flex-col gap-3">
+						<label className="flex flex-col gap-1.5 px-2 text-sm font-medium text-heading dark:text-zinc-200">
+							Display Label <span className="text-red-500">*</span>
+							<input
+								type="text"
+								required
+								value={displayLabel}
+								disabled={loading}
+								onChange={({ target }) => {
+									setLabelEdited(true);
+									setLabel(target.value);
+								}}
+								aria-invalid={labelConflict}
+								aria-describedby={
+									labelConflict ? 'connection-label-error' : undefined
+								}
+								data-testid="connection-display-label"
+								className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+							/>
+						</label>
+						{labelConflict && (
+							<p id="connection-label-error" className="px-2 text-sm text-red-600">
+								This display label is already in use.
+							</p>
+						)}
+						<ConnectionConnectStep
+							connectionType={connectionType}
+							values={values}
+							onFieldChange={handleFieldChange}
+							readOnlyKeys={readOnlyKeys}
+							keepCurrentKeys={keepCurrentKeys}
+							testSuccessMessage={testSuccessMessage}
+							onTestConnection={() => {
+								void handleTestConnection();
+							}}
+							testDisabled={!fieldsComplete || busy}
+							testingConnection={testingConnection}
+							disabled={busy}
+							onFileReadPendingChange={setReadingFile}
+						/>
+					</div>
 				);
 			case SCHEMA_STEP:
 				return (
@@ -290,11 +361,17 @@ export const ConnectionModal = ({
 						<p className="px-2 text-xs text-secondary dark:text-zinc-400">
 							Leave empty to ingest all schemas.
 						</p>
-						<ConnectionSelectDataStep
-							availableDatabases={availableSchemas}
-							selectedDatabases={selectedSchemas}
-							onSelectionChange={setSelectedSchemas}
-						/>
+						<fieldset disabled={busy}>
+							<ConnectionSelectDataStep
+								availableDatabases={availableSchemas}
+								selectedDatabases={selectedSchemas}
+								onSelectionChange={(schemas) => {
+									if (busy) return;
+									setSettingsDirty(true);
+									setSelectedSchemas(schemas);
+								}}
+							/>
+						</fieldset>
 					</div>
 				);
 			default:
@@ -313,9 +390,18 @@ export const ConnectionModal = ({
 				: { label: 'Back', onClick: handleBack, variant: 'outline' },
 		];
 
-		const isLastStep = activeStep === steps.length - 1;
+		// Renaming skips the schema picker, even when stored driver fields are incomplete.
+		const isLastStep = labelOnly || activeStep === steps.length - 1;
+		if (labelOnly && isConnectionTested && activeStep < steps.length - 1) {
+			actions.push({
+				label: 'Select Schemas',
+				onClick: handleNext,
+				disabled: busy,
+				variant: 'outline',
+			});
+		}
 		// Require a successful test before advancing so the schema list can load.
-		const blocked = !canContinue || loading || testingConnection || !isConnectionTested;
+		const blocked = !canContinue || busy || (!labelOnly && !isConnectionTested);
 
 		actions.push(
 			isLastStep
@@ -333,24 +419,25 @@ export const ConnectionModal = ({
 		return actions;
 	}, [
 		activeStep,
+		busy,
 		canContinue,
 		editing,
 		handleBack,
 		handleNext,
 		handleSubmit,
 		isConnectionTested,
+		labelOnly,
 		loading,
 		onCancel,
 		onTypeStep,
 		steps.length,
-		testingConnection,
 	]);
 
 	return (
 		<ModalWithSteps
 			open={open}
 			onClose={onCancel}
-			title={editing ? `Edit ${connection.database_name}` : 'Create New Connection'}
+			title={editing ? `Edit ${connection.display_label}` : 'Create New Connection'}
 			steps={steps}
 			activeStep={activeStep}
 			onActiveStepChange={setActiveStep}

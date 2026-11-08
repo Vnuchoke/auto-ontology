@@ -23,12 +23,12 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, ValidationError
 
 from auto_ontology_mcp.config import Settings
 
@@ -41,6 +41,17 @@ MAX_ROWS = 100
 
 _SSE_DATA_PREFIX = "data:"
 _SSE_DONE = "[DONE]"
+
+
+NonBlankString = Annotated[str, StringConstraints(strict=True, pattern=r"\S")]
+
+
+class SourceSnapshot(BaseModel):
+    """Safe provenance only; upstream connection settings are never returned."""
+
+    connection_id: NonBlankString
+    display_label: NonBlankString
+    database_name: NonBlankString
 
 
 class DataAnswer(BaseModel):
@@ -61,6 +72,9 @@ class DataAnswer(BaseModel):
     reasoning: str = Field(
         default="",
         description="What the agent did, one line per step it took.",
+    )
+    source: SourceSnapshot | None = Field(
+        default=None, description="Source reported by the server, if available."
     )
 
 
@@ -168,13 +182,14 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
         ctx: Context,
         conversation_id: str | None = None,
         evidence: str | None = None,
+        connection_id: NonBlankString | None = None,
+        connection_label: NonBlankString | None = None,
     ) -> DataAnswer:
         """Run one text-to-SQL turn and return its structured result.
 
-        The API also accepts ``target_db`` to pin retrieval to one database.
-        It is not exposed here: it exists for benchmarking, the web UI never
-        sends it, and letting the deployment choose is what the semantic layer
-        is for.
+        Use list_sources to select an explicit source. Omit both selectors to
+        inherit the conversation's source or use the sole available source.
+        Multiple available sources require a selection for a new conversation.
 
         Args:
             question: The question, in plain language.
@@ -184,14 +199,25 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
                 question while the first is still running.
             evidence: Optional authoritative evidence supplied separately
                 from the question.
+            connection_id: Exact source ID from list_sources; mutually exclusive
+                with connection_label. Does not bypass the semantic layer.
+            connection_label: Source display label, resolved by the server;
+                mutually exclusive with connection_id.
         """
+        if connection_id is not None and connection_label is not None:
+            raise ToolError("Provide only one of connection_id and connection_label.")
         body: dict[str, Any] = {"question": question}
         if conversation_id:
             body["conversation_id"] = conversation_id
         if evidence:
             body["evidence"] = evidence
+        if connection_id is not None:
+            body["connection_id"] = connection_id
+        if connection_label is not None:
+            body["connection_label"] = connection_label
 
         answer: DataAnswer | None = None
+        source: SourceSnapshot | None = None
         steps = 0
 
         try:
@@ -220,8 +246,26 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
                             progress=steps,
                             message=f"{label}: {thought}" if thought else str(label),
                         )
-                    elif kind == "result":
-                        answer = _build_answer(event.get("answer") or {})
+                    elif kind in ("source", "result"):
+                        payload = (
+                            event if kind == "source" else event.get("answer") or {}
+                        )
+                        if kind == "source" or "source" in payload:
+                            try:
+                                snapshot = SourceSnapshot.model_validate(
+                                    payload.get("source")
+                                )
+                            except ValidationError:
+                                raise ToolError(
+                                    "Invalid Auto Ontology source snapshot."
+                                ) from None
+                            if source is not None and snapshot != source:
+                                raise ToolError(
+                                    "Auto Ontology source snapshot mismatch."
+                                )
+                            source = snapshot
+                        if kind == "result":
+                            answer = _build_answer(payload)
                     elif kind == "error":
                         raise ToolError(
                             f"Auto Ontology agent failed: {event.get('message') or 'unknown'}"
@@ -243,6 +287,7 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
                 "Auto Ontology ended the run without producing an answer. It may have "
                 "been cancelled, or the question may not map to the data."
             )
+        answer.source = source
         return answer
 
 

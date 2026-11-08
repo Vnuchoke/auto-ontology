@@ -43,6 +43,7 @@ from auto_ontology.dal.terms import (
     get_full_term_by_id,
 )
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
+from auto_ontology.retrieval.text_to_sql.source_hits import source_owned_hits
 from auto_ontology.semantic.constants import (
     LABEL_COLUMN_ATTRIBUTE,
     LABEL_SQL_ATTRIBUTE,
@@ -124,18 +125,21 @@ def _match_record(
 
 def _resolve_table(
     *,
+    connection_id: str,
     table_id: str | None = None,
     table_name: str | None = None,
     database_name: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     if table_id:
-        table = fetch_table_by_id(table_id)
+        table = fetch_table_by_id(table_id, connection_id=connection_id)
         if not table:
             return None, _error("not_found", f"Table id {table_id!r} was not found.")
         return table_id, None
     if not table_name:
         return None, _error("invalid_arguments", "Provide table_id or table_name.")
-    resolved = find_table_id_by_name(table_name, database_name=database_name)
+    resolved = find_table_id_by_name(
+        table_name, database_name=database_name, connection_id=connection_id
+    )
     if resolved:
         return resolved, None
     scope = f" in dataset {database_name!r}" if database_name else ""
@@ -145,9 +149,9 @@ def _resolve_table(
     )
 
 
-def list_databases(**_: Any) -> dict[str, Any]:
+def list_databases(*, connection_id: str, **_: Any) -> dict[str, Any]:
     """Return the bounded root of the lazy catalog tree."""
-    databases = fetch_databases()
+    databases = fetch_databases(connection_id=connection_id)
     return _ok(
         {
             "databases": databases[:MAX_DATASETS],
@@ -160,6 +164,7 @@ def list_databases(**_: Any) -> dict[str, Any]:
 
 def list_schemas(
     *,
+    connection_id: str,
     database_id: str | None = None,
     dataset_id: str | None = None,
     **_: Any,
@@ -168,7 +173,7 @@ def list_schemas(
     resolved_id = database_id or dataset_id
     if not resolved_id:
         return _error("invalid_arguments", "Provide database_id.")
-    result = fetch_schemas_for_database(resolved_id)
+    result = fetch_schemas_for_database(resolved_id, connection_id=connection_id)
     if result is None:
         return _error(
             "not_found",
@@ -188,6 +193,7 @@ def list_schemas(
 
 def list_tables(
     *,
+    connection_id: str,
     schema_id: str | None = None,
     database_name: str | None = None,
     **_: Any,
@@ -195,7 +201,9 @@ def list_tables(
     """Return tables directly beneath one schema."""
     if not schema_id:
         return _error("invalid_arguments", "Provide schema_id.")
-    tables = fetch_tables_for_schema(schema_id, database_name=database_name)
+    tables = fetch_tables_for_schema(
+        schema_id, database_name=database_name, connection_id=connection_id
+    )
     return _ok(
         {
             "schema_id": schema_id,
@@ -209,6 +217,7 @@ def list_tables(
 
 def list_columns(
     *,
+    connection_id: str,
     table_id: str | None = None,
     skip: int = 0,
     limit: int = MAX_COLUMNS,
@@ -223,10 +232,11 @@ def list_columns(
         table_id,
         skip=bounded_skip,
         limit=bounded_limit,
+        connection_id=connection_id,
     )
     if result is None:
         return _error("not_found", f"Table id {table_id!r} was not found.")
-    total = count_columns_for_table(table_id)
+    total = count_columns_for_table(table_id, connection_id=connection_id)
     columns = list(result.get("columns") or [])
     return _ok(
         {
@@ -241,6 +251,7 @@ def list_columns(
 
 def get_dataset(
     *,
+    connection_id: str,
     dataset_id: str | None = None,
     dataset_name: str | None = None,
     **_: Any,
@@ -250,7 +261,7 @@ def get_dataset(
     if not identifier:
         return _error("invalid_arguments", "Provide dataset_id or dataset_name.")
 
-    databases = fetch_databases()
+    databases = fetch_databases(connection_id=connection_id)
     matches = _match_record(databases, identifier)
     if not matches:
         return _error("not_found", f"Dataset {identifier!r} was not found.")
@@ -258,7 +269,10 @@ def get_dataset(
         return _error("ambiguous", f"Dataset {identifier!r} is ambiguous.")
 
     database = matches[0]
-    schemas_result = fetch_schemas_for_database(str(database["id"])) or {}
+    schemas_result = (
+        fetch_schemas_for_database(str(database["id"]), connection_id=connection_id)
+        or {}
+    )
     schemas = (
         list(schemas_result.get("schemas") or [])
         if isinstance(schemas_result, dict)
@@ -269,7 +283,9 @@ def get_dataset(
     truncated = len(schemas) > MAX_SCHEMAS
     for schema in schemas[:MAX_SCHEMAS]:
         tables = fetch_tables_for_schema(
-            str(schema["id"]), database_name=str(database.get("name") or "")
+            str(schema["id"]),
+            database_name=str(database.get("name") or ""),
+            connection_id=connection_id,
         )
         remaining = max(0, MAX_TABLES - table_count)
         shown_tables = tables[:remaining]
@@ -294,6 +310,7 @@ def get_dataset(
 
 def get_table(
     *,
+    connection_id: str,
     table_id: str | None = None,
     table_name: str | None = None,
     database_name: str | None = None,
@@ -301,19 +318,24 @@ def get_table(
 ) -> dict[str, Any]:
     """Return catalog, semantic, column, and connection metadata for one table."""
     resolved, error = _resolve_table(
-        table_id=table_id, table_name=table_name, database_name=database_name
+        connection_id=connection_id,
+        table_id=table_id,
+        table_name=table_name,
+        database_name=database_name,
     )
     if error:
         return error
     assert resolved is not None
 
-    table = fetch_table_by_id(resolved)
+    table = fetch_table_by_id(resolved, connection_id=connection_id)
     table_columns = fetch_columns_for_table(
-        resolved, skip=0, limit=MAX_COLUMNS + 1
+        resolved, skip=0, limit=MAX_COLUMNS + 1, connection_id=connection_id
     ) or {"columns": []}
     columns = list(table_columns.get("columns") or [])
-    neighbors = fetch_join_neighbors(resolved)
-    terms, attributes = fetch_terms_and_attributes_for_table(resolved)
+    neighbors = fetch_join_neighbors(resolved, connection_id=connection_id)
+    terms, attributes = fetch_terms_and_attributes_for_table(
+        resolved, connection_id=connection_id
+    )
     truncated = (
         len(columns) > MAX_COLUMNS
         or len(neighbors) > MAX_CONNECTIONS
@@ -338,6 +360,7 @@ def get_table(
 
 def get_column(
     *,
+    connection_id: str,
     column_id: str | None = None,
     column_name: str | None = None,
     table_id: str | None = None,
@@ -349,7 +372,9 @@ def get_column(
     resolved_column_id = column_id
     resolved_table_id = table_id
     if resolved_column_id:
-        resolved_table_id = fetch_parent_table_id_for_column(resolved_column_id)
+        resolved_table_id = fetch_parent_table_id_for_column(
+            resolved_column_id, connection_id=connection_id
+        )
         if not resolved_table_id:
             return _error(
                 "not_found", f"Column id {resolved_column_id!r} was not found."
@@ -358,7 +383,7 @@ def get_column(
         if not column_name:
             return _error("invalid_arguments", "Provide column_id or column_name.")
         if not table_name and table_id:
-            table = fetch_table_by_id(table_id)
+            table = fetch_table_by_id(table_id, connection_id=connection_id)
             table_name = str((table or {}).get("name") or "") or None
         if not table_name:
             return _error(
@@ -369,13 +394,16 @@ def get_column(
             table_name,
             column_name,
             database_name=database_name,
+            connection_id=connection_id,
         )
         if not resolved_column_id:
             return _error(
                 "not_found_or_ambiguous",
                 f"Column {table_name}.{column_name} was not found or is ambiguous.",
             )
-        resolved_table_id = fetch_parent_table_id_for_column(resolved_column_id)
+        resolved_table_id = fetch_parent_table_id_for_column(
+            resolved_column_id, connection_id=connection_id
+        )
 
     assert resolved_column_id is not None
     assert resolved_table_id is not None
@@ -386,6 +414,7 @@ def get_column(
             resolved_table_id,
             skip=skip,
             limit=MAX_COLUMNS,
+            connection_id=connection_id,
         )
         columns = list((table_columns or {}).get("columns") or [])
         column = next(
@@ -398,9 +427,14 @@ def get_column(
     if column is None:
         return _error("not_found", f"Column id {resolved_column_id!r} was not found.")
 
-    details = fetch_column_exploration_details(resolved_column_id) or {}
-    table = fetch_table_by_id(resolved_table_id)
-    neighbors = fetch_join_neighbors(resolved_table_id)
+    details = (
+        fetch_column_exploration_details(
+            resolved_column_id, connection_id=connection_id
+        )
+        or {}
+    )
+    table = fetch_table_by_id(resolved_table_id, connection_id=connection_id)
+    neighbors = fetch_join_neighbors(resolved_table_id, connection_id=connection_id)
     return _ok(
         {
             "column": column,
@@ -415,6 +449,7 @@ def get_column(
 
 def get_table_semantic_fks(
     *,
+    connection_id: str,
     table_id: str | None = None,
     table_name: str | None = None,
     database_name: str | None = None,
@@ -422,13 +457,16 @@ def get_table_semantic_fks(
 ) -> dict[str, Any]:
     """Return semantic-FK attributes and the columns/tables they connect."""
     resolved, error = _resolve_table(
-        table_id=table_id, table_name=table_name, database_name=database_name
+        table_id=table_id,
+        table_name=table_name,
+        database_name=database_name,
+        connection_id=connection_id,
     )
     if error:
         return error
     assert resolved is not None
 
-    context = fetch_table_context(resolved)
+    context = fetch_table_context(resolved, connection_id=connection_id)
     columns = list(context.get("columns") or [])
     connections: list[dict[str, Any]] = []
     truncated = len(columns) > MAX_COLUMNS
@@ -436,7 +474,10 @@ def get_table_semantic_fks(
         column_id = str(column.get("id") or "")
         if not column_id:
             continue
-        details = fetch_column_exploration_details(column_id) or {}
+        details = (
+            fetch_column_exploration_details(column_id, connection_id=connection_id)
+            or {}
+        )
         attribute = details.get("column_attribute")
         if not isinstance(attribute, dict):
             continue
@@ -444,7 +485,9 @@ def get_table_semantic_fks(
             continue
         attribute_id = str(attribute.get("id") or "")
         linked = (
-            fetch_column_attribute_exploration_details(attribute_id)
+            fetch_column_attribute_exploration_details(
+                attribute_id, connection_id=connection_id
+            )
             if attribute_id
             else {}
         ) or {}
@@ -464,7 +507,7 @@ def get_table_semantic_fks(
 
     return _ok(
         {
-            "table": fetch_table_by_id(resolved),
+            "table": fetch_table_by_id(resolved, connection_id=connection_id),
             "semantic_foreign_keys": connections,
             "limits": {
                 "connections": MAX_CONNECTIONS,
@@ -477,25 +520,29 @@ def get_table_semantic_fks(
 
 def _resolve_term(
     *,
+    connection_id: str,
     term_id: str | None = None,
     term_name: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Resolve one Term by id or exact case-insensitive name."""
     if term_id:
-        term = get_full_term_by_id(term_id)
+        term = get_full_term_by_id(term_id, connection_id=connection_id)
         if term:
             return term, None
         return None, _error("not_found", f"Term id {term_id!r} was not found.")
     if not term_name:
         return None, _error("invalid_arguments", "Provide term_id or term_name.")
     matches = _match_record(
-        fetch_all_terms(search=term_name, limit=MAX_TERMS + 1), term_name
+        fetch_all_terms(
+            search=term_name, limit=MAX_TERMS + 1, connection_id=connection_id
+        ),
+        term_name,
     )
     if not matches:
         return None, _error("not_found", f"Term {term_name!r} was not found.")
     if len(matches) > 1:
         return None, _error("ambiguous", f"Term {term_name!r} is ambiguous.")
-    term = get_full_term_by_id(str(matches[0]["id"]))
+    term = get_full_term_by_id(str(matches[0]["id"]), connection_id=connection_id)
     if not term:
         return None, _error("not_found", f"Term {term_name!r} was not found.")
     return term, None
@@ -503,14 +550,17 @@ def _resolve_term(
 
 def list_terms(
     *,
+    connection_id: str,
     search: str | None = None,
     limit: int = 25,
     **_: Any,
 ) -> dict[str, Any]:
     """Return a bounded glossary list with descriptions and synonyms."""
     bounded_limit = min(max(int(limit), 1), MAX_TERMS)
-    terms = fetch_all_terms(search=search, limit=bounded_limit + 1)
-    total = count_terms(search=search)
+    terms = fetch_all_terms(
+        search=search, limit=bounded_limit + 1, connection_id=connection_id
+    )
+    total = count_terms(search=search, connection_id=connection_id)
     return _ok(
         {
             "terms": terms[:bounded_limit],
@@ -523,12 +573,15 @@ def list_terms(
 
 def get_term(
     *,
+    connection_id: str,
     term_id: str | None = None,
     term_name: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Return one Term plus bounded ColumnAttributes and SqlAttributes."""
-    term, error = _resolve_term(term_id=term_id, term_name=term_name)
+    term, error = _resolve_term(
+        term_id=term_id, term_name=term_name, connection_id=connection_id
+    )
     if error:
         return error
     assert term is not None
@@ -537,10 +590,10 @@ def get_term(
     term["tables"] = term_tables[:MAX_TABLES]
     resolved_id = str(term["id"])
     column_attributes = fetch_column_attributes_by_term_id(
-        resolved_id, limit=MAX_TERM_ATTRIBUTES + 1
+        resolved_id, limit=MAX_TERM_ATTRIBUTES + 1, connection_id=connection_id
     )
     sql_attributes = fetch_sql_attributes_by_term_id(
-        resolved_id, limit=MAX_TERM_ATTRIBUTES + 1
+        resolved_id, limit=MAX_TERM_ATTRIBUTES + 1, connection_id=connection_id
     )
     truncated = (
         len(term_tables) > MAX_TABLES
@@ -560,6 +613,7 @@ def get_term(
 
 def get_column_attribute(
     *,
+    connection_id: str,
     column_attribute_id: str | None = None,
     column_attribute_name: str | None = None,
     term_id: str | None = None,
@@ -569,20 +623,26 @@ def get_column_attribute(
     """Return one ColumnAttribute, its owning Term, and linked columns."""
     resolved_term: dict[str, Any] | None = None
     if term_id or term_name:
-        resolved_term, error = _resolve_term(term_id=term_id, term_name=term_name)
+        resolved_term, error = _resolve_term(
+            term_id=term_id, term_name=term_name, connection_id=connection_id
+        )
         if error:
             return error
 
     if column_attribute_id and resolved_term is None:
         exploration = (
             fetch_column_attribute_exploration_details(
-                column_attribute_id, limit=MAX_ATTRIBUTE_COLUMNS + 1
+                column_attribute_id,
+                limit=MAX_ATTRIBUTE_COLUMNS + 1,
+                connection_id=connection_id,
             )
             or {}
         )
         term = exploration.get("term")
         if isinstance(term, dict) and term.get("id"):
-            resolved_term = get_full_term_by_id(str(term["id"]))
+            resolved_term = get_full_term_by_id(
+                str(term["id"]), connection_id=connection_id
+            )
     else:
         exploration = {}
 
@@ -598,7 +658,9 @@ def get_column_attribute(
         )
 
     attributes = fetch_column_attributes_by_term_id(
-        str(resolved_term["id"]), limit=MAX_TERM_ATTRIBUTES + 1
+        str(resolved_term["id"]),
+        limit=MAX_TERM_ATTRIBUTES + 1,
+        connection_id=connection_id,
     )
     identifier = column_attribute_id or column_attribute_name
     if not identifier:
@@ -620,7 +682,9 @@ def get_column_attribute(
     if not exploration:
         exploration = (
             fetch_column_attribute_exploration_details(
-                attribute_id, limit=MAX_ATTRIBUTE_COLUMNS + 1
+                attribute_id,
+                limit=MAX_ATTRIBUTE_COLUMNS + 1,
+                connection_id=connection_id,
             )
             or {}
         )
@@ -642,6 +706,7 @@ def get_column_attribute(
 
 def get_sql_attribute(
     *,
+    connection_id: str,
     sql_attribute_id: str | None = None,
     sql_attribute_name: str | None = None,
     **_: Any,
@@ -649,20 +714,25 @@ def get_sql_attribute(
     """Return one SqlAttribute with its Term, SQL, and linked statement."""
     resolved_id = sql_attribute_id
     if not resolved_id and sql_attribute_name:
-        match = find_attr_by_name(sql_attribute_name, None)
+        match = find_attr_by_name(sql_attribute_name, connection_id=connection_id)
         resolved_id = str(match.get("id")) if match and match.get("id") else None
     if not resolved_id:
         return _error(
             "invalid_arguments",
             "Provide a valid sql_attribute_id or sql_attribute_name.",
         )
-    attribute = get_full_sql_attribute_by_id(resolved_id)
+    attribute = get_full_sql_attribute_by_id(resolved_id, connection_id=connection_id)
     if not attribute:
         return _error(
             "not_found",
             f"SqlAttribute {sql_attribute_id or sql_attribute_name!r} not found.",
         )
-    exploration = fetch_sql_attribute_exploration_details(resolved_id) or {}
+    exploration = (
+        fetch_sql_attribute_exploration_details(
+            resolved_id, connection_id=connection_id
+        )
+        or {}
+    )
     return _ok(
         {
             "sql_attribute": attribute,
@@ -674,6 +744,7 @@ def get_sql_attribute(
 
 def search_semantic_layer(
     *,
+    connection_id: str,
     query: str | None = None,
     labels: list[str] | None = None,
     database_name: str | None = None,
@@ -705,7 +776,17 @@ def search_semantic_layer(
         label_filter=requested_labels,
         per_label_k=bounded_limit,
         database_name=database_name,
+        connection_id=connection_id,
     )
+    rows = [
+        hit
+        for label in requested_labels
+        for hit in source_owned_hits(
+            [row for row in rows if row.get("label") == label],
+            label,
+            connection_id=connection_id,
+        )
+    ]
     return _ok(
         {
             "matches": rows[:MAX_SEMANTIC_SEARCH_RESULTS],
@@ -737,12 +818,14 @@ def run_information_tool(
     arguments: dict[str, Any],
     *,
     semantic_retriever: Any = None,
+    connection_id: str,
 ) -> dict[str, Any]:
     """Dispatch a named read-only metadata tool."""
     try:
         name = InformationToolName(tool_name)
     except ValueError:
         return _error("unknown_tool", f"Unknown information tool {tool_name!r}.")
+    arguments = {**arguments, "connection_id": connection_id}
     if name == InformationToolName.SEARCH_SEMANTIC_LAYER:
         return INFORMATION_TOOLS[name](
             **arguments, semantic_retriever=semantic_retriever

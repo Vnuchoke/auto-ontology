@@ -18,12 +18,12 @@ def test_lazy_catalog_tools_mirror_catalog_endpoints(
     monkeypatch.setattr(
         information_tools,
         "fetch_databases",
-        lambda: [{"id": "db-1", "name": "sales"}],
+        lambda **_kwargs: [{"id": "db-1", "name": "sales"}],
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_schemas_for_database",
-        lambda _database_id: {
+        lambda _database_id, **_kwargs: {
             "schemas_count": 1,
             "schemas": [{"id": "schema-1", "schema_name": "public"}],
         },
@@ -44,13 +44,19 @@ def test_lazy_catalog_tools_mirror_catalog_endpoints(
     monkeypatch.setattr(
         information_tools,
         "count_columns_for_table",
-        lambda _table_id: 1,
+        lambda _table_id, **_kwargs: 1,
     )
 
-    databases = information_tools.list_databases()
-    schemas = information_tools.list_schemas(database_id="db-1")
-    tables = information_tools.list_tables(schema_id="schema-1")
-    columns = information_tools.list_columns(table_id="table-1")
+    databases = information_tools.list_databases(connection_id="test-source")
+    schemas = information_tools.list_schemas(
+        database_id="db-1", connection_id="test-source"
+    )
+    tables = information_tools.list_tables(
+        schema_id="schema-1", connection_id="test-source"
+    )
+    columns = information_tools.list_columns(
+        table_id="table-1", connection_id="test-source"
+    )
 
     assert databases["data"]["databases"][0]["id"] == "db-1"
     assert schemas["data"]["schemas"][0]["id"] == "schema-1"
@@ -60,9 +66,18 @@ def test_lazy_catalog_tools_mirror_catalog_endpoints(
 
 
 def test_lazy_catalog_tools_require_parent_ids() -> None:
-    assert information_tools.list_schemas()["error"]["code"] == "invalid_arguments"
-    assert information_tools.list_tables()["error"]["code"] == "invalid_arguments"
-    assert information_tools.list_columns()["error"]["code"] == "invalid_arguments"
+    assert (
+        information_tools.list_schemas(connection_id="test-source")["error"]["code"]
+        == "invalid_arguments"
+    )
+    assert (
+        information_tools.list_tables(connection_id="test-source")["error"]["code"]
+        == "invalid_arguments"
+    )
+    assert (
+        information_tools.list_columns(connection_id="test-source")["error"]["code"]
+        == "invalid_arguments"
+    )
 
 
 def test_get_dataset_returns_scoped_hierarchy(
@@ -71,12 +86,12 @@ def test_get_dataset_returns_scoped_hierarchy(
     monkeypatch.setattr(
         information_tools,
         "fetch_databases",
-        lambda: [{"id": "db-1", "name": "sales"}],
+        lambda **_kwargs: [{"id": "db-1", "name": "sales"}],
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_schemas_for_database",
-        lambda _database_id: {
+        lambda _database_id, **_kwargs: {
             "schemas_count": 1,
             "schemas": [{"id": "schema-1", "schema_name": "public"}],
         },
@@ -87,7 +102,9 @@ def test_get_dataset_returns_scoped_hierarchy(
         lambda _schema_id, **_kwargs: [{"id": "table-1", "name": "orders"}],
     )
 
-    result = information_tools.get_dataset(dataset_name="SALES")
+    result = information_tools.get_dataset(
+        dataset_name="SALES", connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["dataset"]["id"] == "db-1"
@@ -96,9 +113,11 @@ def test_get_dataset_returns_scoped_hierarchy(
 
 
 def test_get_dataset_reports_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(information_tools, "fetch_databases", lambda: [])
+    monkeypatch.setattr(information_tools, "fetch_databases", lambda **kwargs: [])
 
-    result = information_tools.get_dataset(dataset_name="missing")
+    result = information_tools.get_dataset(
+        dataset_name="missing", connection_id="test-source"
+    )
 
     assert result["ok"] is False
     assert result["error"]["code"] == "not_found"
@@ -110,13 +129,15 @@ def test_get_dataset_reports_ambiguous_identifier(
     monkeypatch.setattr(
         information_tools,
         "fetch_databases",
-        lambda: [
+        lambda **_kwargs: [
             {"id": "same", "name": "first"},
             {"id": "db-2", "name": "same"},
         ],
     )
 
-    result = information_tools.get_dataset(dataset_name="same")
+    result = information_tools.get_dataset(
+        dataset_name="same", connection_id="test-source"
+    )
 
     assert result["ok"] is False
     assert result["error"]["code"] == "ambiguous"
@@ -126,12 +147,12 @@ def test_get_dataset_caps_table_results(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(
         information_tools,
         "fetch_databases",
-        lambda: [{"id": "db-1", "name": "sales"}],
+        lambda **_kwargs: [{"id": "db-1", "name": "sales"}],
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_schemas_for_database",
-        lambda _database_id: {
+        lambda _database_id, **_kwargs: {
             "schemas_count": 1,
             "schemas": [{"id": "schema-1", "schema_name": "public"}],
         },
@@ -145,7 +166,9 @@ def test_get_dataset_caps_table_results(monkeypatch: pytest.MonkeyPatch) -> None
         ],
     )
 
-    result = information_tools.get_dataset(dataset_name="sales")
+    result = information_tools.get_dataset(
+        dataset_name="sales", connection_id="test-source"
+    )
 
     assert result["truncated"] is True
     assert len(result["data"]["schemas"][0]["tables"]) == information_tools.MAX_TABLES
@@ -157,7 +180,7 @@ def test_get_table_returns_columns_semantics_and_connections(
     monkeypatch.setattr(
         information_tools,
         "fetch_table_by_id",
-        lambda _table_id: {"id": "table-1", "name": "orders"},
+        lambda _table_id, **_kwargs: {"id": "table-1", "name": "orders"},
     )
     monkeypatch.setattr(
         information_tools,
@@ -169,18 +192,20 @@ def test_get_table_returns_columns_semantics_and_connections(
     monkeypatch.setattr(
         information_tools,
         "fetch_join_neighbors",
-        lambda _table_id: [{"id": "table-2", "name": "customers"}],
+        lambda _table_id, **_kwargs: [{"id": "table-2", "name": "customers"}],
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_terms_and_attributes_for_table",
-        lambda _table_id: (
+        lambda _table_id, **_kwargs: (
             [{"id": "term-1", "name": "Order"}],
             [{"id": "attr-1", "name": "Revenue"}],
         ),
     )
 
-    result = information_tools.get_table(table_id="table-1")
+    result = information_tools.get_table(
+        table_id="table-1", connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["columns"][0]["column_name"] == "revenue"
@@ -194,7 +219,7 @@ def test_get_column_returns_calculation_metadata(
     monkeypatch.setattr(
         information_tools,
         "fetch_parent_table_id_for_column",
-        lambda _column_id: "table-1",
+        lambda _column_id, **_kwargs: "table-1",
     )
     monkeypatch.setattr(
         information_tools,
@@ -206,7 +231,7 @@ def test_get_column_returns_calculation_metadata(
     monkeypatch.setattr(
         information_tools,
         "fetch_column_exploration_details",
-        lambda _column_id: {
+        lambda _column_id, **_kwargs: {
             "column_attribute": {
                 "id": "attr-1",
                 "description": "Gross sales minus refunds",
@@ -217,15 +242,17 @@ def test_get_column_returns_calculation_metadata(
     monkeypatch.setattr(
         information_tools,
         "fetch_table_by_id",
-        lambda _table_id: {"id": "table-1", "name": "orders"},
+        lambda _table_id, **_kwargs: {"id": "table-1", "name": "orders"},
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_join_neighbors",
-        lambda _table_id: [{"id": "table-2", "name": "customers"}],
+        lambda _table_id, **_kwargs: [{"id": "table-2", "name": "customers"}],
     )
 
-    result = information_tools.get_column(column_id="column-1")
+    result = information_tools.get_column(
+        column_id="column-1", connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["semantic_details"]["column_attribute"]["id"] == "attr-1"
@@ -242,7 +269,7 @@ def test_get_column_pages_until_it_finds_column_id(
     monkeypatch.setattr(
         information_tools,
         "fetch_parent_table_id_for_column",
-        lambda _column_id: "table-1",
+        lambda _column_id, **_kwargs: "table-1",
     )
 
     def fetch_page(
@@ -250,6 +277,7 @@ def test_get_column_pages_until_it_finds_column_id(
         *,
         skip: int,
         limit: int,
+        connection_id: str,
     ) -> dict:
         page_starts.append(skip)
         if skip == 0:
@@ -260,20 +288,22 @@ def test_get_column_pages_until_it_finds_column_id(
     monkeypatch.setattr(
         information_tools,
         "fetch_column_exploration_details",
-        lambda _column_id: {},
+        lambda _column_id, **_kwargs: {},
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_table_by_id",
-        lambda _table_id: {"id": "table-1", "name": "wide_table"},
+        lambda _table_id, **_kwargs: {"id": "table-1", "name": "wide_table"},
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_join_neighbors",
-        lambda _table_id: [],
+        lambda _table_id, **_kwargs: [],
     )
 
-    result = information_tools.get_column(column_id=requested_id)
+    result = information_tools.get_column(
+        column_id=requested_id, connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["column"]["id"] == requested_id
@@ -287,12 +317,12 @@ def test_semantic_fk_tool_only_returns_semantic_fk_attributes(
     monkeypatch.setattr(
         information_tools,
         "fetch_table_by_id",
-        lambda _table_id: {"id": "table-1", "name": "orders"},
+        lambda _table_id, **_kwargs: {"id": "table-1", "name": "orders"},
     )
     monkeypatch.setattr(
         information_tools,
         "fetch_table_context",
-        lambda _table_id: {
+        lambda _table_id, **_kwargs: {
             "columns": [
                 {"id": "column-1", "name": "customer_id"},
                 {"id": "column-2", "name": "amount"},
@@ -301,7 +331,7 @@ def test_semantic_fk_tool_only_returns_semantic_fk_attributes(
         },
     )
 
-    def details(column_id: str) -> dict:
+    def details(column_id: str, **kwargs: object) -> dict:
         if column_id == "column-1":
             return {
                 "column_attribute": {
@@ -320,7 +350,7 @@ def test_semantic_fk_tool_only_returns_semantic_fk_attributes(
     monkeypatch.setattr(
         information_tools,
         "fetch_column_attribute_exploration_details",
-        lambda _attribute_id: {
+        lambda _attribute_id, **_kwargs: {
             "columns": [
                 {
                     "id": "customer-pk",
@@ -331,7 +361,9 @@ def test_semantic_fk_tool_only_returns_semantic_fk_attributes(
         },
     )
 
-    result = information_tools.get_table_semantic_fks(table_id="table-1")
+    result = information_tools.get_table_semantic_fks(
+        table_id="table-1", connection_id="test-source"
+    )
 
     semantic_fks = result["data"]["semantic_foreign_keys"]
     assert len(semantic_fks) == 1
@@ -340,7 +372,9 @@ def test_semantic_fk_tool_only_returns_semantic_fk_attributes(
 
 
 def test_dispatch_rejects_unknown_tool() -> None:
-    result = information_tools.run_information_tool("delete_table", {})
+    result = information_tools.run_information_tool(
+        "delete_table", {}, connection_id="test-source"
+    )
 
     assert result["ok"] is False
     assert result["error"]["code"] == "unknown_tool"
@@ -356,7 +390,9 @@ def test_list_terms_returns_bounded_glossary(
     )
     monkeypatch.setattr(information_tools, "count_terms", lambda **_kwargs: 1)
 
-    result = information_tools.list_terms(search="rev", limit=10)
+    result = information_tools.list_terms(
+        search="rev", limit=10, connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["terms"][0]["name"] == "Revenue"
@@ -369,7 +405,7 @@ def test_get_term_returns_both_attribute_kinds(
     monkeypatch.setattr(
         information_tools,
         "get_full_term_by_id",
-        lambda _term_id: {
+        lambda _term_id, **_kwargs: {
             "id": "term-1",
             "name": "Revenue",
             "tables": [{"id": "table-1", "name": "orders"}],
@@ -386,7 +422,7 @@ def test_get_term_returns_both_attribute_kinds(
         lambda *_args, **_kwargs: [{"id": "sql-attr-1", "name": "Net Revenue"}],
     )
 
-    result = information_tools.get_term(term_id="term-1")
+    result = information_tools.get_term(term_id="term-1", connection_id="test-source")
 
     assert result["data"]["term"]["name"] == "Revenue"
     assert result["data"]["column_attributes"][0]["id"] == "column-attr-1"
@@ -408,7 +444,7 @@ def test_get_column_attribute_returns_term_and_linked_columns(
     monkeypatch.setattr(
         information_tools,
         "get_full_term_by_id",
-        lambda _term_id: {"id": "term-1", "name": "Revenue"},
+        lambda _term_id, **_kwargs: {"id": "term-1", "name": "Revenue"},
     )
     monkeypatch.setattr(
         information_tools,
@@ -422,7 +458,9 @@ def test_get_column_attribute_returns_term_and_linked_columns(
         ],
     )
 
-    result = information_tools.get_column_attribute(column_attribute_id="column-attr-1")
+    result = information_tools.get_column_attribute(
+        column_attribute_id="column-attr-1", connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["column_attribute"]["description"].startswith("Gross")
@@ -436,7 +474,7 @@ def test_get_sql_attribute_returns_formula_and_statement(
     monkeypatch.setattr(
         information_tools,
         "get_full_sql_attribute_by_id",
-        lambda _attr_id: {
+        lambda _attr_id, **_kwargs: {
             "id": "sql-attr-1",
             "name": "Net Revenue",
             "expression": "gross_sales - refunds",
@@ -445,13 +483,15 @@ def test_get_sql_attribute_returns_formula_and_statement(
     monkeypatch.setattr(
         information_tools,
         "fetch_sql_attribute_exploration_details",
-        lambda _attr_id: {
+        lambda _attr_id, **_kwargs: {
             "term": {"id": "term-1", "name": "Revenue"},
             "sql": {"id": "sql-1", "sql": "SELECT gross_sales - refunds"},
         },
     )
 
-    result = information_tools.get_sql_attribute(sql_attribute_id="sql-attr-1")
+    result = information_tools.get_sql_attribute(
+        sql_attribute_id="sql-attr-1", connection_id="test-source"
+    )
 
     assert result["ok"] is True
     assert result["data"]["sql_attribute"]["expression"] == "gross_sales - refunds"
@@ -472,16 +512,26 @@ def test_semantic_search_is_bounded_and_receives_retriever(
     ) -> list[dict]:
         captured.update({"retriever": actual_retriever, "query": query, **kwargs})
         return [
-            {"id": f"term-{index}", "label": "Term", "text": f"Term {index}"}
+            {
+                "id": f"term-{index}",
+                "label": "Term",
+                "text": f"Term {index}",
+                "connection_id": "test-source",
+            }
             for index in range(12)
         ]
 
     monkeypatch.setattr(information_tools, "search_semantic_index", search)
+    monkeypatch.setattr(
+        "auto_ontology.retrieval.text_to_sql.source_hits.get_full_term_by_id",
+        lambda node_id, *, connection_id: {"id": node_id},
+    )
 
     result = information_tools.run_information_tool(
         "search_semantic_layer",
         {"query": "revenue", "labels": ["Term"], "limit": 5},
         semantic_retriever=retriever,
+        connection_id="test-source",
     )
 
     assert result["ok"] is True

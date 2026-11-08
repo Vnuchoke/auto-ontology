@@ -57,7 +57,7 @@ def _link(table, **values) -> None:
 class World:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        self.database = _add(s.catalog_database, name=prefix)
+        self.database = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.database, name="public")
         self.table = _add(s.catalog_table, schema_id=self.schema, name="orders")
         self.columns = {

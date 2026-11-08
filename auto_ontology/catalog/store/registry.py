@@ -23,8 +23,8 @@ work today.
 
 **How identity is decided**, which differs per entity. ``Table`` and ``Column``
 arrive with a pre-generated ``id``; ``Schema`` arrives with
-``(database_name, name)`` where ``database_name`` is not a column on the row at
-all; ``Database`` arrives with ``name``. Each needs its own predicate, and the
+``(connection_id, name)`` where ``connection_id`` identifies its root;
+``Database`` arrives with its registered ``id``. Each needs its own predicate, and the
 keys are parent-scoped — ``public`` exists once per database, not once.
 
 **Which relationships are association tables and which are foreign key
@@ -94,7 +94,7 @@ ENTITIES: dict[str, EntitySpec] = {
         label=Labels.DB,
         table=s.catalog_database,
         columns=_cols(s.catalog_database),
-        natural_key=("name",),
+        natural_key=("id",),
     ),
     Labels.SCHEMA: EntitySpec(
         label=Labels.SCHEMA,
@@ -124,7 +124,7 @@ ENTITIES: dict[str, EntitySpec] = {
         label=Labels.SQL,
         table=s.sql_query,
         columns=_cols(s.sql_query),
-        natural_key=("sql_full_query",),
+        natural_key=("connection_id", "sql_full_query"),
         conflict_expression=func.md5(s.sql_query.c.sql_full_query),
         key_expressions={"sql_full_query": func.md5},
     ),
@@ -132,7 +132,7 @@ ENTITIES: dict[str, EntitySpec] = {
         label=Labels.CUSTOM_ANALYSIS,
         table=s.custom_analysis,
         columns=_cols(s.custom_analysis),
-        natural_key=("name",),
+        natural_key=("connection_id", "name"),
     ),
     # The semantic write path routes through here too: creating a SqlAttribute
     # persists its statement with `add_query`, exactly as an ingest does, so
@@ -142,7 +142,7 @@ ENTITIES: dict[str, EntitySpec] = {
         label=LABEL_SQL_ATTRIBUTE,
         table=s.sql_attribute,
         columns=_cols(s.sql_attribute),
-        natural_key=("name",),
+        natural_key=("connection_id", "name"),
     ),
 }
 
@@ -232,7 +232,7 @@ class UnknownLink(KeyError):
     """A relationship shape the schema has nowhere to put."""
 
 
-def entity_spec(label: str | list[str]) -> EntitySpec:
+def entity_spec(label: str | list[str] | tuple[str, ...]) -> EntitySpec:
     """Resolve a label to its table.
 
     Accepts a list as well as a string: a node in a property graph can carry

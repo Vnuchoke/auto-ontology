@@ -60,7 +60,7 @@ def _link(table, **values) -> None:
 class World:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        self.database = _add(s.catalog_database, name=prefix)
+        self.database = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.database, name="public")
         self.tables: dict[str, str] = {}
         self.columns: dict[str, str] = {}
@@ -135,10 +135,19 @@ class World:
         tables: tuple[str, ...] = (),
         certified: bool = False,
     ) -> str:
-        aid = _add(s.sql_attribute, name=f"{self.prefix}-{key}", certified=certified)
+        aid = _add(
+            s.sql_attribute,
+            name=f"{self.prefix}-{key}",
+            certified=certified,
+            connection_id=self.database,
+        )
         self.attributes[key] = aid
         _link(s.sql_attribute__term, attribute_id=aid, term_id=self.terms[term])
-        qid = _add(s.sql_query, sql_full_query=f"SELECT 1 -- {self.prefix}-{key}")
+        qid = _add(
+            s.sql_query,
+            sql_full_query=f"SELECT 1 -- {self.prefix}-{key}",
+            connection_id=self.database,
+        )
         self.queries.append(qid)
         _link(s.sql_attribute__sql, attribute_id=aid, sql_query_id=qid)
         for table in tables:
@@ -765,7 +774,7 @@ def test_terms_by_ids_is_empty_for_an_empty_list() -> None:
 
 def test_table_schema_map_lower_cases_its_keys(world) -> None:
     world.table("Orders")
-    assert t.fetch_table_schema_map(world.prefix) == {"orders": "public"}
+    assert t.fetch_table_schema_map(world.database) == {"orders": "public"}
 
 
 def test_terms_with_sqls_excludes_generated_statements(world) -> None:
@@ -773,14 +782,20 @@ def test_terms_with_sqls_excludes_generated_statements(world) -> None:
     world.table("orders")
     world.term("Order", represents=("orders",))
 
-    ingestion = _add(s.sql_query, sql_full_query=f"SELECT ingested -- {world.prefix}")
+    ingestion = _add(
+        s.sql_query,
+        sql_full_query=f"SELECT ingested -- {world.prefix}",
+        connection_id=world.database,
+    )
     world.queries.append(ingestion)
     _link(s.sql_query__table, sql_query_id=ingestion, table_id=world.tables["orders"])
     # An attribute-owned statement over the same table must not come back.
     world.sql_attribute("revenue", "Order", tables=("orders",))
 
     rows = [
-        r for r in t.fetch_terms_with_sqls() if r["term_id"] == world.terms["Order"]
+        r
+        for r in t.fetch_terms_with_sqls(connection_id=world.database)
+        if r["term_id"] == world.terms["Order"]
     ]
     assert len(rows) == 1
     assert [sql["sql_text"] for sql in rows[0]["sqls"]] == [
@@ -792,7 +807,9 @@ def test_a_term_with_no_ingestion_sql_is_omitted(world) -> None:
     world.table("orders")
     world.term("Order", represents=("orders",))
     assert [
-        r for r in t.fetch_terms_with_sqls() if r["term_id"] == world.terms["Order"]
+        r
+        for r in t.fetch_terms_with_sqls(connection_id=world.database)
+        if r["term_id"] == world.terms["Order"]
     ] == []
 
 
@@ -812,14 +829,18 @@ def test_term_and_attributes_for_embedding(world) -> None:
     term = world.term("Order", represents=("orders",))
     world.column_attribute("order-id", "Order", table="orders", column="id")
 
-    row, attrs = t.fetch_term_and_column_attributes_for_embedding(term)
+    row, attrs = t.fetch_term_and_column_attributes_for_embedding(
+        term, connection_id=world.database
+    )
     assert row["name"] == f"{world.prefix}-Order"
     assert row["database_name"] == world.prefix
     assert [a["name"] for a in attrs] == [f"{world.prefix}-order-id"]
 
 
 def test_embedding_context_for_a_missing_term_is_none() -> None:
-    assert t.fetch_term_and_column_attributes_for_embedding("no-such-term") == (
+    assert t.fetch_term_and_column_attributes_for_embedding(
+        "no-such-term", connection_id="no-such-source"
+    ) == (
         None,
         [],
     )

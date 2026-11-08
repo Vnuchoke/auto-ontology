@@ -25,7 +25,10 @@ from auto_ontology.retrieval.entity_coverage.state import (
     EntityCoveragePayload,
 )
 from auto_ontology.server.chat.settings_dal import fetch_acronyms, fetch_custom_prompts
-from auto_ontology.connectors.registry import get_connectors
+from auto_ontology.connectors.registry import get_connectors_for_subject_token
+from auto_ontology.connectors.sources import SourceDescriptor, SourceSelectionError
+from auto_ontology.connectors.databricks_oauth import DatabricksOAuthError
+from auto_ontology.retrieval.source_context import resolve_query_source
 from auto_ontology.utils.retriever import (
     get_data_objects_retriever,
     get_semantic_objects_retriever,
@@ -44,12 +47,22 @@ class PredictionFlowError(RuntimeError):
 
 def _build_coverage_payload(
     question: str,
+    source: SourceDescriptor,
     max_distance: float = DEFAULT_MAX_DISTANCE,
+    *,
+    subject_token: str | None = None,
 ) -> EntityCoveragePayload:
     """Assemble the payload for the entity-coverage pipeline."""
-    connectors = get_connectors()
+    try:
+        connectors = get_connectors_for_subject_token(
+            subject_token, connection_id=source.connection_id
+        )
+    except (SourceSelectionError, DatabricksOAuthError):
+        raise
+    except Exception:
+        raise SourceSelectionError(503, "source_unavailable") from None
     if not connectors:
-        raise PredictionFlowError("No database connection is configured.")
+        raise SourceSelectionError(503, "source_unavailable")
     custom_prompts = fetch_custom_prompts()
     return {
         "question": question,
@@ -59,23 +72,41 @@ def _build_coverage_payload(
         "acronyms": fetch_acronyms(),
         "custom_prompts": custom_prompts,
         "max_distance": max_distance,
+        "connection_id": source.connection_id,
     }
 
 
 def entity_coverage(
     question: str,
     max_distance: float = DEFAULT_MAX_DISTANCE,
+    *,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
+    subject_token: str | None = None,
 ) -> dict:
     """Return ranked semantic candidates and a 0–1 entity coverage grade.
 
     Raises :class:`PredictionFlowError` when the flow cannot produce a result.
     """
+    source = resolve_query_source(
+        connection_id=connection_id,
+        connection_label=connection_label,
+        target_db=target_db,
+    )
     if coverage_llm_client is None:
         raise PredictionFlowError("LLM client is not configured.")
     with _run_lock:
         try:
             return get_coverage_response(
-                _build_coverage_payload(question, max_distance=max_distance)
+                _build_coverage_payload(
+                    question,
+                    source,
+                    max_distance=max_distance,
+                    subject_token=subject_token,
+                )
             )
+        except (SourceSelectionError, DatabricksOAuthError):
+            raise
         except (ValueError, RuntimeError) as exc:
             raise PredictionFlowError(str(exc)) from exc

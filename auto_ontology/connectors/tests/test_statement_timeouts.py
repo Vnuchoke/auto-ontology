@@ -679,7 +679,7 @@ def test_sampling_breaker_counts_a_statement_timeout() -> None:
     from auto_ontology.semantic.visit_enter import _SamplingCircuitBreaker
 
     breaker = _SamplingCircuitBreaker()
-    connector = SimpleNamespace(database_name="warehouse")
+    connector = SimpleNamespace(database_name="warehouse", connection_id="warehouse-id")
 
     assert breaker.record_failure(connector, StatementTimeout(120)) is True
 

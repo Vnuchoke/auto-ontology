@@ -78,20 +78,24 @@ def _uncovered_entities(
 def _enrich_column_attributes(
     hits: list[dict[str, Any]],
     *,
-    database_name: str | None,
+    connection_id: str,
 ) -> list[dict[str, Any]]:
     attr_ids = [str(h["id"]) for h in hits if h.get("id")]
     contexts = fetch_attr_column_contexts(
         attr_ids,
-        database_name=database_name,
+        connection_id=connection_id,
     )
     enriched: list[dict[str, Any]] = []
     for hit in hits:
         aid = str(hit.get("id") or "")
-        ctx = contexts.get(aid) or {}
+        ctx = contexts.get(aid)
+        if not ctx:
+            continue
         enriched.append(
             {
+                **hit,
                 "id": aid,
+                "connection_id": connection_id,
                 "label": hit.get("label") or LABEL_COLUMN_ATTRIBUTE,
                 "score": hit.get("score"),
                 "name": ctx.get("attr_name") or hit.get("name") or "",
@@ -103,13 +107,20 @@ def _enrich_column_attributes(
 
 def _enrich_sql_attributes(
     hits: list[dict[str, Any]],
+    *,
+    connection_id: str,
 ) -> list[dict[str, Any]]:
     attr_ids = [str(h["id"]) for h in hits if h.get("id")]
-    details = {d["id"]: d for d in fetch_sql_attributes_with_sql(attr_ids)}
+    details = {
+        d["id"]: d
+        for d in fetch_sql_attributes_with_sql(attr_ids, connection_id=connection_id)
+    }
     enriched: list[dict[str, Any]] = []
     for hit in hits:
         aid = str(hit.get("id") or "")
-        detail = details.get(aid) or {}
+        detail = details.get(aid)
+        if not detail:
+            continue
         enriched.append(
             {
                 "id": aid,
@@ -124,13 +135,22 @@ def _enrich_sql_attributes(
 
 def _enrich_custom_analyses(
     hits: list[dict[str, Any]],
+    *,
+    connection_id: str,
 ) -> list[dict[str, Any]]:
     analysis_ids = [str(h["id"]) for h in hits if h.get("id")]
-    details = {d["id"]: d for d in fetch_custom_analyses_with_sql(analysis_ids)}
+    details = {
+        d["id"]: d
+        for d in fetch_custom_analyses_with_sql(
+            analysis_ids, connection_id=connection_id
+        )
+    }
     enriched: list[dict[str, Any]] = []
     for hit in hits:
         aid = str(hit.get("id") or "")
-        detail = details.get(aid) or {}
+        detail = details.get(aid)
+        if not detail:
+            continue
         enriched.append(
             {
                 "id": aid,
@@ -171,6 +191,9 @@ class CoverageGradeAgent(BaseAgent):
 
     def execute(self, state: AgentState) -> Dict[str, Any]:
         path_state = state.get("path_state", {})
+        connection_id = path_state.get("connection_id")
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise ValueError("source_required: a single connection_id is required")
         entities: list[str] = list(path_state.get("entities") or [])
         max_distance = float(path_state.get("max_distance", DEFAULT_MAX_DISTANCE))
 
@@ -187,15 +210,13 @@ class CoverageGradeAgent(BaseAgent):
             max_distance,
         )
 
+        col_hits = _enrich_column_attributes(col_hits, connection_id=connection_id)
         coverage = _compute_coverage(entities, col_hits)
 
         ranked = _rank_candidates(
-            _enrich_column_attributes(
-                col_hits,
-                database_name=path_state.get("target_db"),
-            )
-            + _enrich_sql_attributes(sql_hits)
-            + _enrich_custom_analyses(custom_hits)
+            col_hits
+            + _enrich_sql_attributes(sql_hits, connection_id=connection_id)
+            + _enrich_custom_analyses(custom_hits, connection_id=connection_id)
         )
         candidates = [_to_response_candidate(hit) for hit in ranked]
 

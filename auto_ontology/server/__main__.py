@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 from auto_ontology.version import get_app_version  # noqa: E402
 from auto_ontology.dal import close_store  # noqa: E402
 from auto_ontology.dal.schema_version import require_current_schema  # noqa: E402
+from auto_ontology.connectors.sources import bootstrap_sources  # noqa: E402
 from auto_ontology.server.chat.router import router as chat_router  # noqa: E402
 from auto_ontology.server.chat.worker import get_pool, shutdown_pool  # noqa: E402
 from auto_ontology.server.connections.router import router as connections_router  # noqa: E402
@@ -58,6 +59,7 @@ async def lifespan(_app: FastAPI):
     # lifespan runs only when the app is actually served, which covers both
     # documented commands: `python -m auto_ontology.server` and `uvicorn ... --factory`.
     require_current_schema()
+    bootstrap_sources()
 
     # Kick off the chat worker pool's initial warm spawn at boot. The pool
     # itself is lazy on first use, but eagerly initialising here means the

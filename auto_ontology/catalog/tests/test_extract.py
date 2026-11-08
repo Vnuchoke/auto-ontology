@@ -15,6 +15,7 @@ from auto_ontology.catalog.extract import (
     IncompleteCatalogExtractionError,
     _relation_keys,
     create_dataframe,
+    data_for_populate_tabular,
 )
 
 
@@ -34,6 +35,22 @@ def test_empty_catalog_is_valid() -> None:
 
     assert tables.empty
     assert columns.empty
+
+
+def test_extraction_carries_registered_id_without_renaming_physical_database() -> None:
+    connector = _connector([], [])
+    connector.connection_id = "11111111-1111-4111-8111-111111111111"
+    connector.database_name = "sales"
+    data = data_for_populate_tabular(connector)
+    assert data["connection_id"] == connector.connection_id
+    assert data["database_name"] == "sales"
+
+
+def test_extraction_requires_explicit_source_context() -> None:
+    connector = _connector([], [])
+    connector.connection_id = None
+    with pytest.raises(ValueError, match="connection_id"):
+        data_for_populate_tabular(connector)
 
 
 def test_nullable_relation_identifiers_are_normalized_without_boolean_coercion() -> (

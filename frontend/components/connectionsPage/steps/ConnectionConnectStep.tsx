@@ -21,11 +21,13 @@ export type ConnectionConnectStepProps = {
 	connectionType: ConnectionType;
 	values: Partial<Record<ConnectionFieldKey, string>>;
 	onFieldChange: (key: ConnectionFieldKey, value: string) => void;
-	/** Shown but not editable — the connection's identity on the backend. */
+	/** Immutable physical driver settings, shown but not editable. */
 	readOnlyKeys?: ReadonlySet<ConnectionFieldKey>;
 	/** Blank keeps the stored value, so these are never required. */
 	keepCurrentKeys?: ReadonlySet<ConnectionFieldKey>;
 	loading?: boolean;
+	disabled?: boolean;
+	onFileReadPendingChange?: (pending: boolean) => void;
 	testSuccessMessage?: string | null;
 	onTestConnection?: () => void;
 	testDisabled?: boolean;
@@ -39,6 +41,8 @@ export const ConnectionConnectStep = ({
 	readOnlyKeys = EMPTY_KEYS,
 	keepCurrentKeys = EMPTY_KEYS,
 	loading = false,
+	disabled = false,
+	onFileReadPendingChange,
 	testSuccessMessage = null,
 	onTestConnection,
 	testDisabled = false,
@@ -60,7 +64,7 @@ export const ConnectionConnectStep = ({
 			<p className="text-sm text-body dark:text-zinc-400">
 				Connect to {connectionDisplayName[connectionType]}
 			</p>
-			<div className="flex w-full flex-col gap-3">
+			<fieldset disabled={disabled} className="flex w-full flex-col gap-3">
 				{fields.map((field) => {
 					const onChange = ({
 						target,
@@ -105,12 +109,17 @@ export const ConnectionConnectStep = ({
 								onFieldChange(field.key, '');
 								return;
 							}
-							const bytes = new Uint8Array(await picked.arrayBuffer());
-							let binary = '';
-							bytes.forEach((byte) => {
-								binary += String.fromCharCode(byte);
-							});
-							onFieldChange(field.key, window.btoa(binary));
+							onFileReadPendingChange?.(true);
+							try {
+								const bytes = new Uint8Array(await picked.arrayBuffer());
+								let binary = '';
+								bytes.forEach((byte) => {
+									binary += String.fromCharCode(byte);
+								});
+								onFieldChange(field.key, window.btoa(binary));
+							} finally {
+								onFileReadPendingChange?.(false);
+							}
 						};
 						const encoded = values[field.key] ?? '';
 						return (
@@ -194,7 +203,7 @@ export const ConnectionConnectStep = ({
 						</label>
 					);
 				})}
-			</div>
+			</fieldset>
 			<div className="mt-auto flex flex-col items-start">
 				{onTestConnection != null && (
 					<Button

@@ -228,7 +228,23 @@ def test_set_sso_federation_updates_only_the_flag(monkeypatch: MonkeyPatch) -> N
     }
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(service, "list_connections", lambda: [stored])
+    monkeypatch.delenv("CONNECTION_STRINGS", raising=False)
+    monkeypatch.setattr(
+        service,
+        "list_source_metadata",
+        lambda: [
+            {
+                "id": "source-id",
+                "name": "main",
+                "display_label": "Main",
+                "configuration_origin": "managed",
+            }
+        ],
+    )
+    monkeypatch.setattr(service, "load_source_connection", lambda source_id: stored)
+    monkeypatch.setattr(
+        service, "get_connection_storage", lambda source_id: {"credential_ref": None}
+    )
     monkeypatch.setattr(service, "is_vault_configured", lambda: False)
     monkeypatch.setattr(
         service, "insert_connection", lambda **kwargs: captured.update(kwargs)
@@ -238,7 +254,14 @@ def test_set_sso_federation_updates_only_the_flag(monkeypatch: MonkeyPatch) -> N
 
     result = service.set_sso_federation(database_name="main", enabled=True)
 
-    assert result == {"database_name": "main", "sso_federation": True}
+    assert result == {
+        "connection_id": "source-id",
+        "display_label": "Main",
+        "database_name": "main",
+        "connection": {**stored, "sso_federation": True},
+        "sso_federation": True,
+    }
+    assert captured["connection_id"] == "source-id"
     written = json.loads(captured["connection"])
     assert written["sso_federation"] is True
     # Everything else survives untouched.
@@ -249,7 +272,8 @@ def test_set_sso_federation_updates_only_the_flag(monkeypatch: MonkeyPatch) -> N
 def test_set_sso_federation_unknown_database_raises(monkeypatch: MonkeyPatch) -> None:
     from auto_ontology.server.connections import service
 
-    monkeypatch.setattr(service, "list_connections", lambda: [])
+    monkeypatch.delenv("CONNECTION_STRINGS", raising=False)
+    monkeypatch.setattr(service, "list_source_metadata", lambda: [])
 
     with pytest.raises(ValueError, match="No connection found"):
         service.set_sso_federation(database_name="nope", enabled=True)

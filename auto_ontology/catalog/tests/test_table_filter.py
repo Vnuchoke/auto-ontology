@@ -134,6 +134,7 @@ def test_get_connectors_passes_the_filter_to_every_connector(monkeypatch) -> Non
     displayed correctly, and ingestion quietly took every table anyway.
     """
     from auto_ontology.connectors import registry
+    from auto_ontology.connectors.sources import SourceDescriptor
 
     captured: dict = {}
 
@@ -145,15 +146,24 @@ def test_get_connectors_passes_the_filter_to_every_connector(monkeypatch) -> Non
     monkeypatch.setattr(registry, "create_connector", fake_create_connector)
     monkeypatch.setattr(registry, "build_connection_string", lambda conn: "sqlite:///x")
     monkeypatch.setattr(
-        "auto_ontology.dal.connections.list_connections",
-        lambda: [{"database": "db", "type": "sqlite", "table_deny_regex": "^tmp_"}],
+        "auto_ontology.connectors.sources.list_active_sources",
+        lambda: [SourceDescriptor("source", "db", "db", "sqlite", "managed")],
     )
-    monkeypatch.setattr(registry, "_connectors", None)
+    monkeypatch.setattr(
+        "auto_ontology.dal.connections.load_source_connection",
+        lambda source_id: {
+            "database": "db",
+            "type": "sqlite",
+            "table_deny_regex": "^tmp_",
+        },
+    )
+    monkeypatch.setattr(registry, "_connectors", {})
+    monkeypatch.setattr(registry, "_connection_specs", {})
 
     try:
         registry.get_connectors()
     finally:
-        monkeypatch.setattr(registry, "_connectors", None)
+        registry.invalidate_connectors_cache()
 
     assert captured["table_filter"] is not None
     assert captured["table_filter"].active is True

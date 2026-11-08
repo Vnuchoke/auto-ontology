@@ -20,32 +20,41 @@ the schema expects, and `True` is a plausible one.
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 
 pytest.importorskip("sqlalchemy")
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import String, or_, select  # noqa: E402
 
 from auto_ontology.dal import model_interchange as mi  # noqa: E402
 from auto_ontology.dal import schema as s  # noqa: E402
 from auto_ontology.dal.session import store  # noqa: E402
+from auto_ontology.dal.tests.test_connection_identity_schema import (  # noqa: E402
+    ROOT,
+    identity_database,  # noqa: F401
+)
 from auto_ontology.semantic.constants import SEMANTIC_SOURCE  # noqa: E402
 
 
-@pytest.fixture(scope="module", autouse=True)
-def require_schema():
-    if not os.environ.get("POSTGRES_USER"):
-        pytest.skip("POSTGRES_* not set")
+@pytest.fixture(autouse=True)
+def require_schema(identity_database):  # noqa: F811
+    from alembic import command
+    from alembic.config import Config
+    from auto_ontology.dal.session import dispose_engine
+
+    dispose_engine()
+    command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
     try:
-        store().query_read("SELECT 1 FROM catalog_database LIMIT 1")
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"auto_ontology schema unavailable (alembic upgrade head): {exc}")
+        yield
+    finally:
+        dispose_engine()
 
 
 def _add(table, **values) -> str:
+    if table is s.catalog_database:
+        values.setdefault("display_label", values["name"])
     return store().query_write(table.insert().values(**values).returning(table.c.id))[
         0
     ]["id"]
@@ -169,6 +178,7 @@ def _reid(document, seed: str):
 
     for database in document.data_layer.databases:
         database.id = new(database.id)
+        database.display_label = seed
         for schema in database.schemas:
             schema.id = new(schema.id)
             for table in schema.tables:
@@ -204,7 +214,7 @@ def _document(world: World):
     rows = mi.fetch_export_rows([world.database])
     return mi.assemble_export_document(
         rows,
-        dialect_by_db_name={world.prefix: "postgres"},
+        dialect_by_db_name={world.database: "postgres"},
         sql_column_resolver=lambda sql, database_name: [],
     )
 
@@ -561,13 +571,7 @@ def test_a_cross_database_term_stays_importable(world) -> None:
 
     A Term can be represented by tables in more than one database. `_scoped_ids`
     drops the out-of-scope ones at export, so the document only references
-    tables it carries; the importer is *also* tolerant of ids it cannot resolve
-    (`_remap_optional`), so a document produced elsewhere still imports.
-
-    Belt and braces, and deliberately so: the export half keeps documents
-    self-contained, the import half stops one bad reference aborting a whole
-    import. Either alone leaves a gap — before both, such an export raised
-    ModelImportValidationError and could not be imported anywhere.
+    tables it carries. Explicit out-of-document references are rejected on import.
     """
     other_prefix = f"{world.prefix}-other"
     other_db = _add(s.catalog_database, name=other_prefix)
@@ -658,3 +662,476 @@ def test_an_import_cannot_duplicate_a_term_name(world) -> None:
             mi.apply_import_model(document, replace=False)
     finally:
         _cleanup(f"{world.prefix}-copy")
+
+
+def test_import_rejects_catalog_id_from_another_source_atomically(world):
+    other = World(f"{world.prefix}-other")
+    document = _document(world)
+    document.data_layer.databases[0].schemas[0].id = other.schema
+    before = mi.fetch_export_rows([other.database])
+    with pytest.raises(
+        mi.ModelImportValidationError, match="(?i)(scope|parent|source)"
+    ):
+        mi.apply_import_model(document, replace=True)
+    assert mi.fetch_export_rows([other.database]) == before
+
+
+def test_export_excludes_unresolved_and_foreign_sql_owners(world):
+    other = World(f"{world.prefix}-other")
+    for owner in (None, other.database):
+        query = _add(
+            s.sql_query, connection_id=owner, sql_full_query="SELECT id FROM orders"
+        )
+        analysis = _add(
+            s.custom_analysis, connection_id=owner, name=f"{world.prefix}-{owner}"
+        )
+        _link(s.sql_query__table, sql_query_id=query, table_id=world.orders)
+        _link(s.custom_analysis__sql, analysis_id=analysis, sql_query_id=query)
+    assert mi.fetch_export_rows([world.database])["custom_analyses"] == []
+
+
+def _sql_definitions(document, world):
+    from auto_ontology.server.model_interchange.schemas import (
+        ModelCustomAnalysis,
+        ModelSqlAttribute,
+    )
+
+    sql = "SELECT id FROM public.orders"
+    document.semantic_layer.sql_attributes.manual.append(
+        ModelSqlAttribute(
+            id=f"{world.database}-attribute",
+            connection_id=world.database,
+            name="order identifier",
+            sql=sql,
+            term_id=world.term,
+            sql_column_is=[world.order_id],
+        )
+    )
+    document.semantic_layer.custom_analyses.append(
+        ModelCustomAnalysis(
+            id=f"{world.database}-analysis",
+            connection_id=world.database,
+            name="order identifier",
+            sql=sql,
+            sql_column_is=[world.order_id],
+        )
+    )
+    return document
+
+
+def _source_snapshot(world):
+    ids = {
+        world.database,
+        world.schema,
+        world.orders,
+        world.customers,
+        world.order_id,
+        world.customer_ref,
+        world.customer_id,
+        world.term,
+        world.attribute,
+    }
+    for table in (s.sql_query, s.sql_attribute, s.custom_analysis):
+        ids.update(
+            row["id"]
+            for row in store().query_read(
+                select(table.c.id).where(table.c.connection_id == world.database)
+            )
+        )
+    snapshot = {}
+    for table in s.METADATA.tables.values():
+        keys = [
+            column
+            for column in table.c
+            if isinstance(column.type, String)
+            and (column.name == "id" or column.name.endswith("_id"))
+        ]
+        if keys:
+            snapshot[table.name] = sorted(
+                (
+                    dict(row)
+                    for row in store().query_read(
+                        select(table).where(or_(*(column.in_(ids) for column in keys)))
+                    )
+                ),
+                key=repr,
+            )
+    return snapshot
+
+
+def test_same_physical_name_sql_and_definition_names_stay_separate(world):
+    other = World(f"{world.prefix}-other")
+    store().query_write(
+        s.catalog_database.update()
+        .where(s.catalog_database.c.id.in_([world.database, other.database]))
+        .values(name="sales")
+    )
+    for source in (world, other):
+        mi.apply_import_model(
+            _sql_definitions(_document(source), source), replace=False
+        )
+    before = _source_snapshot(other)
+    for table in (s.sql_query, s.sql_attribute, s.custom_analysis):
+        rows = store().query_read(
+            select(table).where(
+                table.c.connection_id.in_([world.database, other.database])
+            )
+        )
+        assert len(rows) == 2
+        assert len({row["id"] for row in rows}) == 2
+    exported = _document(world)
+    assert (
+        exported.semantic_layer.sql_attributes.manual[0].connection_id == world.database
+    )
+    assert exported.semantic_layer.custom_analyses[0].connection_id == world.database
+    mi.apply_import_model(exported, replace=True)
+    assert _source_snapshot(other) == before
+
+
+def test_all_declared_sql_columns_are_checked_even_when_parser_would_ignore_them(world):
+    other = World(f"{world.prefix}-other")
+    document = _sql_definitions(_document(world), world)
+    document.semantic_layer.custom_analyses[0].sql_column_is.append(other.order_id)
+    before = mi.fetch_export_rows([world.database])
+    with pytest.raises(mi.ModelImportValidationError, match="foreign-source"):
+        mi.apply_import_model(document, replace=True)
+    assert mi.fetch_export_rows([world.database]) == before
+    assert store().query_read(select(s.sql_query)) == []
+
+
+def test_foreign_definition_id_cannot_be_adopted(world):
+    other = World(f"{world.prefix}-other")
+    foreign = _add(s.custom_analysis, connection_id=other.database, name="foreign")
+    document = _sql_definitions(_document(world), world)
+    document.semantic_layer.sql_attributes.manual = []
+    document.semantic_layer.custom_analyses[0].id = foreign
+    with pytest.raises(mi.ModelImportValidationError, match="scope"):
+        mi.apply_import_model(document, replace=False)
+    assert (
+        store().query_read(
+            select(s.custom_analysis).where(s.custom_analysis.c.id == foreign)
+        )[0]["connection_id"]
+        == other.database
+    )
+
+
+def test_export_rejects_sql_with_any_foreign_catalog_reference(world):
+    other = World(f"{world.prefix}-other")
+    query = _add(
+        s.sql_query,
+        connection_id=world.database,
+        sql_full_query="SELECT id FROM orders",
+    )
+    analysis = _add(s.custom_analysis, connection_id=world.database, name="mixed")
+    _link(s.custom_analysis__sql, analysis_id=analysis, sql_query_id=query)
+    for table_id in (world.orders, other.orders):
+        _link(s.sql_query__table, sql_query_id=query, table_id=table_id)
+    assert mi.fetch_export_rows([world.database])["custom_analyses"] == []
+
+
+def test_export_projects_shared_term_before_assembly(world):
+    other = World(f"{world.prefix}-other")
+    _link(s.table__term, table_id=other.orders, term_id=world.term)
+    store().query_write(
+        s.column_attribute__term.update()
+        .where(s.column_attribute__term.c.attribute_id == other.attribute)
+        .values(term_id=world.term)
+    )
+    terms = {
+        term["id"]: term for term in mi.fetch_export_rows([world.database])["terms"]
+    }
+    assert terms[world.term]["represents"] == [world.orders]
+    assert [attr["column_id"] for attr in terms[world.term]["columns_attributes"]] == [
+        world.order_id
+    ]
+
+
+def test_duplicate_catalog_id_under_different_document_sources_is_rejected(world):
+    document = _reid(_document(world), f"{world.prefix}-copy")
+    duplicate = document.data_layer.databases[0].model_copy(deep=True)
+    duplicate.id = str(uuid.uuid4())
+    duplicate.display_label += " second"
+    document.data_layer.databases.append(duplicate)
+    with pytest.raises(mi.ModelImportValidationError, match="scope"):
+        mi.apply_import_model(document, replace=False)
+
+
+def test_export_checks_all_queries_of_an_owner_not_only_matching_query(world):
+    other = World(f"{world.prefix}-other")
+    analysis = _add(
+        s.custom_analysis, connection_id=world.database, name="mixed definitions"
+    )
+    for source in (world, other):
+        query = _add(
+            s.sql_query,
+            connection_id=source.database,
+            sql_full_query="SELECT id FROM orders",
+        )
+        _link(s.custom_analysis__sql, analysis_id=analysis, sql_query_id=query)
+        _link(s.sql_query__table, sql_query_id=query, table_id=source.orders)
+    assert mi.fetch_export_rows([world.database])["custom_analyses"] == []
+
+
+def test_new_catalog_root_keeps_explicit_id_and_requires_label(world):
+    document = _reid(_document(world), f"{world.prefix}-copy")
+    target = document.data_layer.databases[0]
+    label = target.display_label
+    target.display_label = ""
+    with pytest.raises(mi.ModelImportValidationError, match="display_label"):
+        mi.apply_import_model(document, replace=False)
+    target.display_label = label
+    result = mi.apply_import_model(document, replace=False)
+    assert result["database_ids"] == [target.id]
+    row = store().query_read(
+        select(s.catalog_database).where(s.catalog_database.c.id == target.id)
+    )[0]
+    assert row["display_label"] == label
+    assert row["configuration_origin"] is None
+
+
+def test_import_never_uses_schema_name_or_id_as_physical_database_name(world):
+    document = _reid(_document(world), f"{world.prefix}-copy")
+    for schema in document.data_layer.databases[0].schemas:
+        schema.database_name = ""
+    with pytest.raises(mi.ModelImportValidationError, match="physical database_name"):
+        mi.apply_import_model(document, replace=False)
+
+
+def test_existing_target_uuid_and_curated_metadata_are_preserved(world):
+    document = _document(world)
+    document.data_layer.databases[0].display_label = "not an authorized rename"
+    for table in document.data_layer.databases[0].schemas[0].tables:
+        table.description = "not curated"
+    summary = mi.apply_import_model(document, replace=False)
+    assert summary["database_ids"] == [world.database]
+    assert store().query_read(
+        select(s.catalog_database.c.display_label).where(
+            s.catalog_database.c.id == world.database
+        )
+    ) == [{"display_label": world.prefix}]
+    assert store().query_read(
+        select(s.catalog_table.c.description).where(
+            s.catalog_table.c.id == world.orders
+        )
+    ) == [{"description": "an order"}]
+
+
+def test_multisource_legacy_sql_requires_explicit_document_owner(world):
+    other = World(f"{world.prefix}-other")
+    document = _sql_definitions(_document(world), world)
+    document.data_layer.databases.extend(_document(other).data_layer.databases)
+    document.semantic_layer.custom_analyses[0].connection_id = ""
+    with pytest.raises(
+        mi.ModelImportValidationError, match="explicit document connection_id"
+    ):
+        mi.apply_import_model(document, replace=False)
+
+
+@pytest.mark.parametrize("reference", ["term", "semantic_fk"])
+def test_explicit_out_of_document_catalog_links_are_rejected(world, reference):
+    other = World(f"{world.prefix}-other")
+    document = _document(world)
+    if reference == "term":
+        document.semantic_layer.terms[0].represents.append(other.orders)
+    else:
+        document.semantic_layer.semantic_fks[0].column_id = other.order_id
+    before = _source_snapshot(other)
+    with pytest.raises(mi.ModelImportValidationError, match="Cannot resolve"):
+        mi.apply_import_model(document, replace=False)
+    assert _source_snapshot(other) == before
+
+
+def test_replace_exported_import_preserves_live_ids_and_curation(world):
+    from auto_ontology.server.model_interchange.schemas import (
+        ModelCustomAnalysis,
+        ModelSqlAttribute,
+    )
+
+    document = _reid(_document(world), f"{world.prefix}-copy")
+    database = document.data_layer.databases[0]
+    term = document.semantic_layer.terms[0]
+    orders = next(
+        table for table in database.schemas[0].tables if table.name == "orders"
+    )
+    column = next(column for column in orders.columns if column.name == "id")
+    document.semantic_layer.sql_attributes.manual.append(
+        ModelSqlAttribute(
+            id="payload-sql-attribute",
+            connection_id=database.id,
+            name="imported identifier",
+            term_id=term.id,
+            sql="SELECT id FROM public.orders",
+            sql_column_is=[column.id],
+        )
+    )
+    document.semantic_layer.custom_analyses.append(
+        ModelCustomAnalysis(
+            id="payload-analysis",
+            connection_id=database.id,
+            name="imported analysis",
+            sql="SELECT id FROM public.orders",
+            sql_column_is=[column.id],
+        )
+    )
+    mi.apply_import_model(document, replace=False)
+    identities = {}
+    tag = _add(s.tag, name="Curated import")
+    for table, payload_id, tag_column, curated in (
+        (
+            s.term,
+            term.id,
+            "term_id",
+            {
+                "name_certified": True,
+                "description_certified": True,
+                "owner_id": "curator",
+            },
+        ),
+        (
+            s.column_attribute,
+            term.columns_attributes[0].id,
+            "column_attribute_id",
+            {"certified": True},
+        ),
+        (
+            s.sql_attribute,
+            "payload-sql-attribute",
+            "sql_attribute_id",
+            {"certified": True, "owner_id": "curator"},
+        ),
+        (s.custom_analysis, "payload-analysis", None, {}),
+    ):
+        row = store().query_read(
+            select(table).where(table.c.imported_id == payload_id)
+        )[0]
+        assert row["id"] != payload_id
+        identities[table.name] = row["id"]
+        if curated:
+            store().query_write(
+                table.update().where(table.c.id == row["id"]).values(**curated)
+            )
+        if tag_column:
+            _add(s.tag_target, tag_id=tag, **{tag_column: row["id"]})
+    before = {
+        name: store().query_read(
+            select(s.METADATA.tables[name]).where(
+                s.METADATA.tables[name].c.id == live_id
+            )
+        )
+        for name, live_id in identities.items()
+    }
+    tags_before = store().query_read(
+        select(s.tag_target).where(s.tag_target.c.tag_id == tag)
+    )
+    exported = mi.assemble_export_document(
+        mi.fetch_export_rows([database.id]),
+        dialect_by_db_name={},
+        sql_column_resolver=mi.make_cached_sql_column_resolver(),
+    )
+    result = mi.apply_import_model(exported, replace=True)
+    assert result["created"]["sql_attributes"] == 0
+    for name, live_id in identities.items():
+        table = s.METADATA.tables[name]
+        assert (
+            store().query_read(select(table).where(table.c.id == live_id))
+            == before[name]
+        )
+    assert (
+        store().query_read(select(s.tag_target).where(s.tag_target.c.tag_id == tag))
+        == tags_before
+    )
+
+
+def test_replace_a_retains_term_used_by_b_sql_attribute_and_all_b_reads(world):
+    from auto_ontology.dal.sql_attributes import (
+        list_sql_attributes,
+        get_full_sql_attribute_by_id,
+    )
+
+    other = World(f"{world.prefix}-other")
+    document_b = _sql_definitions(_document(other), other)
+    # A global term may be represented only by A but own a SQL projection in B.
+    definition = document_b.semantic_layer.sql_attributes.manual[0]
+    definition.term_id = world.term
+    document_b.semantic_layer.terms.append(
+        _document(world)
+        .semantic_layer.terms[0]
+        .model_copy(deep=True, update={"represents": [], "columns_attributes": []})
+    )
+    mi.apply_import_model(document_b, replace=False)
+    attribute_id = store().query_read(
+        select(s.sql_attribute.c.id).where(
+            s.sql_attribute.c.connection_id == other.database
+        )
+    )[0]["id"]
+    term_before = store().query_read(select(s.term).where(s.term.c.id == world.term))
+    b_before = _source_snapshot(other)
+    list_before = list_sql_attributes(connection_id=other.database)
+    full_before = get_full_sql_attribute_by_id(attribute_id)
+    assert [row["id"] for row in list_before] == [attribute_id]
+    assert full_before is not None
+    document_a = _document(world)
+    document_a.semantic_layer.terms = []
+    document_a.semantic_layer.semantic_fks = []
+    document_a.semantic_layer.sql_attributes.manual = []
+    mi.apply_import_model(document_a, replace=True)
+    assert (
+        store().query_read(select(s.term).where(s.term.c.id == world.term))
+        == term_before
+    )
+    assert _source_snapshot(other) == b_before
+    assert list_sql_attributes(connection_id=other.database) == list_before
+    assert get_full_sql_attribute_by_id(attribute_id) == full_before
+
+
+@pytest.mark.parametrize("relation", ["column_attribute", "tag"])
+def test_replace_retains_term_with_remaining_global_relations(world, relation):
+    if relation == "column_attribute":
+        other = World(f"{world.prefix}-other")
+        store().query_write(
+            s.column_attribute__term.update()
+            .where(s.column_attribute__term.c.attribute_id == other.attribute)
+            .values(term_id=world.term)
+        )
+        table = s.column_attribute__term
+    else:
+        tag = _add(s.tag, name="Global vocabulary curation")
+        _add(s.tag_target, tag_id=tag, term_id=world.term)
+        table = s.tag_target
+    before = store().query_read(select(table).where(table.c.term_id == world.term))
+    # The A-owned column attribute is intentionally removed; only external links survive.
+    if relation == "column_attribute":
+        before = [row for row in before if row["attribute_id"] == other.attribute]
+    document = _document(world)
+    document.semantic_layer.terms = []
+    document.semantic_layer.semantic_fks = []
+    mi.apply_import_model(document, replace=True)
+    assert store().query_read(select(s.term).where(s.term.c.id == world.term))
+    assert (
+        store().query_read(select(table).where(table.c.term_id == world.term)) == before
+    )
+
+
+@pytest.mark.parametrize("identity", ["live", "imported"])
+def test_replace_keeps_imported_term_without_other_retaining_relations(world, identity):
+    document = _reid(_document(world), f"{world.prefix}-copy")
+    term = document.semantic_layer.terms[0]
+    term.columns_attributes = []
+    document.semantic_layer.semantic_fks = []
+    mi.apply_import_model(document, replace=False)
+    row = store().query_read(select(s.term).where(s.term.c.imported_id == term.id))[0]
+    assert row["id"] != term.id
+    store().query_write(
+        s.term.update()
+        .where(s.term.c.id == row["id"])
+        .values(name_certified=True, owner_id="curator")
+    )
+    before = store().query_read(select(s.term).where(s.term.c.id == row["id"]))
+    if identity == "live":
+        document = mi.assemble_export_document(
+            mi.fetch_export_rows([document.data_layer.databases[0].id]),
+            dialect_by_db_name={},
+            sql_column_resolver=lambda *_args: [],
+        )
+    mi.apply_import_model(document, replace=True)
+    assert store().query_read(select(s.term).where(s.term.c.id == row["id"])) == before

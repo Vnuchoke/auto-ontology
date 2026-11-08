@@ -14,6 +14,18 @@ from auto_ontology.retrieval.text_to_sql.state import TextToSQLPayload
 
 @pytest.fixture
 def main_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    import sys
+    from auto_ontology.connectors.sources import SourceDescriptor
+
+    monkeypatch.setitem(
+        sys.modules,
+        "auto_ontology.retrieval.source_context",
+        SimpleNamespace(
+            resolve_query_source=lambda **kwargs: SourceDescriptor(
+                "test-source", "Test", "db_test", "sqlite", "env"
+            )
+        ),
+    )
     reasoning_llm = object()
     non_reasoning_llm = object()
     monkeypatch.setattr(
@@ -38,7 +50,11 @@ def test_build_state_treats_absent_or_empty_evidence_as_none(
     payload = {
         "question": "How many accounts?",
         "data_retriever": object(),
-        "connectors": [SimpleNamespace(dialect="sqlite", database_name="db_test")],
+        "connectors": [
+            SimpleNamespace(
+                dialect="sqlite", database_name="db_test", connection_id="test-source"
+            )
+        ],
     }
     if payload_evidence is not None:
         payload["evidence"] = payload_evidence
@@ -60,7 +76,11 @@ def test_build_state_uses_non_reasoning_by_default_and_preserves_reasoning_for_s
                 "question": "How many accounts?",
                 "data_retriever": object(),
                 "connectors": [
-                    SimpleNamespace(dialect="sqlite", database_name="db_test")
+                    SimpleNamespace(
+                        dialect="sqlite",
+                        database_name="db_test",
+                        connection_id="test-source",
+                    )
                 ],
             },
         )
@@ -82,7 +102,11 @@ def test_build_state_keeps_evidence_separate_from_every_question_value(
                 "evidence": "active refers to accounts.status_code",
                 "data_retriever": object(),
                 "connectors": [
-                    SimpleNamespace(dialect="sqlite", database_name="db_test")
+                    SimpleNamespace(
+                        dialect="sqlite",
+                        database_name="db_test",
+                        connection_id="test-source",
+                    )
                 ],
             },
         )
@@ -113,7 +137,11 @@ def test_build_state_propagates_shorten_answer(
     payload = {
         "question": "How many accounts?",
         "data_retriever": object(),
-        "connectors": [SimpleNamespace(dialect="sqlite", database_name="db_test")],
+        "connectors": [
+            SimpleNamespace(
+                dialect="sqlite", database_name="db_test", connection_id="test-source"
+            )
+        ],
     }
     if payload_value is not None:
         payload["shorten_answer"] = payload_value
@@ -135,7 +163,11 @@ def test_build_state_propagates_validate_sql_values(
     payload = {
         "question": "How many accounts?",
         "data_retriever": object(),
-        "connectors": [SimpleNamespace(dialect="sqlite", database_name="db_test")],
+        "connectors": [
+            SimpleNamespace(
+                dialect="sqlite", database_name="db_test", connection_id="test-source"
+            )
+        ],
     }
     if payload_value is not None:
         payload["validate_sql_values"] = payload_value
@@ -158,7 +190,11 @@ def test_build_state_propagates_skip_evidence_refinement(
     payload = {
         "question": "How many accounts?",
         "data_retriever": object(),
-        "connectors": [SimpleNamespace(dialect="sqlite", database_name="db_test")],
+        "connectors": [
+            SimpleNamespace(
+                dialect="sqlite", database_name="db_test", connection_id="test-source"
+            )
+        ],
     }
     if payload_value is not None:
         payload["skip_evidence_refinement"] = payload_value
@@ -180,7 +216,11 @@ def test_build_state_propagates_calculation_only(
     payload = {
         "question": "How many accounts?",
         "data_retriever": object(),
-        "connectors": [SimpleNamespace(dialect="sqlite", database_name="db_test")],
+        "connectors": [
+            SimpleNamespace(
+                dialect="sqlite", database_name="db_test", connection_id="test-source"
+            )
+        ],
     }
     if payload_value is not None:
         payload["calculation_only"] = payload_value
@@ -202,7 +242,11 @@ def test_calculation_only_disables_prediction_override(
                 "prediction": True,
                 "data_retriever": object(),
                 "connectors": [
-                    SimpleNamespace(dialect="sqlite", database_name="db_test")
+                    SimpleNamespace(
+                        dialect="sqlite",
+                        database_name="db_test",
+                        connection_id="test-source",
+                    )
                 ],
             },
         )

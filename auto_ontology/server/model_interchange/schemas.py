@@ -76,6 +76,7 @@ class ModelSchema(BaseModel):
 
 class ModelDatabase(BaseModel):
     id: str
+    display_label: str = ""
     dialect: str = ""
     schemas: list[ModelSchema] = Field(default_factory=list)
 
@@ -120,6 +121,7 @@ class ModelSemanticFk(BaseModel):
 
 class ModelSqlAttribute(BaseModel):
     id: str
+    connection_id: str = ""
     name: str = ""
     description: str = ""
     sql: str = ""
@@ -136,6 +138,7 @@ class ModelSqlAttributesBySource(BaseModel):
 
 class ModelCustomAnalysis(BaseModel):
     id: str
+    connection_id: str = ""
     name: str = ""
     description: str = ""
     sql: str = ""

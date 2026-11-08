@@ -243,7 +243,7 @@ class PiiPropagationResult:
     sql_attributes: int = 0
 
 
-def propagate_pii_to_attributes() -> PiiPropagationResult:
+def propagate_pii_to_attributes(*, connection_id: str) -> PiiPropagationResult:
     """Label the attributes built from PII columns with the shared ``PII`` tag.
 
     A ColumnAttribute is tagged when one of its columns is, and a SqlAttribute
@@ -256,15 +256,17 @@ def propagate_pii_to_attributes() -> PiiPropagationResult:
     yet and a later pass has to pick them up.
 
     Does not create the tag: if no column was ever tagged, there is nothing to
-    propagate.
+    propagate. Only the selected connection's attributes are changed.
     """
 
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("connection_id is required for PII propagation")
     pii_tag = get_tag_by_name(PII_TAG_NAME)
     if pii_tag is None:
         return PiiPropagationResult()
 
     column_attributes, sql_attributes = tag_attributes_of_tagged_columns(
-        str(pii_tag["id"])
+        str(pii_tag["id"]), connection_id=connection_id
     )
     result = PiiPropagationResult(
         column_attributes=column_attributes, sql_attributes=sql_attributes

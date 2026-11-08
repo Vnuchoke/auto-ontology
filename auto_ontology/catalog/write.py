@@ -7,6 +7,12 @@
 from datetime import datetime, timezone
 import logging
 import time
+from typing import Any
+
+import pandas as pd
+
+from auto_ontology.catalog.model.schema import Schema
+from auto_ontology.catalog.sql_parse import populate_queries
 
 from auto_ontology.catalog.store.db import (
     db_exists,
@@ -17,7 +23,6 @@ from auto_ontology.catalog.store.db import (
 from auto_ontology.catalog.store.indexes import add_indices
 from concurrent.futures import ThreadPoolExecutor
 from auto_ontology.catalog.parsers import schemas_parser
-from auto_ontology.catalog.sql_parse import populate_queries
 from auto_ontology.catalog.store.schemas import (
     get_schemas_ids_and_names,
     add_fks,
@@ -31,7 +36,13 @@ from auto_ontology.dal.session import write_transaction
 logger = logging.getLogger(__name__)
 
 
-def populate_tabular_data(data, num_workers, dialect):
+def populate_tabular_data(
+    data: dict[str, Any], num_workers: int, dialect: str
+) -> dict[str, Schema]:
+    """Ingest one registered connection_id; names only qualify/display SQL.
+
+    Query history is parsed and deduplicated only within this source.
+    """
     logger.info("Using Dialect: " + dialect)
 
     add_indices()
@@ -46,23 +57,40 @@ def populate_tabular_data(data, num_workers, dialect):
     database = data["database_name"]
     logger.info(f"Started parsing db {database}.")
 
-    all_schemas = populate_db(tables_df, columns_df, database, num_workers)
+    connection_id = data["connection_id"]
+    all_schemas = populate_db(
+        tables_df, columns_df, database, num_workers, connection_id=connection_id
+    )
 
     if "fks" in data:
-        populate_fks(fks=data["fks"], database_name=database)
+        populate_fks(fks=data["fks"], connection_id=connection_id)
 
     if "pks" in data:
-        populate_pks(pks=data["pks"], database_name=database)
+        populate_pks(pks=data["pks"], connection_id=connection_id)
 
-    if "queries" in data:
-        populate_queries(all_schemas, data["queries"], num_workers, [dialect])
+    if "queries" in data and data["queries"] is not None and not data["queries"].empty:
+        populate_queries(
+            all_schemas,
+            data["queries"],
+            num_workers,
+            [dialect],
+            connection_id=connection_id,
+        )
 
     return all_schemas
 
 
-def populate_db(tables_df, columns_df, database, num_workers):
+def populate_db(
+    tables_df: pd.DataFrame,
+    columns_df: pd.DataFrame,
+    database: str,
+    num_workers: int,
+    *,
+    connection_id: str,
+) -> dict[str, Schema]:
+    """Write one registered source, preserving its ID and connection metadata."""
     schemas, db_node = schemas_parser.parse_df(
-        tables_df, columns_df, database_name=database
+        tables_df, columns_df, database_name=database, connection_id=connection_id
     )
     existing_db_id, loaded = db_exists(db_node)
 
@@ -143,7 +171,7 @@ def populate_db(tables_df, columns_df, database, num_workers):
     return schemas
 
 
-def populate_fks(fks, database_name: str):
+def populate_fks(fks: pd.DataFrame | None, connection_id: str) -> None:
     logger.info("Adding FKs.")
     last_seen = datetime.now(timezone.utc)
     # One unit: between the insert and the sweep, the catalog holds both the
@@ -151,11 +179,11 @@ def populate_fks(fks, database_name: str):
     # the pk case below -- a re-ingest corrects it -- but the window is the
     # same and so is the fix.
     with write_transaction():
-        add_fks(fks, last_seen, database_name)
-        delete_old_fks(last_seen, database_name)
+        add_fks(fks, last_seen, connection_id)
+        delete_old_fks(last_seen, connection_id)
 
 
-def populate_pks(pks, database_name: str):
+def populate_pks(pks: pd.DataFrame | None, connection_id: str) -> None:
     logger.info("Adding PKs.")
     # `reset_pks` NULLs the pk of every table in the database before `add_pks`
     # writes the new ones. Autocommitted separately, a failure in between --
@@ -163,8 +191,8 @@ def populate_pks(pks, database_name: str):
     # and nothing to recover it but a full re-ingest. The prediction graph keys
     # its entities on pk, so those tables silently stop being usable.
     with write_transaction():
-        reset_pks(database_name)
-        add_pks(pks, database_name)
+        reset_pks(connection_id)
+        add_pks(pks, connection_id)
 
 
 def _update_schema(schema, latest_timestamp):

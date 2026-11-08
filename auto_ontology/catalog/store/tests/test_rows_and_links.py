@@ -64,7 +64,11 @@ def _db_name() -> str:
 
 def _node(label, props, match):
     return CatalogNode(
-        name=props.get("name", ""), label=label, props=props, match_props=match
+        name=props.get("name", ""),
+        label=label,
+        props=props,
+        match_props=match,
+        existing_id=props.get("id"),
     )
 
 
@@ -75,8 +79,8 @@ def _node(label, props, match):
 
 def test_insert_then_match_returns_the_same_row() -> None:
     name = _db_name()
-    first = upsert_row(Labels.DB, {"name": name}, {"name": name})
-    second = upsert_row(Labels.DB, {"name": name}, {"name": name})
+    first = _database(name)
+    second = _database(name)
     assert first == second
 
     rows = store().query_read(
@@ -97,15 +101,22 @@ def test_stored_id_survives_a_match_with_a_different_incoming_id() -> None:
     so for Table and Column the incoming id already *is* the stored one.
     """
     name = _db_name()
-    original = upsert_row(Labels.DB, {"name": name}, {"name": name})
+    db_id = _database(name)
+    schema_id = _schema(name, db_id, "shop")
+    original = upsert_row(
+        Labels.TABLE, {"name": "orders"}, {"name": "orders"}, parent_id=schema_id
+    )
 
     returned = upsert_row(
-        Labels.DB, {"name": name}, {"name": name, "id": str(uuid.uuid4())}
+        Labels.TABLE,
+        {"name": "orders"},
+        {"name": "orders", "id": str(uuid.uuid4())},
+        parent_id=schema_id,
     )
 
     assert returned == original
     rows = store().query_read(
-        s.catalog_database.select().where(s.catalog_database.c.name == name)
+        s.catalog_table.select().where(s.catalog_table.c.schema_id == schema_id)
     )
     assert len(rows) == 1
     assert rows[0]["id"] == original
@@ -119,10 +130,14 @@ def test_referencing_rows_survive_a_reingest() -> None:
 
     def write_sql_edge():
         sql_node = _node(
-            Labels.SQL, {"sql_full_query": statement}, {"sql_full_query": statement}
+            Labels.SQL,
+            {"sql_full_query": statement, "connection_id": f"root-{name}"},
+            {"sql_full_query": statement, "connection_id": f"root-{name}"},
         )
         table = _node(Labels.TABLE, {"id": table_id}, {"id": table_id})
-        pg_queries.add_query([(sql_node, table, {Props.SQL_ID: "sql-1"})])
+        pg_queries.add_query(
+            [(sql_node, table, {Props.SQL_ID: "sql-1"})], connection_id=f"root-{name}"
+        )
 
     write_sql_edge()
     write_sql_edge()
@@ -138,8 +153,14 @@ def test_unknown_properties_are_dropped_not_rejected() -> None:
     name = _db_name()
     node_id = upsert_row(
         Labels.DB,
-        {"name": name},
-        {"name": name, "not_a_column": "ignored", "another": 5},
+        {"id": f"root-{name}"},
+        {
+            "id": f"root-{name}",
+            "name": name,
+            "display_label": name,
+            "not_a_column": "ignored",
+            "another": 5,
+        },
     )
     assert node_id
 
@@ -151,7 +172,7 @@ def test_unknown_label_raises_rather_than_silently_dropping() -> None:
 
 
 def test_resolve_id_returns_none_for_absent_node() -> None:
-    assert resolve_id(Labels.DB, {"name": _db_name()}) is None
+    assert resolve_id(Labels.DB, {"id": str(uuid.uuid4())}) is None
 
 
 # --------------------------------------------------------------------------
@@ -165,13 +186,17 @@ def test_resolve_id_returns_none_for_absent_node() -> None:
 
 
 def _database(name: str) -> str:
-    return upsert_row(Labels.DB, {"name": name}, {"name": name})
+    return upsert_row(
+        Labels.DB,
+        {"id": f"root-{name}"},
+        {"id": f"root-{name}", "name": name, "display_label": name},
+    )
 
 
 def _schema(db_name: str, db_id: str, schema_name: str) -> str:
     return upsert_row(
         Labels.SCHEMA,
-        {"database_name": db_name, "name": schema_name},
+        {"connection_id": db_id, "name": schema_name},
         {"name": schema_name},
         parent_id=db_id,
     )
@@ -278,11 +303,15 @@ def test_sql_edge_becomes_a_row() -> None:
 
     statement = "SELECT customer_id FROM customer"
     sql_node = _node(
-        Labels.SQL, {"sql_full_query": statement}, {"sql_full_query": statement}
+        Labels.SQL,
+        {"sql_full_query": statement, "connection_id": f"root-{name}"},
+        {"sql_full_query": statement, "connection_id": f"root-{name}"},
     )
     table = _node(Labels.TABLE, {"id": table_id}, {"id": table_id})
 
-    pg_queries.add_query([(sql_node, table, {Props.SQL_ID: "sql-1"})])
+    pg_queries.add_query(
+        [(sql_node, table, {Props.SQL_ID: "sql-1"})], connection_id=f"root-{name}"
+    )
 
     rows = store().query_read(
         s.sql_query__table.select().where(s.sql_query__table.c.table_id == table_id)
@@ -295,12 +324,14 @@ def test_repeated_sql_link_does_not_duplicate() -> None:
     table_id, _ = _column(name, "customer", "customer_id")
     statement = "SELECT customer_id FROM customer"
     sql_node = _node(
-        Labels.SQL, {"sql_full_query": statement}, {"sql_full_query": statement}
+        Labels.SQL,
+        {"sql_full_query": statement, "connection_id": f"root-{name}"},
+        {"sql_full_query": statement, "connection_id": f"root-{name}"},
     )
     table = _node(Labels.TABLE, {"id": table_id}, {"id": table_id})
     link = (sql_node, table, {Props.SQL_ID: "sql-1"})
 
-    pg_queries.add_query([link, link])
+    pg_queries.add_query([link, link], connection_id=f"root-{name}")
 
     rows = store().query_read(
         s.sql_query__table.select().where(s.sql_query__table.c.table_id == table_id)
@@ -322,7 +353,7 @@ def test_delete_cascades_to_children() -> None:
     """No DETACH step: the schema's cascades do that work."""
     name = _db_name()
     table_id, column_id = _column(name, "customer", "customer_id")
-    db_id = resolve_id(Labels.DB, {"name": name})
+    db_id = resolve_id(Labels.DB, {"id": f"root-{name}"})
 
     store().query_write(
         s.catalog_database.delete().where(s.catalog_database.c.id == db_id)

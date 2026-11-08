@@ -12,6 +12,8 @@ from typing import Any, Union
 # import time (which requires NVIDIA_API_KEY to be set).
 from concurrent.futures import ThreadPoolExecutor
 
+from auto_ontology.retrieval.source_context import resolve_query_source
+
 from .clarify import (
     should_clarify,
     refresh_grounded_knowledge,
@@ -57,6 +59,12 @@ from auto_ontology.retrieval.text_to_sql.numeric_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _session_connector(session: InteractiveSessionState) -> Any:
+    return resolve_connector_from_tables(
+        [{"connection_id": session.require_connection_id()}], session.connectors
+    )
 
 
 # ── Seeds ───────────────────────────────────────────────────────────────────
@@ -284,6 +292,7 @@ def _format_user_clarifications(session: InteractiveSessionState) -> str:
 
 def _run_sql_generation(session: InteractiveSessionState) -> str:
     """Call Auto Ontology and persist the returned path_state back to session."""
+    session.bind_source()
     from auto_ontology.retrieval.text_to_sql.main import get_agent_response_with_state
     from auto_ontology.retrieval.text_to_sql.state import TextToSQLPayload
 
@@ -415,6 +424,7 @@ def _run_sql_generation(session: InteractiveSessionState) -> str:
         logger.info("[%s] SQL gen — Evidence: %s", session.task_id, evidence)
 
     payload: TextToSQLPayload = {
+        "connection_id": session.require_connection_id(),
         "question": question,
         "evidence": evidence,
         # Same merged/clarified question that expanded_question_note carries
@@ -445,6 +455,7 @@ def _run_sql_generation(session: InteractiveSessionState) -> str:
     # Merge returned path_state back into durable session path_state
     if returned_ps := result.get("path_state"):
         session.path_state.update(returned_ps)
+    session.bind_source()
 
     # Clear resume_from after use so next call goes through full pipeline
     session.path_state.pop("_resume_from", None)
@@ -490,9 +501,7 @@ def _align_mixed_numeric_types(session: InteractiveSessionState, sql: str) -> st
     if not kinds or not ({"decimal", "float"} <= set(kinds)):
         return sql
 
-    connector = resolve_connector_from_tables(
-        session.path_state.get("relevant_tables") or [], session.connectors
-    )
+    connector = _session_connector(session)
     if connector is None:
         return sql
     aligned = flip_numeric_output_types(
@@ -564,9 +573,7 @@ def _flip_numeric_types_for_retry(session: InteractiveSessionState, sql: str) ->
         )
         return _align_mixed_numeric_types(session, sql)
 
-    connector = resolve_connector_from_tables(
-        session.path_state.get("relevant_tables") or [], session.connectors
-    )
+    connector = _session_connector(session)
     if connector is None:
         return sql
     flipped = flip_numeric_output_types(
@@ -603,9 +610,7 @@ def _retry_double_without_a_recorded_type(
     still has the other side left: ``double precision``. The rewritten
     statement is kept only when it executes.
     """
-    connector = resolve_connector_from_tables(
-        session.path_state.get("relevant_tables") or [], session.connectors
-    )
+    connector = _session_connector(session)
     if connector is None:
         return sql
     flipped = flip_numeric_output_types(
@@ -662,7 +667,7 @@ def _get_fast_llm():
 def create_session(
     session_id: str,
     task_id: str,
-    db_name: str,
+    db_name: str | None,
     db_schema: str,
     external_kb: str,
     question: str,
@@ -673,11 +678,19 @@ def create_session(
     external_kb_children_map: dict | None = None,
     skip_evidence_refinement: bool = False,
     numeric_type_alignment: bool = False,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
 ) -> InteractiveSessionState:
+    source = resolve_query_source(
+        connection_id=connection_id,
+        connection_label=connection_label,
+        target_db=db_name,
+    )
     return InteractiveSessionState(
         session_id=session_id,
         task_id=task_id,
-        db_name=db_name,
+        db_name=source.database_name,
+        connection_id=source.connection_id,
         db_schema=db_schema,
         external_kb=external_kb,
         original_question=question,
@@ -688,8 +701,12 @@ def create_session(
         numeric_type_alignment=numeric_type_alignment,
         data_retriever=data_retriever,
         semantic_retriever=semantic_retriever,
-        connectors=connectors,
-        path_state={"target_db": db_name, "task_id": task_id},
+        connectors=[
+            connector
+            for connector in connectors
+            if getattr(connector, "connection_id", None) == source.connection_id
+        ],
+        path_state={"connection_id": source.connection_id, "task_id": task_id},
     )
 
 
@@ -712,6 +729,7 @@ def step(
         "SQL ran but the answer was wrong" turn (no execution error).
       - FOLLOW_UP: *follow_up_question*, the next-phase question text.
     """
+    session.bind_source()
     if turn_type is None:
         raise ValueError(
             "step() requires an explicit turn_type — the coordinator no "
@@ -886,9 +904,7 @@ def _real_column_names(session: InteractiveSessionState, sql: str) -> set[str]:
     cached = session.path_state.get("real_column_names")
     if cached is not None:
         return set(cached)
-    connector = resolve_connector_from_tables(
-        session.path_state.get("relevant_tables") or [], session.connectors
-    )
+    connector = _session_connector(session)
     if connector is None:
         return set()
     try:
@@ -915,10 +931,10 @@ def _real_column_names(session: InteractiveSessionState, sql: str) -> set[str]:
 
 
 def _postgres_dialect(session: InteractiveSessionState) -> str | None:
-    for connector in session.connectors or []:
-        dialect = getattr(connector, "dialect", None)
-        if dialect and str(dialect).lower() in ("postgres", "postgresql"):
-            return str(dialect)
+    connector = _session_connector(session)
+    dialect = getattr(connector, "dialect", None)
+    if dialect and str(dialect).lower() in ("postgres", "postgresql"):
+        return str(dialect)
     return None
 
 
@@ -943,9 +959,7 @@ def _submit_if_it_runs(
     """
     if not rewritten or rewritten == sql:
         return sql, None
-    connector = resolve_connector_from_tables(
-        session.path_state.get("relevant_tables") or [], session.connectors
-    )
+    connector = _session_connector(session)
     if connector is None:
         return sql, None
     try:

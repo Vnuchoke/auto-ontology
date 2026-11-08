@@ -11,6 +11,8 @@ import time
 import uuid
 
 import pandas as pd
+import sqlglot
+from sqlglot import exp
 from tqdm import tqdm
 
 from auto_ontology.catalog.normalize import chunks
@@ -52,11 +54,26 @@ def parse_query_slim(
 
     Returns True when at least one recognised table was found, False otherwise.
     """
+    if any(
+        str(schema.get_db_node().id) != query_obj.connection_id
+        for schema in schemas.values()
+    ):
+        raise ValueError("SQL schemas belong to another connection_id")
     extraction: ExtractionResult = extract_tables_and_columns(
         sql=sql_text,
         dialects=dialects,
         all_schemas=schemas,
     )
+    if extraction.tables:
+        statement = sqlglot.parse_one(sql_text, dialect=extraction.dialect_used or None)
+        database_names = {
+            schema.get_db_node().get_name().lower() for schema in schemas.values()
+        }
+        if any(
+            table.catalog and table.catalog.lower() not in database_names
+            for table in statement.find_all(exp.Table)
+        ):
+            raise ValueError("SQL database qualifier conflicts with selected source")
 
     query_obj.ast_node_count = extraction.ast_node_count
     query_obj.join_count = len(extraction.joins)
@@ -174,6 +191,8 @@ def parse_query_single(
     sql: str,
     schemas: dict,
     dialects: list[str],
+    *,
+    connection_id: str,
 ) -> Query | None:
     """Parse a single SQL string and return a populated :class:`Query`, or ``None`` if no
     recognised tables were found."""
@@ -185,6 +204,7 @@ def parse_query_single(
         sql_text=sql,
         ltimestamp=datetime.now(),
         count=1,
+        connection_id=connection_id,
     )
     is_parsed = parse_query_slim(
         sql_text=sql,
@@ -227,11 +247,12 @@ def _try_merge_with_graph(
 
     Returns ``True`` if a match was found and counters were updated.
     """
-    exact_id = get_sql_by_full_query(sql_text)
+    exact_id = get_sql_by_full_query(sql_text, connection_id=query_obj.connection_id)
     if exact_id:
         update_counters_and_timestamps_for_query_and_affected_data(
             identical_sql_id=exact_id,
             sql_node=query_obj.sql_node,
+            connection_id=query_obj.connection_id,
         )
         logger.info("Found existing SQL in graph by full text; updated counters.")
         return True
@@ -252,6 +273,7 @@ def _try_merge_with_graph(
             update_counters_and_timestamps_for_query_and_affected_data(
                 identical_sql_id=cand["sql_id"],
                 sql_node=query_obj.sql_node,
+                connection_id=query_obj.connection_id,
             )
             logger.info(
                 "Found structurally equivalent SQL %s in graph; updated counters.",
@@ -309,6 +331,8 @@ def _try_merge_in_memory(
 
     for qid in table_index.get(tbl_key, []):
         existing_q = parsed_queries[qid]
+        if existing_q.connection_id != query_obj.connection_id:
+            continue
         if existing_q.get_nodes_counter() != nodes_count:
             continue
         if existing_q.get_join_count() != join_count:
@@ -352,6 +376,8 @@ def parse_queries_df(
     queries_df: pd.DataFrame,
     schemas: dict,
     sqls_tbls_df: pd.DataFrame | None = None,
+    *,
+    connection_id: str,
 ) -> list[dict[str, str]]:
     """Parse rows from *queries_df* and accumulate unique queries in *parsed_queries*.
 
@@ -364,7 +390,7 @@ def parse_queries_df(
     for every chunk).
     """
     if sqls_tbls_df is None:
-        sqls_tbls_df = load_sqls_to_tables()
+        sqls_tbls_df = load_sqls_to_tables(connection_id=connection_id)
 
     table_index: dict[frozenset, list[str]] = defaultdict(list)
     norm_cache: dict[str, str | None] = {}
@@ -385,6 +411,7 @@ def parse_queries_df(
                 sql_text=sql_text,
                 ltimestamp=sql_timestamp,
                 count=sql_count,
+                connection_id=connection_id,
             )
             is_parsed = parse_query_slim(
                 sql_text=sql_text,
@@ -424,7 +451,7 @@ def parse_queries_df(
     return failed_queries
 
 
-def populate_queries(schemas, queries_df, num_workers, dialects):
+def populate_queries(schemas, queries_df, num_workers, dialects, *, connection_id: str):
     before = time.time()
     logger.info(f"Starting to parse {len(queries_df)} queries.")
 
@@ -433,7 +460,7 @@ def populate_queries(schemas, queries_df, num_workers, dialects):
         queries_chunks = list(chunks(queries_df.to_dict(orient="records"), 500))
         for i, chunk in enumerate(queries_chunks):
             logger.info(f"chunk {i + 1} out of {len(queries_chunks)} chunks")
-            sqls_tbls_df = load_sqls_to_tables()
+            sqls_tbls_df = load_sqls_to_tables(connection_id=connection_id)
             parsed_queries: dict[str, Query] = {}
             chunk_failed = parse_queries_df(
                 dialects=dialects,
@@ -441,6 +468,7 @@ def populate_queries(schemas, queries_df, num_workers, dialects):
                 queries_df=pd.DataFrame(chunk),
                 schemas=schemas,
                 sqls_tbls_df=sqls_tbls_df,
+                connection_id=connection_id,
             )
             failed_queries += chunk_failed
 
@@ -452,7 +480,9 @@ def populate_queries(schemas, queries_df, num_workers, dialects):
             ) as pbar:
                 with ThreadPoolExecutor(num_workers) as executor:
                     futures = (
-                        executor.submit(add_query, q.get_edges())
+                        executor.submit(
+                            add_query, q.get_edges(), connection_id=connection_id
+                        )
                         for q in parsed_queries.values()
                     )
                     for future in as_completed(futures):

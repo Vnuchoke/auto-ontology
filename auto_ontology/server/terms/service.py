@@ -21,6 +21,7 @@ from auto_ontology.utils import (
     stringify_sample_values,
 )
 from auto_ontology.utils.embedding import embed_docs_into_vdb
+from auto_ontology.vdb import get_semantic_vdb
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ def list_terms_page(
     search: str | None = None,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> dict[str, Any]:
     """Assemble one page of the Terms list with its per-card count breakdowns.
 
@@ -49,6 +51,7 @@ def list_terms_page(
     """
     data_ids_by_zone = resolve_accessible_catalog_ids(zone_ids)
     terms = terms_dal.fetch_all_terms(
+        connection_id=connection_id,
         zone_ids=zone_ids,
         search=search,
         data_ids_by_zone=data_ids_by_zone,
@@ -62,7 +65,10 @@ def list_terms_page(
     page_term_ids = [term["id"] for term in terms] if paged else None
     total = (
         terms_dal.count_terms(
-            zone_ids=zone_ids, search=search, data_ids_by_zone=data_ids_by_zone
+            connection_id=connection_id,
+            zone_ids=zone_ids,
+            search=search,
+            data_ids_by_zone=data_ids_by_zone,
         )
         if paged
         else len(terms)
@@ -71,16 +77,19 @@ def list_terms_page(
         "terms": terms,
         "total": total,
         "column_attribute_counts": terms_dal.fetch_column_attribute_counts(
+            connection_id=connection_id,
             zone_ids=zone_ids,
             data_ids_by_zone=data_ids_by_zone,
             term_ids=page_term_ids,
         ),
         "sql_attribute_counts": sql_attr_dal.fetch_sql_attribute_counts(
+            connection_id=connection_id,
             zone_ids=zone_ids,
             data_ids_by_zone=data_ids_by_zone,
             term_ids=page_term_ids,
         ),
         "related_counts": terms_dal.fetch_related_terms_counts(
+            connection_id=connection_id,
             zone_ids=zone_ids,
             term_ids=page_term_ids,
             data_ids_by_zone=data_ids_by_zone,
@@ -159,61 +168,79 @@ def update_column_attribute(
     else:
         row["sample_values"] = stringify_sample_values(row.get("sample_values"))
 
-    embedder = build_semantic_embedder(row.get("database_name") or "", reset=False)
-    if embedder is not None:
-        embedder.vdb.delete_by_id(attr_id)
-        attr = {
-            "id": row["id"],
-            "name": row["name"],
-            "description": row.get("description"),
-            "term_name": row.get("term_name"),
-            "source_column": row.get("source_column"),
-            "sample_values": row.get("sample_values"),
-            "is_unique": row.get("is_unique"),
-            "table_id": row.get("table_id"),
-            "table_name": row.get("table_name"),
-            "schema_name": row.get("schema_name"),
-        }
-        # Pass Term synonyms only — omit Term name so we re-embed just this attr row.
-        term_ctx = {"synonyms": row.get("term_synonyms") or []}
-        embedder.embed_term(term_ctx, [attr])
+    for context in terms_dal.fetch_term_projection_contexts(term_id):
+        cid = context["connection_id"]
+        term, attrs = terms_dal.fetch_term_and_column_attributes_for_embedding(
+            term_id, connection_id=cid
+        )
+        own_attrs = [attr for attr in attrs if attr["id"] == attr_id]
+        if term is None or not own_attrs:
+            continue
+        embedder = build_semantic_embedder(
+            context["database_name"], connection_id=cid, reset=False
+        )
+        if embedder is not None:
+            embedder.vdb.delete_by_id(attr_id, connection_id=cid)
+            embedder.embed_term({"synonyms": term["synonyms"]}, own_attrs)
 
     return row
 
 
-def refresh_term_embeddings(term_id: str, *, refresh_dependent_attrs: bool) -> None:
-    """Best-effort semantic VDB refresh for one Term update."""
+def refresh_term_embeddings(
+    term_id: str, *, refresh_dependent_attrs: bool, connection_id: str | None = None
+) -> None:
+    """Refresh global vocabulary in every projection, or one changed source context."""
+    contexts = {
+        c["connection_id"]: c["database_name"]
+        for c in terms_dal.fetch_term_projection_contexts(term_id)
+    }
+    vdb = get_semantic_vdb()
+    affected = (
+        {connection_id}
+        if connection_id is not None
+        else set(contexts) | set(vdb.projection_connection_ids(term_id))
+    )
+    for cid in sorted(affected):
+        if cid not in contexts:
+            vdb.delete_by_id(term_id, connection_id=cid)
+            continue
+        _reembed_term_projection(term_id, cid, contexts[cid], refresh_dependent_attrs)
+
+
+def _reembed_term_projection(
+    term_id: str, connection_id: str, database_name: str, refresh_dependent_attrs: bool
+) -> None:
     term, column_attrs = terms_dal.fetch_term_and_column_attributes_for_embedding(
-        term_id
+        term_id, connection_id=connection_id
     )
     if term is None:
         return
-
-    embedder = build_semantic_embedder(term.get("database_name") or "", reset=False)
+    embedder = build_semantic_embedder(
+        database_name, connection_id=connection_id, reset=False
+    )
     if embedder is None:
         return
-
     vdb = embedder.vdb
-    vdb.delete_by_id(term_id)
+    vdb.delete_by_id(term_id, connection_id=connection_id)
     if refresh_dependent_attrs:
         for attr in column_attrs:
-            attr_id = attr.get("id")
-            if attr_id:
-                vdb.delete_by_id(attr_id)
-
+            vdb.delete_by_id(attr["id"], connection_id=connection_id)
     embedder.embed_term(term, column_attrs if refresh_dependent_attrs else [])
-
-    if refresh_dependent_attrs:
-        embed_params = get_embed_params()
-        sql_attrs = sql_attr_dal.fetch_sql_attributes_by_term_id(term_id)
-        for sql_attr in sql_attrs:
-            attr_id = sql_attr.get("id")
-            if not attr_id:
-                continue
-            vdb.delete_by_id(attr_id)
-            embed_docs_into_vdb(
-                sql_attr_dal.fetch_sql_attribute_docs(attr_id),
-                embed_params,
-                vdb,
-                term.get("database_name"),
-            )
+    if not refresh_dependent_attrs:
+        return
+    sql_attrs = sql_attr_dal.fetch_sql_attributes_by_term_id(
+        term_id, connection_id=connection_id
+    )
+    if not sql_attrs:
+        return
+    embed_params = get_embed_params()
+    for sql_attr in sql_attrs:
+        attr_id = sql_attr["id"]
+        vdb.delete_by_id(attr_id, connection_id=connection_id)
+        embed_docs_into_vdb(
+            sql_attr_dal.fetch_sql_attribute_docs(attr_id, connection_id=connection_id),
+            embed_params,
+            vdb,
+            database_name,
+            connection_id=connection_id,
+        )

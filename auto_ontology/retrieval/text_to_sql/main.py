@@ -14,9 +14,6 @@ from auto_ontology.retrieval.text_to_sql.text_to_sql_graph import (
     _prediction_enabled,
     create_graph,
 )
-from auto_ontology.retrieval.text_to_sql.connector_routing import (
-    resolve_target_database_name,
-)
 from auto_ontology.retrieval.text_to_sql.node_labels import NODE_LABELS
 from auto_ontology.retrieval.text_to_sql.state import (
     AgentState,
@@ -99,6 +96,7 @@ _FULL_RETRY_PATH_KEYS_TO_CLEAR = frozenset(
         "sql_attributes_str",
         "primary_attribute",
         "attribute_join_paths",
+        "term_synonyms",
         "table_relevance_reasoning",
         "evidence_repairs_applied",
         "sql_code",
@@ -136,6 +134,14 @@ _FULL_RETRY_PATH_KEYS_TO_CLEAR = frozenset(
 
 
 def _build_state(payload: TextToSQLPayload) -> AgentState:
+    from auto_ontology.retrieval.source_context import resolve_query_source
+    from auto_ontology.connectors.sources import SourceSelectionError
+
+    source = resolve_query_source(
+        connection_id=payload.get("connection_id"),
+        connection_label=payload.get("connection_label"),
+        target_db=payload.get("target_db"),
+    )
     custom_prompts = payload.get("custom_prompts", "")
     acronyms = payload.get("acronyms", [])
     connectors = payload.get("connectors", [])
@@ -144,6 +150,13 @@ def _build_state(payload: TextToSQLPayload) -> AgentState:
             "TextToSQLPayload is missing required 'connectors'. "
             "Provide a non-empty list of database connectors, each with a valid 'dialect' attribute."
         )
+    connectors = [
+        connector
+        for connector in connectors
+        if getattr(connector, "connection_id", None) == source.connection_id
+    ]
+    if len(connectors) != 1 or connectors[0].database_name != source.database_name:
+        raise SourceSelectionError(503, "source_unavailable")
 
     data_retriever = payload.get("data_retriever")
     if data_retriever is None:
@@ -177,15 +190,27 @@ def _build_state(payload: TextToSQLPayload) -> AgentState:
 
     initial_path_state = dict(payload.get("path_state") or {})
 
-    target_db = payload.get("target_db")
-    if target_db:
-        initial_path_state["target_db"] = resolve_target_database_name(
-            target_db, connectors
-        )
-    elif len(connectors) == 1:
-        connector_db = getattr(connectors[0], "database_name", None)
-        if connector_db:
-            initial_path_state["target_db"] = connector_db
+    for key in (
+        "relevant_tables",
+        "retrieved_column_attributes",
+        "retrieved_custom_analyses",
+        "retrieved_sql_attributes",
+        "custom_analyses",
+        "sql_attributes",
+    ):
+        if any(
+            item.get("connection_id") != source.connection_id
+            for item in initial_path_state.get(key, []) or []
+        ):
+            raise SourceSelectionError(409, "source_conflict")
+
+    if initial_path_state.get("connection_id") != source.connection_id:
+        # Unbound/foreign resume artifacts are not evidence for the selected source.
+        for key in _FULL_RETRY_PATH_KEYS_TO_CLEAR:
+            initial_path_state.pop(key, None)
+
+    initial_path_state["connection_id"] = source.connection_id
+    initial_path_state["target_db"] = source.database_name
 
     submitted_question = payload["question"].strip()
     processing_question = (
@@ -219,6 +244,12 @@ def _build_state(payload: TextToSQLPayload) -> AgentState:
     }
 
     state: dict = {
+        "connection_id": source.connection_id,
+        "source": {
+            "connection_id": source.connection_id,
+            "display_label": source.display_label,
+            "database_name": source.database_name,
+        },
         "llm": llm_client,
         "reasoning_llm": reasoning_llm_client,
         "initial_question": submitted_question,
@@ -258,9 +289,14 @@ def _extract_answer(final_state: dict) -> dict:
         else:
             final_response = ""
 
-    if isinstance(final_response, dict):
-        return final_response
-    return {"response": str(final_response)}
+    answer = (
+        dict(final_response)
+        if isinstance(final_response, dict)
+        else {"response": str(final_response)}
+    )
+    if "source" in final_state:
+        answer["source"] = dict(final_state["source"])
+    return answer
 
 
 def _restore_for_full_pipeline_retry(state: AgentState) -> AgentState:
@@ -382,8 +418,19 @@ def _merge_node_output(final_state: dict, node_output: dict | None) -> None:
         final_state.setdefault("path_state", {})
         final_state["path_state"].update(node_output["path_state"])
     for key, value in node_output.items():
-        if key != "path_state":
+        if key not in {
+            "path_state",
+            "connection_id",
+            "source",
+            "connectors",
+            "restore_from",
+        }:
             final_state[key] = value
+    if final_state.get("connection_id"):
+        final_state.setdefault("path_state", {})["connection_id"] = final_state[
+            "connection_id"
+        ]
+        final_state["path_state"]["target_db"] = final_state["source"]["database_name"]
 
 
 def _build_thoughts_summary(thoughts_log: list[dict]) -> str:
@@ -435,6 +482,7 @@ def stream_agent_response(
 
     state = _build_state(payload)
     final_state = dict(state)
+    yield {"type": "source", "source": dict(state["source"])}
     # Last SQL surfaced to the client. A query can clear its final gate more
     # than once (an empty result sends it back through validation unchanged),
     # so dedupe rather than re-emitting the same query.
@@ -596,6 +644,7 @@ def get_agent_response_with_state(payload: TextToSQLPayload) -> dict:
         fallback_sql = interrupted_path_state.get("sql_code", "") or ""
         return {
             "response": f"Agent failed: {exc}",
+            "source": dict(state["source"]),
             "sql_code": fallback_sql,
             "path_state": interrupted_path_state,
         }

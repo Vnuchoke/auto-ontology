@@ -32,7 +32,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlglot import exp
 
-from auto_ontology.connectors import get_connectors
+from auto_ontology.connectors import get_connector
 from auto_ontology.connectors.base import SQLDatabase
 from auto_ontology.dal.attributes import (
     delete_semantic_fk,
@@ -56,6 +56,7 @@ from auto_ontology.semantic.models import (
     FkHitSelection,
     SemanticFkJoinDefaultSelection,
 )
+from auto_ontology.semantic.domain import selected_source
 from auto_ontology.vdb import get_semantic_vdb
 
 logger = logging.getLogger(__name__)
@@ -88,19 +89,20 @@ null only when the schema context is genuinely insufficient. Never invent an ID.
 """
 
 
-def resolve_semantic_fks(database_name: str) -> int:
+def resolve_semantic_fks(connection_id: str) -> int:
     """Create SEMANTIC_FK edges for all unlinked FK columns.
 
     Runs after the taxonomy while-loop in ``compile_semantic_layer``.
     Returns the total number of SEMANTIC_FK edges created.
     """
-    created = _resolve_semantic_fks(database_name)
-    created -= prune_disjoint_semantic_fks(database_name)
-    select_semantic_fk_join_defaults(database_name)
+    selected_source(connection_id)
+    created = _resolve_semantic_fks(connection_id)
+    created -= prune_disjoint_semantic_fks(connection_id)
+    select_semantic_fk_join_defaults(connection_id)
     return created
 
 
-def prune_disjoint_semantic_fks(database_name: str) -> int:
+def prune_disjoint_semantic_fks(connection_id: str) -> int:
     """Delete semantic FKs whose column shares no value with its target.
 
     An inferred edge is a guess from names and descriptions; a seven-digit
@@ -111,12 +113,13 @@ def prune_disjoint_semantic_fks(database_name: str) -> int:
     rows, yet it would still be offered as a join path.
     Returns the number of edges deleted.
     """
-    connector = _resolve_connector(database_name)
+    selected_source(connection_id)
+    connector = _resolve_connector(connection_id)
     if connector is None:
         return 0
     dialect = getattr(connector, "dialect", None)
     pruned = 0
-    for row in fetch_semantic_fk_join_groups(database_name):
+    for row in fetch_semantic_fk_join_groups(connection_id=connection_id):
         source = connector.qualify(
             row.get("source_schema_name"), row["source_table_name"]
         )
@@ -155,9 +158,9 @@ def prune_disjoint_semantic_fks(database_name: str) -> int:
     return pruned
 
 
-def _resolve_semantic_fks(database_name: str) -> int:
+def _resolve_semantic_fks(connection_id: str) -> int:
     """Create missing semantic FK edges before default selection."""
-    candidates = find_unlinked_fk_columns(database_name)
+    candidates = find_unlinked_fk_columns(connection_id=connection_id)
     if not candidates:
         logger.info("resolve_semantic_fks: no unlinked FK columns found")
         return 0
@@ -227,7 +230,7 @@ def _resolve_semantic_fks(database_name: str) -> int:
     if not llm_queue:
         return declared_written
 
-    retriever = _build_retriever(database_name)
+    retriever = _build_retriever(connection_id)
     if retriever is None:
         logger.warning(
             "resolve_semantic_fks: EMBED_API_KEY not set — skipping LLM/VDB path "
@@ -235,15 +238,15 @@ def _resolve_semantic_fks(database_name: str) -> int:
             len(llm_queue),
         )
         return declared_written
-    connector = _resolve_connector(database_name)
+    connector = _resolve_connector(connection_id)
 
     inferred_written = 0
 
     def _resolve_one(index: int, col: dict[str, Any]) -> bool:
         _log_start(index, col)
         try:
-            attr_id = _resolve_via_vdb(col, retriever, database_name, connector)
-            # The VDB where-filter already scopes hits to database_name, but
+            attr_id = _resolve_via_vdb(col, retriever, connection_id, connector)
+            # The VDB where-filter already scopes hits to connection_id, but
             # it's a query-time filter over a collection shared by every
             # ingested database, not physical isolation -- the same shape of
             # mechanism that let Term nodes leak across databases elsewhere.
@@ -283,9 +286,10 @@ def _resolve_semantic_fks(database_name: str) -> int:
     return total
 
 
-def select_semantic_fk_join_defaults(database_name: str) -> int:
+def select_semantic_fk_join_defaults(connection_id: str) -> int:
     """Persist exactly one join-path default for every semantic FK group."""
-    rows = fetch_semantic_fk_join_groups(database_name)
+    selected_source(connection_id)
+    rows = fetch_semantic_fk_join_groups(connection_id=connection_id)
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         key = (row["source_table_id"], row["target_attribute_id"])
@@ -418,23 +422,19 @@ def _deterministic_join_default(group: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_connector(database_name: str) -> SQLDatabase | None:
-    """Return the configured connector matching *database_name*."""
-    target = database_name.casefold()
-    for connector in get_connectors():
-        name = getattr(connector, "database_name", None)
-        if isinstance(name, str) and name.casefold() == target:
-            return connector
-    return None
+def _resolve_connector(connection_id: str) -> SQLDatabase:
+    """Open only the selected connector; never try a same-named neighbour."""
+    selected_source(connection_id)
+    return get_connector(connection_id)
 
 
-def _build_retriever(database_name: str) -> Retriever | None:
+def _build_retriever(connection_id: str) -> Retriever | None:
     """Build a Retriever backed by the semantic VDB, or None when the API key is absent."""
     if not _NVIDIA_API_KEY:
         return None
 
     return Retriever(
-        get_semantic_vdb(database_name=database_name),
+        get_semantic_vdb(connection_id=connection_id),
         EmbedParams(
             model_name=_EMBED_MODEL,
             embed_invoke_url=_EMBED_ENDPOINT,
@@ -466,7 +466,7 @@ def _format_sample_values(raw: Any) -> str:
 def _resolve_via_vdb(
     col: dict[str, Any],
     retriever: Retriever,
-    database_name: str,
+    connection_id: str,
     connector: SQLDatabase | None = None,
 ) -> str | None:
     """Search the semantic VDB for a matching ColumnAttribute and return its id.
@@ -492,7 +492,7 @@ def _resolve_via_vdb(
     vdb_kwargs = {
         "where": {
             "label": "ColumnAttribute",
-            "database_name": database_name,
+            "connection_id": connection_id,
             "is_unique": True,
         }
     }
@@ -505,7 +505,10 @@ def _resolve_via_vdb(
     seen_ids: set[str] = set()
     merged: list[dict[str, Any]] = []
     for hit in full_hits + name_hits:
-        hit_id = (hit.get("metadata") or {}).get("id", "")
+        metadata = hit.get("metadata") or {}
+        if metadata.get("connection_id") != connection_id:
+            continue
+        hit_id = metadata.get("id", "")
         if hit_id and hit_id not in seen_ids:
             seen_ids.add(hit_id)
             merged.append(hit)

@@ -103,11 +103,14 @@ def create_dataframe(connector: "SQLDatabase"):
 
 
 def data_for_populate_tabular(connector: "SQLDatabase") -> dict[str, Any]:
-    """Build the ``data`` dict ``populate_tabular_data()`` expects."""
+    """Carry the registered source ID separately from physical SQL identifiers."""
+    if not connector.connection_id:
+        raise ValueError("Catalog extraction requires a registered connection_id")
     tables, columns, views, queries, pks, fks = create_dataframe(connector)
     tables = normalize_tables(tables)
     columns = normalize_columns(columns)
     data = {
+        "connection_id": connector.connection_id,
         "database_name": connector.database_name,
         "tables": tables,
         "columns": columns,
@@ -122,7 +125,7 @@ def data_for_populate_tabular(connector: "SQLDatabase") -> dict[str, Any]:
 def extract_tabular_db_data(connector: "SQLDatabase | None" = None) -> dict[str, Any]:
     """Step 1 — pull schema entities from the relational DB into a data dict.
 
-    Returns a data dict with keys ``database_name``, ``tables``, ``columns``,
+    Returns a data dict with keys ``connection_id``, ``database_name``, ``tables``, ``columns``,
     ``views``, ``pks``, ``fks`` and ``queries``, or ``{}`` when *connector* is
     ``None``.
     """

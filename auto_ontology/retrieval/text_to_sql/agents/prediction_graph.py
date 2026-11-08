@@ -55,6 +55,8 @@ def _pql_tables(pql: str) -> set[str]:
 def _enrich_relevant_tables(
     relevant_tables: list[dict[str, Any]],
     examples: list[dict[str, str]],
+    *,
+    connection_id: str,
 ) -> list[dict[str, Any]]:
     """Add any table referenced by a retrieved PQL example but missing from
     ``relevant_tables``, resolved from the catalog by name.
@@ -73,12 +75,14 @@ def _enrich_relevant_tables(
     for name in sorted(referenced):
         if name.upper() in existing:
             continue
-        row = fetch_table_by_name(name)
+        row = fetch_table_by_name(name, connection_id=connection_id)
         if not row or not row.get("name"):
             continue
         enriched.append(
             {
                 "id": row.get("id"),
+                "connection_id": connection_id,
+                "database_name": row.get("database_name"),
                 "name": row.get("name"),
                 "schema_name": row.get("schema_name") or "",
                 "description": row.get("description") or "",
@@ -116,7 +120,9 @@ class PredictionGraphAgent(BaseAgent):
         )
         # Enrich the table set with any table the examples reference before the
         # graph is built, so the LLM can never cite a table absent from the graph.
-        relevant_tables = _enrich_relevant_tables(relevant_tables, examples)
+        relevant_tables = _enrich_relevant_tables(
+            relevant_tables, examples, connection_id=state["connection_id"]
+        )
 
         try:
             context = build_prediction_context(

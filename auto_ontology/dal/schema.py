@@ -92,6 +92,13 @@ NAMING_CONVENTION = {
 # by luck.
 METADATA = MetaData(naming_convention=NAMING_CONVENTION)
 
+# No FK: a retired identity outlives its deleted catalog root.
+retired_connection = Table(
+    "retired_connection",
+    METADATA,
+    Column("connection_id", Text, primary_key=True),
+)
+
 #: ``gen_random_uuid()`` is built into Postgres from 13; no pgcrypto needed.
 #:
 #: Parenthesised to match how Postgres *stores* the expression. Written as
@@ -180,10 +187,12 @@ catalog_database = Table(
     "catalog_database",
     METADATA,
     _id(),
-    Column("name", Text, nullable=False, unique=True),
+    Column("name", Text, nullable=False),
+    Column("display_label", Text, nullable=False),
+    Column("configuration_origin", Text, nullable=True),
+    Column("credential_ref", Text, nullable=True),
     # UI-managed connection form. Stored here only when Vault is not configured;
-    # with Vault the credentials live there and this stays null (the database
-    # name is the lookup key -- there is no separate reference field).
+    # with Vault the credentials live at credential_ref and this stays null.
     Column("connection", JSONB, nullable=True),
     Column("dialect", Text, nullable=True),
     # A database and a schema each carry a curated description, as tables and
@@ -196,6 +205,18 @@ catalog_database = Table(
     _owner_id(),
     Column("created", DateTime(timezone=True), server_default=func.now()),
     Column("pulled", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "TRIM(BOTH FROM display_label) <> ''", name="display_label_nonblank"
+    ),
+    CheckConstraint(
+        "configuration_origin IS NULL OR configuration_origin IN ('managed', 'env')",
+        name="configuration_origin_value",
+    ),
+    Index(
+        "uq_catalog_database_display_label_lower",
+        text("lower(TRIM(BOTH FROM display_label))"),
+        unique=True,
+    ),
 )
 
 catalog_schema = Table(
@@ -382,6 +403,13 @@ sql_query = Table(
     "sql_query",
     METADATA,
     _id(),
+    # NULL preserves unresolved legacy ownership; new writers supply a verified ID.
+    Column(
+        "connection_id",
+        Text,
+        ForeignKey(catalog_database.c.id, ondelete="CASCADE"),
+        nullable=True,
+    ),
     Column("sql_full_query", Text, nullable=False),
     Column("query_count", Integer, nullable=False, server_default=text("0")),
     Column("created", DateTime(timezone=True), server_default=func.now()),
@@ -402,7 +430,8 @@ sql_query = Table(
     # (match_props={"sql_full_query": sql}). Statement text can exceed the btree
     # row limit, so the uniqueness is enforced on a hash rather than the column.
     Index(
-        "uq_sql_query_text_md5",
+        "uq_sql_query_connection_text_md5",
+        "connection_id",
         func.md5(text("sql_full_query")),
         unique=True,
     ),
@@ -600,7 +629,14 @@ sql_attribute = Table(
     "sql_attribute",
     METADATA,
     _id(),
-    Column("name", Text, nullable=False, unique=True),
+    Column("name", Text, nullable=False),
+    Column(
+        "connection_id",
+        Text,
+        ForeignKey(catalog_database.c.id, ondelete="CASCADE"),
+        nullable=True,
+    ),
+    UniqueConstraint("connection_id", "name", name="uq_sql_attribute_connection_name"),
     Column("description", Text, nullable=True),
     Column("expression", Text, nullable=True),
     Column("source", Text, nullable=True),
@@ -666,7 +702,16 @@ custom_analysis = Table(
     "custom_analysis",
     METADATA,
     _id(),
-    Column("name", Text, nullable=False, unique=True),
+    Column("name", Text, nullable=False),
+    Column(
+        "connection_id",
+        Text,
+        ForeignKey(catalog_database.c.id, ondelete="CASCADE"),
+        nullable=True,
+    ),
+    UniqueConstraint(
+        "connection_id", "name", name="uq_custom_analysis_connection_name"
+    ),
     Column("description", Text, nullable=True),
     _imported_id(),
 )

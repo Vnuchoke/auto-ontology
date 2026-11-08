@@ -5,6 +5,7 @@
 import os
 from collections.abc import Iterator
 from types import SimpleNamespace
+from .source_fixtures import graph_state
 from typing import Any
 
 import pytest
@@ -58,7 +59,7 @@ class _FailAfterGenerationApp:
 def test_stream_error_preserves_partial_generated_sql(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(main, "app", _FailAfterGenerationApp())
 
     events = list(main.stream_agent_response({"question": "q"}))
@@ -79,7 +80,7 @@ def test_stream_error_preserves_partial_generated_sql(
 def test_nonstreaming_error_exposes_partial_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(main, "app", _FailAfterGenerationApp())
 
     with pytest.raises(main.AgentRunError) as caught:
@@ -110,7 +111,7 @@ def test_error_inside_a_node_names_that_node(
     to ``graph_start`` when it is the first one. The start announcement is
     what makes the report point at the node that was actually running.
     """
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(main, "app", _FailInsideFirstNodeApp())
 
     events = list(main.stream_agent_response({"question": "q"}))
@@ -138,7 +139,7 @@ def test_error_after_a_node_completes_names_the_running_node(
             yield ("custom", {"type": "step_start", "node": "execute_sql_query"})
             raise RuntimeError("connector died")
 
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(main, "app", _FailInSecondNode())
 
     events = list(main.stream_agent_response({"question": "q"}))

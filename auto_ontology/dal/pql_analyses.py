@@ -250,9 +250,13 @@ def embed_pql_analyses(
     analysis_id: str | None = None,
     database_name: str | None = None,
 ) -> None:
-    """Embed PqlAnalysis docs and append them to *vdb*."""
+    """Upsert global question-only PQL examples through the explicit PQL client."""
     from auto_ontology.utils.embedding import embed_rows_into_vdb
 
+    if not getattr(vdb, "global_pql", False):
+        raise ValueError(
+            "PqlAnalysis embedding requires the explicit global PQL client"
+        )
     docs = _pql_analysis_docs(analysis_id)
     if not docs:
         logger.info(

@@ -38,10 +38,13 @@ class NodeUpdate(BaseModel):
 
 
 class CustomAnalysisValidate(BaseModel):
+    connection_id: str | None = None
+    analysis_id: str | None = None
     sql: str = Field(..., min_length=1)
 
 
 class CustomAnalysisCreate(BaseModel):
+    connection_id: str | None = None
     name: str = Field(..., min_length=1)
     description: str
     sql: str = Field(..., min_length=1)
@@ -184,14 +187,18 @@ def list_custom_analyses(
 
 @router.post("/custom-analyses/validate", response_model=SqlValidationResponse)
 def validate_custom_analysis_sql(body: CustomAnalysisValidate) -> dict:
-    """Validate a SQL expression against the full catalog.
+    """Validate SQL in one active source, not the full catalog.
 
-    Does not create a CustomAnalysis. Returns 422 when the SQL can't be
+    Select ``connection_id`` with multiple active sources; ``analysis_id``
+    inherits existing immutable ownership. Does not create a CustomAnalysis.
+    Returns 422 for invalid source selection or when the SQL can't be
     parsed or doesn't resolve to a known table.
     """
     try:
-        result = custom_analyses_dal.validate_custom_analysis_sql(body.sql)
-    except custom_analyses_dal.CustomAnalysisSqlError as exc:
+        result = custom_analyses_dal.validate_custom_analysis_sql(
+            body.sql, connection_id=body.connection_id, analysis_id=body.analysis_id
+        )
+    except (ValueError, custom_analyses_dal.CustomAnalysisSqlError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"data": result}
 
@@ -205,8 +212,9 @@ def create_custom_analysis(body: CustomAnalysisCreate) -> dict:
     values before sending. Updating an existing analysis goes through
     ``PUT /custom-analyses/{analysis_id}``.
 
-    Returns 409 when ``name`` or ``sql`` is already used by another
-    CustomAnalysis (both are unique natural keys), and 422 when the SQL
+    Select ``connection_id`` when multiple sources are active. Returns 409
+    when ``name`` or ``sql`` is already used in that source, and 422 for
+    invalid source selection or when the SQL
     can't be parsed against the current catalog (no recognised tables) —
     without those references the analysis would be invisible to
     retrieval.
@@ -216,13 +224,14 @@ def create_custom_analysis(body: CustomAnalysisCreate) -> dict:
             name=body.name,
             description=body.description,
             sql=body.sql,
+            connection_id=body.connection_id,
         )
     except (
         custom_analyses_dal.CustomAnalysisNameConflict,
         custom_analyses_dal.CustomAnalysisSqlConflict,
     ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except custom_analyses_dal.CustomAnalysisSqlError as exc:
+    except (ValueError, custom_analyses_dal.CustomAnalysisSqlError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"data": row}
 
@@ -231,6 +240,7 @@ def create_custom_analysis(body: CustomAnalysisCreate) -> dict:
 def update_custom_analysis(analysis_id: str, body: CustomAnalysisCreate) -> dict:
     """Replace a CustomAnalysis (matched by id) and re-link its Sql node.
 
+    Source ownership is inherited; a different ``connection_id`` is rejected.
     Returns 404 when no CustomAnalysis with ``analysis_id`` exists, 409
     when ``name`` or ``sql`` is already taken by a different
     CustomAnalysis, and 422 when the SQL can't be parsed against the
@@ -243,13 +253,14 @@ def update_custom_analysis(analysis_id: str, body: CustomAnalysisCreate) -> dict
             name=body.name,
             description=body.description,
             sql=body.sql,
+            connection_id=body.connection_id,
         )
     except (
         custom_analyses_dal.CustomAnalysisNameConflict,
         custom_analyses_dal.CustomAnalysisSqlConflict,
     ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except custom_analyses_dal.CustomAnalysisSqlError as exc:
+    except (ValueError, custom_analyses_dal.CustomAnalysisSqlError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if row is None:

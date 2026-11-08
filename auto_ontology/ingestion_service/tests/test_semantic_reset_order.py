@@ -96,7 +96,7 @@ def test_delete_waits_for_an_in_flight_pass_to_stop(
     assert scheduler._polls_until_idle < 0
 
 
-def test_a_pass_that_never_stops_does_not_block_the_reset_forever(
+def test_a_pass_that_never_stops_aborts_reset_without_deletion_or_rebuild(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     scheduler = _FakeScheduler(running=True, stops_after=10**6)
@@ -106,7 +106,8 @@ def test_a_pass_that_never_stops_does_not_block_the_reset_forever(
 
     asyncio.run(mod.reset_semantic_layer_and_recompile(scheduler, None))
 
-    assert scheduler.events == ["pause", "abort", "delete", "resume", "start"]
+    assert scheduler.events == ["pause", "abort", "resume"]
+    assert not scheduler.started and not scheduler.paused
     assert "still running" in caplog.text
 
 

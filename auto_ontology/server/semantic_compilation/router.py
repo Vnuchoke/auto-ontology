@@ -13,8 +13,9 @@ ingestion service, mirroring how connection changes trigger ingest (see
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from auto_ontology.dal.terms import semantic_layer_calculated
 from auto_ontology.ingestion_service.history import (
@@ -45,13 +46,20 @@ async def trigger() -> dict[str, str]:
 @router.post(
     "/semantic-compilation/reset", status_code=202, response_model=StatusResponse
 )
-async def reset() -> dict[str, str]:
-    """Ask the ingestion service to rebuild every database's semantic layer.
+async def reset(
+    request: Request,
+    connection_id: Annotated[str | None, Query(pattern=r"\S")] = None,
+) -> dict[str, str]:
+    """Queue a semantic rebuild by opaque ID, or all sources if omitted.
 
     The service deletes the semantic nodes and embeddings and compiles them
     again, so the layer is rebuilt without waiting for the next scheduled run.
+    Global PQL vocabulary survives. Legacy physical-name selectors are rejected;
+    a 202 acknowledges queueing, not successful deletion or rebuild.
     """
-    trigger_semantic_reset()
+    if "database_name" in request.query_params:
+        raise HTTPException(status_code=422, detail="invalid_source_selector")
+    trigger_semantic_reset(connection_id)
     return {"status": "accepted"}
 
 

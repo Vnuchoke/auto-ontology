@@ -38,68 +38,45 @@ __all__ = [
 ]
 
 
-def get_schemas_by_ids(relevant_schemas_ids: list | None = None) -> dict:
-    """Assemble :class:`Schema` objects from catalog data.
+def get_schemas_by_ids(
+    relevant_schemas_ids: list | None = None, *, connection_id: str | None = None
+) -> dict:
+    """Assemble one source's parser snapshot with its registered IDs.
 
-    Fetches raw column/table rows via :func:`auto_ontology.dal.datasources.fetch_schemas_by_ids`
-    then builds the in-memory :class:`Schema` map consumed by the SQL parser.
+    An empty selection stays empty. Multiple roots cannot fit the parser's
+    schema-name map, even if their physical names coincide; select one first.
     """
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("source_required: schema snapshot requires connection_id")
+    if relevant_schemas_ids == []:
+        return {}
     before_get_all = time.time()
-    data_array = fetch_schemas_by_ids(relevant_schemas_ids)
+    data_array = fetch_schemas_by_ids(relevant_schemas_ids, connection_id=connection_id)
     logger.info(f"time took to get all data from graph: {time.time() - before_get_all}")
+    if not data_array:
+        return {}
     data_df = pd.DataFrame(data_array)
-    dbs = list(data_df["database_name"].unique())
-
-    schemas = data_df[["database_name", "table_schema"]]
-    schemas = schemas.drop_duplicates().to_dict(orient="records")
-
-    all_schemas = {}
-    schema_dfs = {}
-    dbs_nodes = {}
-    for database_name in dbs:
-        database_node = CatalogNode(
-            name=database_name, label=Labels.DB, props={"name": database_name}
-        )
-        dbs_nodes[database_name] = database_node
-
-    tables_df = data_df[
-        ["database_name", "table_schema", "table_name", "table_id"]
-    ].drop_duplicates(subset=["database_name", "table_schema", "table_name"])
-    tables_df = tables_df.rename(columns={"table_id": "id"})
-
-    unique_schemas = data_df.table_schema.unique()
-    for table_schema in unique_schemas:
-        schema_tables_df = tables_df.loc[tables_df["table_schema"] == table_schema]
-        schema_dfs[table_schema] = {
-            "tables": schema_tables_df.to_dict(orient="records")
-        }
-
-    for table_schema in unique_schemas:
-        columns_df = data_df.loc[data_df["table_schema"] == table_schema].rename(
-            columns={"column_id": "id"}
-        )
-        schema_dfs[table_schema]["columns"] = columns_df.to_dict(orient="records")
-
-    before_modify_all = time.time()
-    for schema in schemas:
-        table_schema: str = schema.get("table_schema")
-        if not table_schema:
-            continue
-
-        schema_database_name: str = schema["database_name"]
-        schema_database_node = dbs_nodes[schema_database_name]
-        tables_df = pd.DataFrame(schema_dfs[table_schema]["tables"])
-        columns_df = pd.DataFrame(schema_dfs[table_schema]["columns"])
-
-        all_schemas[table_schema.lower()] = Schema(
-            schema_database_node,
-            tables_df,
-            columns_df,
-            table_schema,
-            is_creation_mode=False,
-        )
-    logger.info(
-        f"total time it took to create all schemas nodes: {time.time() - before_modify_all}"
+    if set(data_df["connection_id"]) != {connection_id}:
+        raise ValueError("source_required: schema snapshot must belong to one source")
+    database_name = data_df.iloc[0]["database_name"]
+    database_node = CatalogNode(
+        name=database_name,
+        label=Labels.DB,
+        props={"name": database_name},
+        existing_id=connection_id,
+        match_props={"id": connection_id},
     )
+    all_schemas = {}
+    for schema_id, rows in data_df.groupby("schema_id", sort=False):
+        schema_name = rows.iloc[0]["table_schema"]
+        tables = (
+            rows[["database_name", "table_schema", "table_name", "table_id"]]
+            .drop_duplicates(subset=["table_id"])
+            .rename(columns={"table_id": "id"})
+        )
+        columns = rows.rename(columns={"column_id": "id"})
+        schema = Schema(database_node, tables, columns, is_creation_mode=False)
+        schema.create_schema_node(schema_name, id=schema_id)
+        all_schemas[schema_name.lower()] = schema
     logger.info(f"total time for get_schemas_by_ids(): {time.time() - before_get_all}")
     return all_schemas

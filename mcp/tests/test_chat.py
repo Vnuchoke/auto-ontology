@@ -105,6 +105,7 @@ def test_returns_answer_sql_and_rows() -> None:
     assert result.data.row_count == 1
     assert result.data.truncated is False
     assert "found the customers table" in result.data.reasoning
+    assert result.data.source is None
 
 
 def test_forwards_agent_steps_as_progress() -> None:
@@ -294,7 +295,10 @@ def test_forwards_the_conversation_when_given() -> None:
         },
     )
 
-    assert captured["conversation_id"] == "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    assert captured == {
+        "question": "how many?",
+        "conversation_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    }
 
 
 def test_forwards_evidence_separately_from_question() -> None:
@@ -322,13 +326,205 @@ def test_forwards_evidence_separately_from_question() -> None:
     }
 
 
-def test_the_database_cannot_be_pinned_by_a_caller() -> None:
-    # target_db exists on the API for benchmarking. Exposing it would invite an
-    # agent to route around the semantic layer, so the tool has no such
-    # parameter and a caller passing one is rejected rather than silently
-    # ignored.
+def test_legacy_physical_name_selector_is_not_exposed() -> None:
+    # MCP uses stable IDs or unique labels, never an ambiguous physical name.
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         raise AssertionError("the request should never be sent")
 
     with pytest.raises(ToolError):
         _call(_server(handler), {"question": "how many?", "target_db": "sales"})
+
+
+_SOURCE = {
+    "connection_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    "display_label": "sales-local",
+    "database_name": "sales",
+}
+
+
+@pytest.mark.parametrize("selector", ["connection_id", "connection_label"])
+def test_forwards_exact_source_selector_with_conversation_and_evidence(
+    selector: str,
+) -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/chat/completions"
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, text=_sse({"type": "result", "answer": _ANSWER}))
+
+    arguments = {
+        "question": "how many?",
+        "conversation_id": "thread",
+        "evidence": "active means enabled",
+        selector: _SOURCE[
+            "connection_id" if selector == "connection_id" else "display_label"
+        ],
+    }
+    result = _call(_server(handler), arguments)
+
+    assert captured == [arguments]
+    assert result.data.source is None  # Never invent provenance from the request.
+
+
+@pytest.mark.parametrize("selector", ["connection_id", "connection_label"])
+@pytest.mark.parametrize("value", ["", " \t\n", 42, True, [], {}])
+def test_invalid_source_selector_is_rejected_before_http(
+    selector: str,
+    value: Any,
+) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, text=_sse({"type": "result", "answer": _ANSWER}))
+
+    with pytest.raises(ToolError):
+        _call(_server(handler), {"question": "q", selector: value})
+    assert captured == []
+
+
+def test_conflicting_source_selectors_are_rejected_before_http() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, text=_sse({"type": "result", "answer": _ANSWER}))
+
+    with pytest.raises(ToolError, match="connection_id.*connection_label"):
+        _call(
+            _server(handler),
+            {
+                "question": "q",
+                "connection_id": _SOURCE["connection_id"],
+                "connection_label": _SOURCE["display_label"],
+            },
+        )
+    assert captured == []
+
+
+@pytest.mark.parametrize("channels", ["event", "answer", "both"])
+def test_returns_safe_source_snapshot_without_losing_sql_rows(channels: str) -> None:
+    source = dict(_SOURCE, password="never-return-this", credential_ref="private-path")
+    events = []
+    if channels in ("event", "both"):
+        events.append({"type": "source", "source": source})
+    answer = dict(_LIVE_ANSWER)
+    if channels in ("answer", "both"):
+        answer["source"] = source
+    events.append({"type": "result", "answer": answer})
+
+    result = _call(_server(_stream(_sse(*events))), {"question": "q"})
+
+    assert result.structured_content["source"] == _SOURCE
+    assert result.data.sql == _LIVE_ANSWER["sql_code"]
+    assert result.data.rows == [{"CUSTOMER_COUNT": 663}]
+    assert result.data.reasoning == _LIVE_ANSWER["thoughts"]
+
+
+@pytest.mark.parametrize("field", list(_SOURCE))
+@pytest.mark.parametrize(
+    "channels", ["events", "event_answer", "answers", "late_event"]
+)
+def test_source_identity_mismatch_never_returns_an_answer(
+    field: str,
+    channels: str,
+) -> None:
+    other = dict(_SOURCE, **{field: "different"})
+    source_event = {"type": "source", "source": _SOURCE}
+    result_event = {"type": "result", "answer": dict(_ANSWER, source=_SOURCE)}
+    other_source = {"type": "source", "source": other}
+    other_result = {"type": "result", "answer": dict(_ANSWER, source=other)}
+    events = {
+        "events": [source_event, other_source, result_event],
+        "event_answer": [source_event, other_result],
+        "answers": [result_event, other_result],
+        "late_event": [result_event, other_source],
+    }[channels]
+
+    with pytest.raises(ToolError, match="source.*mismatch"):
+        _call(_server(_stream(_sse(*events))), {"question": "q"})
+
+
+def test_identical_repeated_snapshots_and_answers_are_allowed() -> None:
+    events = [
+        {"type": "source", "source": _SOURCE},
+        {"type": "source", "source": dict(_SOURCE, password="discarded")},
+        {"type": "result", "answer": dict(_ANSWER, source=_SOURCE)},
+        {"type": "result", "answer": _LIVE_ANSWER},
+        {"type": "source", "source": _SOURCE},
+    ]
+
+    result = _call(_server(_stream(_sse(*events))), {"question": "q"})
+
+    assert result.structured_content["source"] == _SOURCE
+    assert result.data.rows == [{"CUSTOMER_COUNT": 663}]
+
+
+def test_source_event_without_a_snapshot_is_not_treated_as_absent() -> None:
+    events = [{"type": "source"}, {"type": "result", "answer": _ANSWER}]
+
+    with pytest.raises(ToolError, match="Invalid.*source"):
+        _call(_server(_stream(_sse(*events))), {"question": "q"})
+
+
+@pytest.mark.parametrize("channel", ["event", "answer"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "secret-source-payload",
+        [],
+        {},
+        dict(_SOURCE, connection_id=42),
+        dict(_SOURCE, display_label=" \t"),
+        dict(_SOURCE, database_name=""),
+        {
+            "connection_id": _SOURCE["connection_id"],
+            "display_label": "secret-source-payload",
+        },
+    ],
+)
+def test_invalid_present_source_fails_without_payload_or_fallback(
+    channel: str,
+    invalid: Any,
+) -> None:
+    events = [{"type": "source", "source": _SOURCE}]
+    if channel == "event":
+        events.append({"type": "source", "source": invalid})
+        events.append({"type": "result", "answer": dict(_ANSWER, source=_SOURCE)})
+    else:
+        events.append({"type": "result", "answer": dict(_ANSWER, source=invalid)})
+
+    with pytest.raises(ToolError, match="Invalid.*source") as exc:
+        _call(_server(_stream(_sse(*events))), {"question": "q"})
+    assert "secret-source-payload" not in str(exc.value)
+    assert _SOURCE["connection_id"] not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (404, "source_not_found"),
+        (409, "source_conflict"),
+        (409, "ambiguous_source"),
+        (409, "legacy_conversation_read_only"),
+        (422, "source_required"),
+        (422, "invalid_source_selector"),
+        (503, "source_unavailable"),
+        (503, "source_not_ready"),
+    ],
+)
+def test_source_http_errors_preserve_detail_without_retry(
+    status: int, code: str
+) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(status, json={"detail": {"code": code}})
+
+    with pytest.raises(ToolError, match=code):
+        _call(_server(handler), {"question": "q", "connection_label": "sales-local"})
+    assert len(captured) == 1

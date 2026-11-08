@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from auto_ontology.dal import terms as terms_dal
 from auto_ontology.dal.owners import CATALOG_EDIT, edit_subject
 from auto_ontology.server.identity import resolve_internal_user
+from auto_ontology.server.source_context import resolve_semantic_source
 from auto_ontology.server.owners import enforce_edit, owner_from_body
 from auto_ontology.server.sql_attributes import service as dal
 from auto_ontology.server.responses import (
@@ -27,12 +28,14 @@ router = APIRouter()
 
 
 class SqlAttributeValidate(BaseModel):
+    connection_id: str | None = None
     expression: str = Field(..., min_length=1)
     term_id: str | None = None
     attribute_id: str | None = None
 
 
 class SqlAttributeCreate(BaseModel):
+    connection_id: str | None = None
     name: str = Field(..., min_length=1)
     description: str
     expression: str = Field(..., min_length=1)
@@ -42,6 +45,7 @@ class SqlAttributeCreate(BaseModel):
 
 
 class SqlAttributeUpdate(BaseModel):
+    connection_id: str | None = None
     name: str = Field(..., min_length=1)
     description: str
     expression: str = Field(..., min_length=1)
@@ -50,6 +54,7 @@ class SqlAttributeUpdate(BaseModel):
 
 
 class SqlAttributeMetadataPatch(BaseModel):
+    connection_id: str | None = None
     name: str | None = Field(default=None, min_length=1)
     description: str | None = None
     certified: bool | None = None
@@ -64,9 +69,17 @@ def list_sql_attributes() -> dict:
 
 
 @router.get("/sql-attributes/{attr_id}", response_model=SqlAttributeResponse)
-def get_sql_attribute(attr_id: str) -> dict:
+def get_sql_attribute(
+    attr_id: str,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
+) -> dict:
     """One SqlAttribute by id, including its resolved zones."""
-    row = dal.get_full_sql_attribute_by_id(attr_id, zone_ids=None)
+    connection_id = resolve_semantic_source(connection_id, connection_label, target_db)
+    row = dal.get_full_sql_attribute_by_id(
+        attr_id, zone_ids=None, connection_id=connection_id
+    )
     if row is None:
         raise HTTPException(
             status_code=404,
@@ -103,8 +116,8 @@ def get_sql_attribute_description_suggestion(request: Request, attr_id: str) -> 
 def validate_sql_attribute(body: SqlAttributeValidate) -> dict:
     """Validate a SQL expression against the catalog.
 
-    The connector is resolved server-side (never chosen by the client —
-    see ``auto_ontology/connectors/registry.py``). Does not create a SqlAttribute.
+    Select ``connection_id`` when multiple sources are active; an existing
+    attribute inherits its immutable source. Does not create a SqlAttribute.
     Returns 422 when the SQL can't be parsed or doesn't resolve to a
     known table.
     """
@@ -113,8 +126,13 @@ def validate_sql_attribute(body: SqlAttributeValidate) -> dict:
             expression=body.expression,
             term_id=body.term_id,
             attribute_id=body.attribute_id,
+            connection_id=body.connection_id,
         )
-    except (dal.SqlAttributeExpressionConflict, dal.SqlAttributeSqlError) as exc:
+    except (
+        ValueError,
+        dal.SqlAttributeExpressionConflict,
+        dal.SqlAttributeSqlError,
+    ) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"data": result}
 
@@ -123,8 +141,7 @@ def validate_sql_attribute(body: SqlAttributeValidate) -> dict:
 def create_sql_attribute(request: Request, body: SqlAttributeCreate) -> dict:
     """Create a SqlAttribute with its Sql node, linked to a Term.
 
-    The connector is resolved server-side (never chosen by the client —
-    see ``auto_ontology/connectors/registry.py``). ``owner_id``, when set,
+    Select ``connection_id`` when multiple sources are active. ``owner_id``, when set,
     names a user or a group that can edit the catalog; omit it to leave the
     attribute unassigned. The caller is stored as ``created_by`` so the side
     panel can name them. Returns 400 when that id cannot be assigned, 409
@@ -137,6 +154,7 @@ def create_sql_attribute(request: Request, body: SqlAttributeCreate) -> dict:
             description=body.description,
             expression=body.expression,
             term_id=body.term_id,
+            connection_id=body.connection_id,
             source=body.source,
             owner_id=owner_from_body(body.owner_id, CATALOG_EDIT),
             created_by=resolve_internal_user(request, required=False),
@@ -156,8 +174,8 @@ def update_sql_attribute(
 ) -> dict:
     """Replace a SqlAttribute, re-parse SQL, and re-link to a Term.
 
-    The connector is resolved server-side (never chosen by the client —
-    see ``auto_ontology/connectors/registry.py``). Returns 404 when no SqlAttribute
+    Source ownership is inherited; a different ``connection_id`` is rejected.
+    Returns 404 when no SqlAttribute
     with that id exists, 409 on name conflict, 422 when the Term doesn't
     exist or SQL can't be parsed. Returns 403 when the caller may not edit
     this attribute, the same check as the metadata patch.
@@ -172,6 +190,7 @@ def update_sql_attribute(
             description=body.description,
             expression=body.expression,
             term_id=body.term_id,
+            connection_id=body.connection_id,
             source=body.source,
             modified_by=resolve_internal_user(request, required=False),
             touch=True,
@@ -219,6 +238,7 @@ def patch_sql_attribute(
             name=name if isinstance(name, str) else None,
             description=patch.get("description"),
             certified=patch.get("certified"),
+            connection_id=body.connection_id,
             owner_id=owner_id,
             set_owner=set_owner,
             modified_by=resolve_internal_user(request, required=False),

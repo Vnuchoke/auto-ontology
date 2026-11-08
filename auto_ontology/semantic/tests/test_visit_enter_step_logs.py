@@ -9,15 +9,27 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from pytest import LogCaptureFixture, MonkeyPatch
 
 from auto_ontology.semantic import visit_enter
 from auto_ontology.semantic.models import ColumnAttributeSpec
+from auto_ontology.connectors.sources import SourceDescriptor
 
-TABLE = {"id": "t1", "name": "orders", "schema_name": "public", "description": ""}
-CTX = {"columns": [{"name": "status"}, {"name": "total"}], "fks": []}
+TABLE = {
+    "connection_id": "source-sales",
+    "id": "t1",
+    "name": "orders",
+    "schema_name": "public",
+    "description": "",
+}
+CTX = {
+    "connection_id": "source-sales",
+    "columns": [{"name": "status"}, {"name": "total"}],
+    "fks": [],
+}
 
 
 @pytest.fixture
@@ -35,7 +47,18 @@ def _stubbed(monkeypatch: MonkeyPatch) -> None:
     )
     assignment = SimpleNamespace(source_column="status")
 
-    monkeypatch.setattr(visit_enter, "_resolve_connector", lambda _db: object())
+    monkeypatch.setattr(
+        visit_enter,
+        "list_active_sources",
+        lambda: [
+            SourceDescriptor("source-sales", "Sales", "sales", "postgres", "managed")
+        ],
+    )
+    monkeypatch.setattr(
+        visit_enter,
+        "_resolve_connector",
+        lambda _cid: SimpleNamespace(connection_id="source-sales"),
+    )
     monkeypatch.setattr(
         visit_enter, "calculate_columns_profiling", lambda *_a, **_k: {}
     )
@@ -61,18 +84,28 @@ def _stubbed(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(
         visit_enter,
         "fetch_terms_and_attributes_for_table",
-        lambda _id: ([{"id": "term1", "name": "Order"}], []),
+        lambda _id: (
+            [{"id": "term1", "name": "Order", "connection_id": "source-sales"}],
+            [],
+        ),
     )
 
 
 def _run(embedder: Any = None) -> None:
     visit_enter.process_table(
-        TABLE, CTX, domain_summary=None, embedder=embedder, database_name="mydb"
+        TABLE,
+        CTX,
+        connection_id="source-sales",
+        domain_summary=None,
+        embedder=embedder,
+        database_name="mydb",
     )
 
 
 def test_each_step_is_logged(_stubbed: None, caplog: LogCaptureFixture) -> None:
-    embedder = SimpleNamespace(embed_term=lambda *_a: None)
+    embedder = SimpleNamespace(
+        connection_id="source-sales", embed_term=lambda *_a: None
+    )
 
     with caplog.at_level(logging.INFO, logger="auto_ontology.semantic.visit_enter"):
         _run(embedder)
@@ -97,7 +130,9 @@ def test_each_step_is_logged(_stubbed: None, caplog: LogCaptureFixture) -> None:
 def test_steps_are_logged_in_pipeline_order(
     _stubbed: None, caplog: LogCaptureFixture
 ) -> None:
-    embedder = SimpleNamespace(embed_term=lambda *_a: None)
+    embedder = SimpleNamespace(
+        connection_id="source-sales", embed_term=lambda *_a: None
+    )
 
     with caplog.at_level(logging.INFO, logger="auto_ontology.semantic.visit_enter"):
         _run(embedder)
@@ -123,5 +158,34 @@ def test_sampling_skip_is_logged_without_connector(
         _run()
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "[orders] Skipping value sampling — no live connector for 'mydb'" in messages
+    assert (
+        "[orders] Skipping value sampling — no live connector for source 'source-sales'"
+        in messages
+    )
     assert not any("Sampling column values" in m for m in messages)
+
+
+@pytest.mark.parametrize("foreign_row", ["term", "attribute"])
+def test_inline_embedding_validates_whole_projection_before_model(
+    _stubbed: None, monkeypatch: MonkeyPatch, foreign_row: str
+) -> None:
+    terms = [{"id": "term1", "name": "Order", "connection_id": "source-sales"}]
+    attrs = []
+    if foreign_row == "term":
+        terms.append({"id": "term2", "name": "Foreign", "connection_id": "other-sales"})
+    else:
+        attrs.append(
+            {
+                "id": "attr2",
+                "term_name": "Order",
+                "table_id": "t2",
+                "connection_id": "other-sales",
+            }
+        )
+    monkeypatch.setattr(
+        visit_enter, "fetch_terms_and_attributes_for_table", lambda _id: (terms, attrs)
+    )
+    embedder = SimpleNamespace(connection_id="source-sales", embed_term=Mock())
+    with pytest.raises(ValueError, match="source_conflict"):
+        _run(embedder)
+    embedder.embed_term.assert_not_called()

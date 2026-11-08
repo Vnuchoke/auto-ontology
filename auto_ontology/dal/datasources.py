@@ -62,6 +62,37 @@ _NODE_TABLES = {
 }
 
 
+def query_column_description_expr(connection_id: str | None) -> ColumnElement:
+    """Keep attribute fallback descriptions inside the selected source."""
+    if connection_id is None:
+        return column_description_expr()
+    tables = (
+        select(s.catalog_table.c.id)
+        .join(s.catalog_schema)
+        .where(s.catalog_schema.c.database_id == connection_id)
+    )
+    descriptions = []
+    for link in (s.column__has_attribute, s.column__semantic_fk):
+        descriptions.append(
+            select(s.column_attribute.c.description)
+            .select_from(link.join(s.column_attribute))
+            .where(
+                link.c.column_id == s.catalog_column.c.id,
+                s.column_attribute.c.table_id.in_(tables),
+                func.nullif(func.trim(s.column_attribute.c.description), "").is_not(
+                    None
+                ),
+            )
+            .order_by(s.column_attribute.c.id)
+            .limit(1)
+            .correlate(s.catalog_column)
+            .scalar_subquery()
+        )
+    return func.coalesce(
+        func.nullif(func.trim(s.catalog_column.c.description), ""), *descriptions
+    )
+
+
 def _catalog_join():
     """Column → Table → Schema → Database."""
     return (
@@ -90,7 +121,9 @@ def _table_join():
 # ---------------------------------------------------------------------------
 
 
-def fetch_databases(zone_ids: list[str] | None = None) -> list[dict[str, Any]]:
+def fetch_databases(
+    zone_ids: list[str] | None = None, *, connection_id: str | None = None
+) -> list[dict[str, Any]]:
     """Databases with a schema count. ``schemas`` is empty — the tree is lazy."""
     scoped = resolve_accessible_catalog_ids(zone_ids)
 
@@ -98,6 +131,7 @@ def fetch_databases(zone_ids: list[str] | None = None) -> list[dict[str, Any]]:
         select(
             s.catalog_database.c.id,
             s.catalog_database.c.name,
+            s.catalog_database.c.display_label,
             s.catalog_database.c.owner_id,
             func.count(s.catalog_schema.c.id).label("schema_count"),
         )
@@ -110,10 +144,13 @@ def fetch_databases(zone_ids: list[str] | None = None) -> list[dict[str, Any]]:
         .group_by(
             s.catalog_database.c.id,
             s.catalog_database.c.name,
+            s.catalog_database.c.display_label,
             s.catalog_database.c.owner_id,
         )
         .order_by(s.catalog_database.c.name)
     )
+    if connection_id is not None:
+        statement = statement.where(s.catalog_database.c.id == connection_id)
     if scoped is not None:
         statement = statement.where(
             and_(
@@ -126,6 +163,7 @@ def fetch_databases(zone_ids: list[str] | None = None) -> list[dict[str, Any]]:
         {
             "id": r["id"],
             "name": r["name"],
+            "display_label": r["display_label"],
             # Nothing writes a database description, so this is always None.
             # Kept in the shape because callers read the key.
             "description": None,
@@ -142,9 +180,23 @@ def fetch_databases(zone_ids: list[str] | None = None) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def fetch_schema_ids_for_connection(connection_id: str) -> list[str]:
+    """Catalog-only source lookup; never resolves a physical name or credentials."""
+    return [
+        row["id"]
+        for row in store().query_read(
+            select(s.catalog_schema.c.id).where(
+                s.catalog_schema.c.database_id == connection_id
+            )
+        )
+    ]
+
+
 def fetch_schemas_for_database(
     db_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, Any] | None:
     """``{schemas_count, schemas}`` for a database, or ``None`` if it has none.
 
@@ -152,6 +204,8 @@ def fetch_schemas_for_database(
     so a database with no tables produces no rows at all and the caller treats
     that as absent.
     """
+    if connection_id is not None and db_id != connection_id:
+        return None
     scoped = resolve_accessible_catalog_ids(zone_ids)
 
     statement = (
@@ -200,8 +254,11 @@ def fetch_schemas_for_database(
     }
 
 
-def fetch_all_schema_ids() -> list[str]:
-    return [r["id"] for r in store().query_read(select(s.catalog_schema.c.id))]
+def fetch_all_schema_ids(*, connection_id: str | None = None) -> list[str]:
+    statement = select(s.catalog_schema.c.id)
+    if connection_id is not None:
+        statement = statement.where(s.catalog_schema.c.database_id == connection_id)
+    return [r["id"] for r in store().query_read(statement)]
 
 
 def fetch_schema_ids_for_database(database_name: str) -> list[str]:
@@ -227,6 +284,8 @@ def fetch_schema_ids_for_database(database_name: str) -> list[str]:
 
 def fetch_schemas_by_ids(
     relevant_schemas_ids: list | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, str]]:
     """Flat column rows for the catalog map SQL validation is built from.
 
@@ -243,10 +302,14 @@ def fetch_schemas_by_ids(
         s.catalog_database.c.name.label("database_name"),
         s.catalog_schema.c.name.label("table_schema"),
         s.catalog_column.c.data_type,
+        s.catalog_database.c.id.label("connection_id"),
+        s.catalog_schema.c.id.label("schema_id"),
     ).select_from(_catalog_join())
 
     if schema_ids:
         statement = statement.where(s.catalog_schema.c.id.in_(list(schema_ids)))
+    if connection_id is not None:
+        statement = statement.where(s.catalog_database.c.id == connection_id)
 
     return [dict(r) for r in store().query_read(statement)]
 
@@ -280,7 +343,7 @@ def _table_select():
     )
 
 
-def fetch_sorted_tables() -> list[dict[str, Any]]:
+def fetch_sorted_tables(*, connection_id: str | None = None) -> list[dict[str, Any]]:
     """Every table, busiest first.
 
     ``name`` breaks ties. Nearly every table has a query count of zero, so
@@ -288,9 +351,17 @@ def fetch_sorted_tables() -> list[dict[str, Any]]:
     like, differing between calls — a function whose name promises an order has
     to impose a total one.
     """
+    from auto_ontology.dal.source_scope import query_source_scope
+
     query_count = (
         select(func.count(s.sql_query__table.c.sql_query_id))
+        .select_from(s.sql_query__table.join(s.sql_query))
         .where(s.sql_query__table.c.table_id == s.catalog_table.c.id)
+        .where(
+            query_source_scope(connection_id)
+            if connection_id is not None
+            else literal(True)
+        )
         .scalar_subquery()
         .label("query_count")
     )
@@ -301,12 +372,18 @@ def fetch_sorted_tables() -> list[dict[str, Any]]:
             s.catalog_schema.c.name.label("schema_name"),
             s.catalog_table.c.description,
             s.catalog_table.c.pk,
+            s.catalog_schema.c.database_id.label("connection_id"),
             query_count,
         )
         .select_from(
             s.catalog_table.join(
                 s.catalog_schema, s.catalog_table.c.schema_id == s.catalog_schema.c.id
             )
+        )
+        .where(
+            s.catalog_schema.c.database_id == connection_id
+            if connection_id is not None
+            else literal(True)
         )
         .order_by(query_count.desc(), s.catalog_table.c.name)
     )
@@ -318,38 +395,56 @@ def fetch_sorted_tables() -> list[dict[str, Any]]:
             "description": r["description"] or "",
             "query_count": int(r["query_count"] or 0),
             "pk": r["pk"] or [],
+            "connection_id": r["connection_id"],
         }
         for r in rows
     ]
 
 
-def fetch_table_by_id(table_id: str) -> dict[str, Any] | None:
-    rows = store().query_read(_table_select().where(s.catalog_table.c.id == table_id))
-    return _table_row(rows[0]) if rows else None
+def fetch_table_by_id(
+    table_id: str, *, connection_id: str | None = None
+) -> dict[str, Any] | None:
+    statement = _table_select().where(s.catalog_table.c.id == table_id)
+    if connection_id is not None:
+        statement = statement.where(s.catalog_schema.c.database_id == connection_id)
+    rows = store().query_read(statement)
+    if not rows:
+        return None
+    result = _table_row(rows[0])
+    if connection_id is not None:
+        result["connection_id"] = connection_id
+    return result
 
 
-def fetch_table_by_name(name: str) -> dict[str, Any] | None:
-    """The first table of that name, in *any* schema or database.
+def fetch_table_by_name(
+    name: str, *, connection_id: str | None = None
+) -> dict[str, Any] | None:
+    """Resolve one table within a source; ambiguous names never select a row."""
+    statement = _table_select().where(s.catalog_table.c.name == name)
+    if connection_id is not None:
+        statement = statement.where(s.catalog_schema.c.database_id == connection_id)
+    rows = store().query_read(statement.order_by(s.catalog_table.c.id).limit(2))
+    if len(rows) != 1:
+        return None
+    result = _table_row(rows[0])
+    if connection_id is not None:
+        result["connection_id"] = connection_id
+    return result
 
-    Ambiguous by construction: a name is not unique across schemas or
-    databases. Ordered by id so repeated calls agree with each other — which row
-    wins is still arbitrary, but it is the same arbitrary row each time.
-    """
-    rows = store().query_read(
-        _table_select()
-        .where(s.catalog_table.c.name == name)
-        .order_by(s.catalog_table.c.id)
-        .limit(1)
-    )
-    return _table_row(rows[0]) if rows else None
 
-
-def fetch_join_neighbors(table_id: str) -> list[dict[str, Any]]:
+def fetch_join_neighbors(
+    table_id: str, *, connection_id: str | None = None
+) -> list[dict[str, Any]]:
     """Tables joined to this one, in either direction.
 
     A join is undirected, so both ends count — hence the union of the two
     columns rather than a single direction.
     """
+    if (
+        connection_id is not None
+        and fetch_table_by_id(table_id, connection_id=connection_id) is None
+    ):
+        return []
     other = s.catalog_table.alias("other")
     outgoing = (
         select(other.c.id, other.c.name, other.c.description)
@@ -365,6 +460,12 @@ def fetch_join_neighbors(table_id: str) -> list[dict[str, Any]]:
         )
         .where(s.table__join.c.target_table_id == table_id)
     )
+    if connection_id is not None:
+        schemas = select(s.catalog_schema.c.id).where(
+            s.catalog_schema.c.database_id == connection_id
+        )
+        outgoing = outgoing.where(other.c.schema_id.in_(schemas))
+        incoming = incoming.where(other.c.schema_id.in_(schemas))
     return [dict(r) for r in store().query_read(outgoing.union(incoming))]
 
 
@@ -394,7 +495,12 @@ def fetch_join_edges() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def count_columns_for_table(table_id: str) -> int:
+def count_columns_for_table(table_id: str, *, connection_id: str | None = None) -> int:
+    if (
+        connection_id is not None
+        and fetch_table_by_id(table_id, connection_id=connection_id) is None
+    ):
+        return 0
     rows = store().query_read(
         select(func.count(s.catalog_column.c.id).label("total")).where(
             s.catalog_column.c.table_id == table_id
@@ -403,14 +509,23 @@ def count_columns_for_table(table_id: str) -> int:
     return int(rows[0]["total"]) if rows else 0
 
 
-def fetch_parent_table_id_for_column(column_id: str) -> str | None:
+def fetch_parent_table_id_for_column(
+    column_id: str, *, connection_id: str | None = None
+) -> str | None:
+    if connection_id is not None:
+        context = fetch_col_table_contexts(
+            [column_id], connection_id=connection_id
+        ).get(column_id)
+        return context["table_id"] if context else None
     rows = store().query_read(
         select(s.catalog_column.c.table_id).where(s.catalog_column.c.id == column_id)
     )
     return rows[0]["table_id"] if rows else None
 
 
-def fetch_col_table_contexts(col_ids: list[str]) -> dict[str, dict[str, str]]:
+def fetch_col_table_contexts(
+    col_ids: list[str], *, connection_id: str | None = None
+) -> dict[str, dict[str, str]]:
     """Column id → its database/schema/table identity (ids + names).
 
     Ids come back alongside names so a caller that needs to let a client expand
@@ -436,7 +551,14 @@ def fetch_col_table_contexts(col_ids: list[str]) -> dict[str, dict[str, str]]:
                 s.catalog_database.c.name.label("database_name"),
             )
             .select_from(_catalog_join())
-            .where(s.catalog_column.c.id.in_(list(col_ids)))
+            .where(
+                s.catalog_column.c.id.in_(list(col_ids)),
+                *(
+                    [s.catalog_database.c.id == connection_id]
+                    if connection_id is not None
+                    else []
+                ),
+            )
         )
     except Exception:
         logger.warning("fetch_col_table_contexts: query failed", exc_info=True)
@@ -449,6 +571,7 @@ def fetch_col_table_contexts(col_ids: list[str]) -> dict[str, dict[str, str]]:
             "schema_id": r.get("schema_id") or "",
             "schema_name": r.get("schema_name") or "",
             "database_id": r.get("database_id") or "",
+            "connection_id": r.get("database_id") or "",
             "database_name": r.get("database_name") or "",
         }
         for r in rows
@@ -685,6 +808,17 @@ def patch_catalog_node(
         rows = store().query_read(select(table.c.id).where(table.c.id == node_id))
         if not rows:
             continue
+        if label == "Database" and properties.keys() & {
+            "id",
+            "name",
+            "display_label",
+            "configuration_origin",
+            "credential_ref",
+            "connection",
+        }:
+            raise ValueError(
+                "Use the connection lifecycle API to change connection settings"
+            )
         if values:
             store().query_write(
                 update(table).where(table.c.id == node_id).values(**values)
@@ -804,6 +938,7 @@ def fetch_tables_for_schema(
     *,
     database_name: str | None = None,
     zone_ids: list[str] | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Tables in a schema, with column, SQL, and Term counts.
 
@@ -836,6 +971,8 @@ def fetch_tables_for_schema(
         .where(s.catalog_table.c.schema_id == schema_id)
         .order_by(s.catalog_table.c.name)
     )
+    if connection_id is not None:
+        statement = statement.where(s.catalog_database.c.id == connection_id)
     if scoped is not None:
         statement = statement.where(s.catalog_table.c.id.in_(list(scoped["table_ids"])))
 
@@ -845,18 +982,21 @@ def fetch_tables_for_schema(
     # where a table's chips have to arrive from.
     tags = fetch_tags_map(TARGET_TABLE, [row["id"] for row in rows])
     for row in rows:
+        if connection_id is not None:
+            row["connection_id"] = connection_id
         row["tags"] = tags.get(row["id"], [])
     return rows
 
 
 def fetch_all_tables_without_term(
     database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Tables not yet assigned a Term — the work list for term compilation.
 
-    Scoped to one database when *database_name* is given. Several databases can
-    share a store, and each compile pass tags its embeddings with a database name,
-    so an unscoped pass would attribute one database's tables to another.
+    Compilation must pass ``connection_id``. Optional unscoped/physical-name
+    reads remain for administrative inspection only, not executable context.
 
     Note this reads the table's *own* description, not the fallback: a table
     with no Term has no Term description to fall back to.
@@ -867,6 +1007,7 @@ def fetch_all_tables_without_term(
             s.catalog_table.c.name,
             s.catalog_table.c.description,
             s.catalog_schema.c.name.label("schema_name"),
+            s.catalog_schema.c.database_id.label("connection_id"),
         )
         .select_from(_table_join())
         .where(
@@ -878,6 +1019,8 @@ def fetch_all_tables_without_term(
     )
     if database_name is not None:
         statement = statement.where(s.catalog_database.c.name == database_name)
+    if connection_id is not None:
+        statement = statement.where(s.catalog_database.c.id == connection_id)
 
     return [dict(r) for r in store().query_read(statement)]
 
@@ -887,6 +1030,7 @@ def fetch_columns_for_table(
     *,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> dict[str, Any] | None:
     """A table with its columns nested, or ``None`` if the table is missing.
 
@@ -909,7 +1053,14 @@ def fetch_columns_for_table(
             s.catalog_database.c.name.label("database_name"),
         )
         .select_from(_table_join())
-        .where(s.catalog_table.c.id == table_id)
+        .where(
+            s.catalog_table.c.id == table_id,
+            *(
+                [s.catalog_database.c.id == connection_id]
+                if connection_id is not None
+                else []
+            ),
+        )
         .limit(1)
     )
     if not header:
@@ -921,7 +1072,7 @@ def fetch_columns_for_table(
             s.catalog_column.c.ordinal_position,
             s.catalog_column.c.name.label("column_name"),
             s.catalog_column.c.data_type,
-            column_description_expr().label("description"),
+            query_column_description_expr(connection_id).label("description"),
             s.catalog_column.c.description_certified,
             s.catalog_column.c.sample_values,
         )
@@ -940,6 +1091,8 @@ def fetch_columns_for_table(
     tags = fetch_tags_map(TARGET_COLUMN, [column["id"] for column in columns])
 
     table = dict(header[0])
+    if connection_id is not None:
+        table["connection_id"] = connection_id
     table["columns"] = [
         # Rendered, not just decoded: `ColumnSummary.sample_values` is a string
         # list, so the stored types are display text by the time a client sees
@@ -954,7 +1107,9 @@ def fetch_columns_for_table(
     return table
 
 
-def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
+def fetch_tables_by_ids(
+    table_ids: list[str], *, connection_id: str | None = None
+) -> list[dict[str, Any]]:
     """Tables with a name/type/description/sample_values summary of each column.
 
     Returns ``[]`` rather than raising if the query fails: this decorates
@@ -983,6 +1138,7 @@ def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
     semantic_target = s.catalog_column.alias("semantic_fk_target")
     semantic_table = s.catalog_table.alias("semantic_fk_table")
     semantic_schema = s.catalog_schema.alias("semantic_fk_schema")
+    semantic_attribute = s.column_attribute.alias("semantic_fk_attribute")
     semantic_fk_target = (
         select(
             func.concat_ws(
@@ -1009,8 +1165,23 @@ def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
                 semantic_schema,
                 semantic_schema.c.id == semantic_table.c.schema_id,
             )
+            .join(
+                semantic_attribute,
+                semantic_attribute.c.id == s.column__semantic_fk.c.attribute_id,
+            )
         )
-        .where(s.column__semantic_fk.c.column_id == s.catalog_column.c.id)
+        .where(
+            s.column__semantic_fk.c.column_id == s.catalog_column.c.id,
+            *(
+                [
+                    semantic_schema.c.database_id == connection_id,
+                    semantic_attribute.c.table_id == semantic_target.c.table_id,
+                    semantic_attribute.c.source_column == semantic_target.c.name,
+                ]
+                if connection_id is not None
+                else []
+            ),
+        )
         .correlate(s.catalog_column)
         .order_by(
             semantic_schema.c.name,
@@ -1028,10 +1199,13 @@ def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
                 s.catalog_table.c.description,
                 s.catalog_table.c.pk,
                 s.catalog_database.c.name.label("database_name"),
+                s.catalog_database.c.id.label("connection_id"),
                 s.catalog_schema.c.name.label("schema_name"),
                 s.catalog_column.c.name.label("column_name"),
                 s.catalog_column.c.data_type,
-                column_description_expr().label("column_description"),
+                query_column_description_expr(connection_id).label(
+                    "column_description"
+                ),
                 s.catalog_column.c.format,
                 s.catalog_column.c.sample_values,
                 s.catalog_column.c.is_nullable,
@@ -1043,7 +1217,14 @@ def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
                     s.catalog_column.c.table_id == s.catalog_table.c.id,
                 )
             )
-            .where(s.catalog_table.c.id.in_(list(table_ids)))
+            .where(
+                s.catalog_table.c.id.in_(list(table_ids)),
+                *(
+                    [s.catalog_database.c.id == connection_id]
+                    if connection_id is not None
+                    else []
+                ),
+            )
             .order_by(s.catalog_table.c.id, s.catalog_column.c.ordinal_position)
         )
     except Exception:
@@ -1059,6 +1240,7 @@ def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
                 "name": row["name"] or "",
                 "description": row["description"] or "",
                 "database_name": row["database_name"] or "",
+                "connection_id": row["connection_id"],
                 "schema_name": row["schema_name"] or "",
                 "label": "Table",
                 # The prediction graph keys its entities on this: a table
@@ -1086,13 +1268,23 @@ def fetch_tables_by_ids(table_ids: list[str]) -> list[dict[str, Any]]:
     return list(tables.values())
 
 
-def fetch_table_context(table_id: str) -> dict[str, Any]:
+def fetch_table_context(
+    table_id: str, *, connection_id: str | None = None
+) -> dict[str, Any]:
     """``{columns, fks}`` for one table — what the SQL generator is handed.
 
     ``is_foreign_key_target`` marks a column some *other* column already points
     at; ``auto_ontology.semantic.fk_suggester`` drops those from the columns it offers the
     LLM, so it cannot propose an FK that inverts one the catalog already knows.
     """
+    roots = store().query_read(
+        select(s.catalog_schema.c.database_id)
+        .select_from(s.catalog_table.join(s.catalog_schema))
+        .where(s.catalog_table.c.id == table_id)
+    )
+    owner = roots[0]["database_id"] if roots else None
+    if connection_id is not None and owner != connection_id:
+        raise ValueError("Table does not belong to connection_id")
     is_fk_target = (
         select(literal(1))
         .select_from(s.column__foreign_key)
@@ -1115,7 +1307,7 @@ def fetch_table_context(table_id: str) -> dict[str, Any]:
                 s.catalog_column.c.id,
                 s.catalog_column.c.name,
                 s.catalog_column.c.data_type,
-                column_description_expr().label("description"),
+                query_column_description_expr(connection_id).label("description"),
                 s.catalog_column.c.ordinal_position,
                 s.catalog_column.c.sample_values,
                 s.catalog_column.c.format,
@@ -1129,6 +1321,7 @@ def fetch_table_context(table_id: str) -> dict[str, Any]:
     source = s.catalog_column.alias("source_column")
     target = s.catalog_column.alias("target_column")
     target_table = s.catalog_table.alias("target_table")
+    target_schema = s.catalog_schema.alias("target_schema")
     fks = [
         dict(r)
         for r in store().query_read(
@@ -1145,11 +1338,15 @@ def fetch_table_context(table_id: str) -> dict[str, Any]:
                 )
                 .join(target, target.c.id == s.column__foreign_key.c.target_column_id)
                 .join(target_table, target_table.c.id == target.c.table_id)
+                .join(target_schema, target_schema.c.id == target_table.c.schema_id)
             )
-            .where(source.c.table_id == table_id)
+            .where(source.c.table_id == table_id, target_schema.c.database_id == owner)
         )
     ]
-    return {"columns": columns, "fks": fks}
+    result = {"columns": columns, "fks": fks}
+    if owner is not None:
+        result["connection_id"] = owner
+    return result
 
 
 def fetch_tables_and_columns_by_node_ids(
@@ -1158,12 +1355,34 @@ def fetch_tables_and_columns_by_node_ids(
     """Table and column frames for ``CatalogEmbeddingRowsOp``.
 
     *node_ids* mixes table and column ids freely. A table id pulls in all of its
-    columns; a column id pulls in only itself. Both frames carry
-    ``database_name``, and the third return value is the first one found — the
-    caller assumes a single database and there is nothing here that enforces it.
+    columns; a column id pulls in only that column plus its owning table as
+    row-builder context (writers still restrict output to the requested IDs).
+    Both frames carry
+    ``database_name`` and ``connection_id``. Mixed-source inputs are rejected;
+    the third return value remains the physical database name.
     """
     conn = store()
     ids = list(node_ids)
+    requested_tables = (
+        s.catalog_table.c.id.in_(ids)
+        | select(s.catalog_column.c.id)
+        .where(
+            s.catalog_column.c.table_id == s.catalog_table.c.id,
+            s.catalog_column.c.id.in_(ids),
+        )
+        .exists()
+    )
+    owners = conn.query_read(
+        select(s.catalog_database.c.id)
+        .select_from(_table_join())
+        .where(requested_tables)
+        .distinct()
+    )
+    if len(owners) > 1:
+        raise ValueError("Embedding refresh requires a single connection_id")
+    if not owners:
+        return pd.DataFrame(), pd.DataFrame(), ""
+    connection_id = owners[0]["id"]
 
     columns_df = pd.DataFrame(
         [
@@ -1179,12 +1398,16 @@ def fetch_tables_and_columns_by_node_ids(
                     s.catalog_schema.c.name.label("table_schema"),
                     s.catalog_column.c.name.label("column_name"),
                     s.catalog_column.c.data_type,
-                    column_description_expr().label("description"),
+                    query_column_description_expr(connection_id).label("description"),
                     s.catalog_column.c.sample_values,
                     s.catalog_database.c.name.label("database_name"),
+                    s.catalog_database.c.id.label("connection_id"),
                 )
                 .select_from(_catalog_join())
-                .where(s.catalog_table.c.id.in_(ids) | s.catalog_column.c.id.in_(ids))
+                .where(
+                    s.catalog_table.c.id.in_(ids) | s.catalog_column.c.id.in_(ids),
+                    s.catalog_database.c.id == connection_id,
+                )
                 .distinct()
             )
         ]
@@ -1205,13 +1428,25 @@ def fetch_tables_and_columns_by_node_ids(
                     # noticing.
                     s.catalog_table.c.description,
                     s.catalog_database.c.name.label("database_name"),
+                    s.catalog_database.c.id.label("connection_id"),
                 )
                 .select_from(_table_join())
-                .where(s.catalog_table.c.id.in_(ids))
+                .where(
+                    requested_tables,
+                    s.catalog_database.c.id == connection_id,
+                )
             )
         ]
     )
 
+    connection_ids = {
+        str(cid)
+        for frame in (tables_df, columns_df)
+        if not frame.empty
+        for cid in frame["connection_id"]
+    }
+    if len(connection_ids) > 1:
+        raise ValueError("Embedding refresh requires a single connection_id")
     database_name = ""
     for frame in (tables_df, columns_df):
         if not frame.empty:
@@ -1220,7 +1455,7 @@ def fetch_tables_and_columns_by_node_ids(
     return tables_df, columns_df, database_name
 
 
-def fetch_bridge_table_candidates(database_name: str) -> list[dict[str, Any]]:
+def fetch_bridge_table_candidates(connection_id: str) -> list[dict[str, Any]]:
     """Pure-FK junction tables eligible for a bridge SqlAttribute.
 
     A table qualifies when **every** column is a foreign key — by a real
@@ -1235,6 +1470,8 @@ def fetch_bridge_table_candidates(database_name: str) -> list[dict[str, Any]]:
     column whose table was never ingested passes the first and fails the
     second.
     """
+    from auto_ontology.dal.source_scope import definition_source_scope
+
     fk_target = s.catalog_column.alias("fk_target")
     fk_table = s.catalog_table.alias("fk_table")
     fk_schema = s.catalog_schema.alias("fk_schema")
@@ -1287,6 +1524,13 @@ def fetch_bridge_table_candidates(database_name: str) -> list[dict[str, Any]]:
         .where(
             func.coalesce(fk_table.c.id, sem_table.c.id).isnot(None),
             func.coalesce(fk_target.c.id, sem_target.c.id).isnot(None),
+            func.coalesce(fk_schema.c.database_id, sem_schema.c.database_id)
+            == connection_id,
+            s.catalog_column.c.table_id.in_(
+                select(s.catalog_table.c.id)
+                .select_from(s.catalog_table.join(s.catalog_schema))
+                .where(s.catalog_schema.c.database_id == connection_id)
+            ),
         )
         .distinct()
         .subquery("resolved")
@@ -1336,6 +1580,9 @@ def fetch_bridge_table_candidates(database_name: str) -> list[dict[str, Any]]:
         )
         .where(
             s.sql_attribute.c.source == SQL_ATTR_SOURCE_BRIDGE,
+            definition_source_scope(
+                s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+            ),
             s.sql_query__table.c.table_id == s.catalog_table.c.id,
         )
         .exists()
@@ -1350,7 +1597,7 @@ def fetch_bridge_table_candidates(database_name: str) -> list[dict[str, Any]]:
         )
         .select_from(_table_join())
         .where(
-            s.catalog_database.c.name == database_name,
+            s.catalog_database.c.id == connection_id,
             columns_count >= 2,
             ~has_attribute_anywhere,
             ~already_bridged,
@@ -1395,6 +1642,8 @@ def find_column_id_by_table_and_name(
     table_name: str,
     column_name: str,
     database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> str | None:
     """Resolve a ``table.column`` reference from generated SQL to its Column id.
 
@@ -1417,21 +1666,21 @@ def find_column_id_by_table_and_name(
         func.lower(s.catalog_table.c.name) == table_name.lower(),
         func.lower(s.catalog_column.c.name) == column_name.lower(),
     ]
-    if database_name:
+    if database_name or connection_id is not None:
         join = join.join(
             s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
         ).join(
             s.catalog_database,
             s.catalog_database.c.id == s.catalog_schema.c.database_id,
         )
-        where.append(s.catalog_database.c.name == database_name)
-        limit = 1
-    else:
-        limit = 2
+        if connection_id is not None:
+            where.append(s.catalog_database.c.id == connection_id)
+        elif database_name:
+            where.append(s.catalog_database.c.name == database_name)
     rows = store().query_read(
-        select(s.catalog_column.c.id).select_from(join).where(*where).limit(limit)
+        select(s.catalog_column.c.id).select_from(join).where(*where).limit(2)
     )
-    if not database_name and len(rows) > 1:
+    if len(rows) > 1:
         logger.info(
             "find_column_id_by_table_and_name: ambiguous match for %s.%s "
             "with no database_name given — treating as unresolved",
@@ -1443,7 +1692,10 @@ def find_column_id_by_table_and_name(
 
 
 def find_table_id_by_name(
-    table_name: str, database_name: str | None = None
+    table_name: str,
+    database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> str | None:
     """Resolve a bare table name (from a join-path hop) to its Table id.
 
@@ -1455,21 +1707,21 @@ def find_table_id_by_name(
         return None
     join = s.catalog_table
     where = [func.lower(s.catalog_table.c.name) == table_name.lower()]
-    if database_name:
+    if database_name or connection_id is not None:
         join = s.catalog_table.join(
             s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
         ).join(
             s.catalog_database,
             s.catalog_database.c.id == s.catalog_schema.c.database_id,
         )
-        where.append(s.catalog_database.c.name == database_name)
-        limit = 1
-    else:
-        limit = 2
+        if connection_id is not None:
+            where.append(s.catalog_database.c.id == connection_id)
+        elif database_name:
+            where.append(s.catalog_database.c.name == database_name)
     rows = store().query_read(
-        select(s.catalog_table.c.id).select_from(join).where(*where).limit(limit)
+        select(s.catalog_table.c.id).select_from(join).where(*where).limit(2)
     )
-    if not database_name and len(rows) > 1:
+    if len(rows) > 1:
         logger.info(
             "find_table_id_by_name: ambiguous match for %s with no "
             "database_name given — treating as unresolved",
@@ -1480,7 +1732,10 @@ def find_table_id_by_name(
 
 
 def find_table_key_columns(
-    table_name: str, database_name: str | None = None
+    table_name: str,
+    database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, list[str]]:
     """Return ``{"pk": [...], "unique": [...]}`` column names (lowercased) for
     a bare table name, used to detect a vacuous ``GROUP BY``/``PARTITION BY``
@@ -1500,21 +1755,24 @@ def find_table_key_columns(
         return empty
     join = s.catalog_table
     where = [func.lower(s.catalog_table.c.name) == table_name.lower()]
-    if database_name:
+    if database_name or connection_id is not None:
         join = s.catalog_table.join(
             s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
         ).join(
             s.catalog_database,
             s.catalog_database.c.id == s.catalog_schema.c.database_id,
         )
-        where.append(s.catalog_database.c.name == database_name)
+        if connection_id is not None:
+            where.append(s.catalog_database.c.id == connection_id)
+        elif database_name:
+            where.append(s.catalog_database.c.name == database_name)
     rows = store().query_read(
         select(s.catalog_table.c.id, s.catalog_table.c.pk)
         .select_from(join)
         .where(*where)
-        .limit(1)
+        .limit(2)
     )
-    if not rows:
+    if len(rows) != 1:
         return empty
     table_id, pk = rows[0]["id"], rows[0]["pk"]
     pk_cols = [str(c).lower() for c in (pk or [])]

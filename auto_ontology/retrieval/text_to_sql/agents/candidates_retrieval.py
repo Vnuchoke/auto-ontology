@@ -19,7 +19,6 @@ Responsibilities:
 
 import logging
 
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict
 
@@ -38,6 +37,7 @@ from auto_ontology.dal.custom_analyses import custom_analysis_exists
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
 from auto_ontology.utils.llm_invoke import invoke_with_structured_output
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent
+from auto_ontology.retrieval.text_to_sql.source_hits import source_owned_hits
 from auto_ontology.retrieval.text_to_sql.models import (
     CandidateFilterModel,
     ColumnAttributeSpec,
@@ -63,18 +63,22 @@ def _search_by_label(
     label: str,
     k: int,
     database_name: str | None = None,
+    *,
+    connection_id: str,
 ) -> list[dict]:
     """Return up to *k* VDB hits for *label*."""
     try:
-        return list(
+        hits = list(
             search_semantic_index(
                 retriever,
                 entity,
                 label_filter=[label],
                 per_label_k=k,
                 database_name=database_name,
+                connection_id=connection_id,
             )
         )
+        return source_owned_hits(hits, label, connection_id=connection_id)
     except Exception:
         logger.warning("%s search failed for entity %r", label, entity, exc_info=True)
         return []
@@ -118,79 +122,6 @@ def _dedupe_best_score(hits: list[dict]) -> list[dict]:
         result,
         key=lambda h: float(h.get("score") or float("inf")),
     )
-
-
-def _database_name(hit: dict) -> str | None:
-    """Return a normalized database name from a semantic hit."""
-    database_name = str(hit.get("database_name") or "").strip()
-    return database_name or None
-
-
-def _score(hit: dict) -> float:
-    """Return a sortable semantic distance, treating missing scores as worst."""
-    score = hit.get("score")
-    return float(score) if score is not None else float("inf")
-
-
-def _select_candidate_database(
-    column_hits: list[dict],
-    custom_hits: list[dict],
-    sql_attribute_hits: list[dict],
-) -> tuple[str | None, dict[str, dict[str, Any]]]:
-    """Select the database that covers the most searched entities.
-
-    Databases are ranked by distinct ColumnAttribute ``query_entity`` coverage,
-    then total hits across all candidate types, aggregate semantic distance,
-    and finally database name for deterministic ties.
-    """
-    stats: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"entities": set(), "hit_count": 0, "score_total": 0.0}
-    )
-
-    for hit in column_hits:
-        database_name = _database_name(hit)
-        if database_name is None:
-            continue
-        entity = str(hit.get("query_entity") or "").strip()
-        if entity:
-            stats[database_name]["entities"].add(entity)
-        stats[database_name]["hit_count"] += 1
-        stats[database_name]["score_total"] += _score(hit)
-
-    for hit in [*custom_hits, *sql_attribute_hits]:
-        database_name = _database_name(hit)
-        if database_name is None:
-            continue
-        stats[database_name]["hit_count"] += 1
-        stats[database_name]["score_total"] += _score(hit)
-
-    if not stats:
-        return None, {}
-
-    selected_database = min(
-        stats,
-        key=lambda database_name: (
-            -len(stats[database_name]["entities"]),
-            -stats[database_name]["hit_count"],
-            stats[database_name]["score_total"],
-            database_name,
-        ),
-    )
-    return selected_database, dict(stats)
-
-
-def _filter_hits_to_database(hits: list[dict], database_name: str) -> list[dict]:
-    """Keep only semantic hits belonging to *database_name*."""
-    return [hit for hit in hits if _database_name(hit) == database_name]
-
-
-def _covered_entities(column_hits: list[dict]) -> set[str]:
-    """Return entities represented by the retained ColumnAttribute hits."""
-    return {
-        str(hit.get("query_entity")).strip()
-        for hit in column_hits
-        if str(hit.get("query_entity") or "").strip()
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +402,9 @@ class CandidateRetrievalAgent(BaseAgent):
         llm = state["llm"]
         semantic_retriever = state.get("semantic_retriever")
         target_db = path_state.get("target_db")
+        connection_id = state["connection_id"]
+        if not target_db:
+            raise ValueError("Resolved source database is required before retrieval.")
         raw_evidence = state.get("evidence")
         evidence = (
             raw_evidence.strip()
@@ -486,7 +420,7 @@ class CandidateRetrievalAgent(BaseAgent):
         if semantic_retriever is not None:
             clean_entities = entities
 
-            has_custom = custom_analysis_exists(target_db)
+            has_custom = custom_analysis_exists(connection_id=connection_id)
             if not has_custom:
                 self.logger.info(
                     "No CustomAnalysis nodes found for database %r — skipping VDB search",
@@ -566,12 +500,18 @@ class CandidateRetrievalAgent(BaseAgent):
 
             with ThreadPoolExecutor(max_workers=len(search_tasks) or 1) as pool:
                 futures = {
-                    pool.submit(_search_by_label, *args): key
+                    pool.submit(
+                        _search_by_label, *args, connection_id=connection_id
+                    ): key
                     for key, args in search_tasks
                 }
                 for future in as_completed(futures):
                     key = futures[future]
-                    result = future.result()
+                    result = [
+                        hit
+                        for hit in future.result()
+                        if hit.get("connection_id") == connection_id
+                    ]
                     if key == "custom":
                         all_custom_hits = result
                     elif key == "sql_attr":
@@ -590,96 +530,6 @@ class CandidateRetrievalAgent(BaseAgent):
                             tagged = dict(hit)
                             tagged["query_entity"] = entity
                             all_col_attr_hits.append(tagged)
-
-            if target_db is None:
-                selected_database, database_stats = _select_candidate_database(
-                    all_col_attr_hits,
-                    all_custom_hits,
-                    all_sql_attr_hits,
-                )
-                if selected_database is None:
-                    self.logger.warning(
-                        "No database-scoped semantic hits found; dropping %d "
-                        "hits without database_name",
-                        len(all_col_attr_hits)
-                        + len(all_custom_hits)
-                        + len(all_sql_attr_hits),
-                    )
-                    all_col_attr_hits = []
-                    all_custom_hits = []
-                    all_sql_attr_hits = []
-                else:
-                    target_db = selected_database
-                    initial_hit_count = (
-                        len(all_col_attr_hits)
-                        + len(all_custom_hits)
-                        + len(all_sql_attr_hits)
-                    )
-                    selected_stats = database_stats[selected_database]
-                    self.logger.info(
-                        "Selected candidate database %r: %d entities covered, "
-                        "%d hits, aggregate score %.4f",
-                        selected_database,
-                        len(selected_stats["entities"]),
-                        selected_stats["hit_count"],
-                        selected_stats["score_total"],
-                    )
-
-                    all_col_attr_hits = _filter_hits_to_database(
-                        all_col_attr_hits, selected_database
-                    )
-                    all_custom_hits = _filter_hits_to_database(
-                        all_custom_hits, selected_database
-                    )
-                    all_sql_attr_hits = _filter_hits_to_database(
-                        all_sql_attr_hits, selected_database
-                    )
-                    retained_hit_count = (
-                        len(all_col_attr_hits)
-                        + len(all_custom_hits)
-                        + len(all_sql_attr_hits)
-                    )
-                    self.logger.info(
-                        "Dropped %d semantic hits outside candidate database %r",
-                        initial_hit_count - retained_hit_count,
-                        selected_database,
-                    )
-
-                    covered_entities = _covered_entities(all_col_attr_hits)
-                    uncovered_entities = [
-                        entity
-                        for entity in clean_entities
-                        if entity not in covered_entities
-                    ]
-                    if uncovered_entities:
-                        self.logger.info(
-                            "Backfilling %d uncovered entities in database %r: %s",
-                            len(uncovered_entities),
-                            selected_database,
-                            uncovered_entities,
-                        )
-                        with ThreadPoolExecutor(
-                            max_workers=len(uncovered_entities)
-                        ) as pool:
-                            futures = {
-                                pool.submit(
-                                    _search_by_label,
-                                    semantic_retriever,
-                                    entity,
-                                    LABEL_COLUMN_ATTRIBUTE,
-                                    2,
-                                    selected_database,
-                                ): entity
-                                for entity in uncovered_entities
-                            }
-                            for future in as_completed(futures):
-                                entity = futures[future]
-                                for hit in _filter_hits_to_database(
-                                    future.result(), selected_database
-                                ):
-                                    tagged = dict(hit)
-                                    tagged["query_entity"] = entity
-                                    all_col_attr_hits.append(tagged)
 
         if _all_bridge_sourced(all_sql_attr_hits):
             # All hits are structural bridge-table joins — nothing to judge

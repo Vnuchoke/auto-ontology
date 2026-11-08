@@ -36,7 +36,7 @@ from auto_ontology.dal.session import store, write_transaction
 
 
 def db_exists(db_node):
-    """Return ``(id, loaded)`` for a database, or ``(None, None)``.
+    """Return ``(id, loaded)`` by source ID only, or ``(None, None)``.
 
     ``loaded`` answers "does this database have anything hanging off it", which
     decides whether ``populate_db`` does a first-time load or a diff — whether it
@@ -50,7 +50,7 @@ def db_exists(db_node):
             .where(s.catalog_schema.c.database_id == s.catalog_database.c.id)
             .scalar_subquery()
             .label("children"),
-        ).where(s.catalog_database.c.name == db_node.get_name())
+        ).where(s.catalog_database.c.id == db_node.get_id())
     )
     if not rows:
         return None, None

@@ -10,8 +10,20 @@ import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from auto_ontology.connectors.sources import SourceDescriptor
+
 from auto_ontology.semantic.models import ProcessTableResult
 from auto_ontology.semantic.pipeline import compile_semantic_layer
+
+
+@pytest.fixture(autouse=True)
+def active_source(monkeypatch):
+    monkeypatch.setattr(
+        "auto_ontology.connectors.sources.list_active_sources",
+        lambda: [SourceDescriptor("dbx", "Test", "sales", "postgres", "managed")],
+    )
 
 
 @patch("auto_ontology.semantic.pipeline.process_table")
@@ -26,12 +38,12 @@ def test_compile_processes_all_tables(
 ) -> None:
     """Two tables → two process_table calls → count == 2."""
     mock_fetch_tables.return_value = [
-        {"id": "t1", "name": "orders", "description": ""},
-        {"id": "t2", "name": "customers", "description": ""},
+        {"id": "t1", "name": "orders", "description": "", "connection_id": "dbx"},
+        {"id": "t2", "name": "customers", "description": "", "connection_id": "dbx"},
     ]
     mock_fetch_ctx.side_effect = [
-        {"columns": [{"name": "amount"}], "fks": []},
-        {"columns": [{"name": "name"}], "fks": []},
+        {"columns": [{"name": "amount"}], "fks": [], "connection_id": "dbx"},
+        {"columns": [{"name": "name"}], "fks": [], "connection_id": "dbx"},
     ]
 
     count = compile_semantic_layer("dbx")
@@ -49,10 +61,14 @@ def test_term_commits_follow_canonical_order_when_llm_completion_is_reversed(
     mock_fetch_ctx: MagicMock,
 ) -> None:
     mock_fetch_tables.return_value = [
-        {"id": "z-id", "name": "zeta", "schema_name": "sales"},
-        {"id": "a-id", "name": "alpha", "schema_name": "sales"},
+        {"id": "z-id", "name": "zeta", "schema_name": "sales", "connection_id": "dbx"},
+        {"id": "a-id", "name": "alpha", "schema_name": "sales", "connection_id": "dbx"},
     ]
-    mock_fetch_ctx.return_value = {"columns": [{"name": "id"}], "fks": []}
+    mock_fetch_ctx.return_value = {
+        "columns": [{"name": "id"}],
+        "fks": [],
+        "connection_id": "dbx",
+    }
     zeta_ready = threading.Event()
     commits: list[str] = []
 
@@ -88,9 +104,9 @@ def test_compile_skips_columnless_table(
 ) -> None:
     """Table with no columns is skipped without calling process_table."""
     mock_fetch_tables.return_value = [
-        {"id": "t1", "name": "empty_table", "description": ""}
+        {"id": "t1", "name": "empty_table", "description": "", "connection_id": "dbx"}
     ]
-    mock_fetch_ctx.return_value = {"columns": [], "fks": []}
+    mock_fetch_ctx.return_value = {"columns": [], "fks": [], "connection_id": "dbx"}
 
     count = compile_semantic_layer("dbx")
 
@@ -111,8 +127,14 @@ def test_compile_continues_after_error(
     _mock_process: MagicMock,
 ) -> None:
     """process_table raising an exception should not abort the loop."""
-    mock_fetch_tables.return_value = [{"id": "t1", "name": "orders", "description": ""}]
-    mock_fetch_ctx.return_value = {"columns": [{"name": "x"}], "fks": []}
+    mock_fetch_tables.return_value = [
+        {"id": "t1", "name": "orders", "description": "", "connection_id": "dbx"}
+    ]
+    mock_fetch_ctx.return_value = {
+        "columns": [{"name": "x"}],
+        "fks": [],
+        "connection_id": "dbx",
+    }
 
     count = compile_semantic_layer("dbx")
 

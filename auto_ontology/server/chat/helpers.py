@@ -7,10 +7,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictStr
 
 # Re-exported so the router (and any other server-side consumer) can keep
 # importing NODE_LABELS from here. The dict itself now lives next to the
@@ -23,10 +23,23 @@ from auto_ontology.retrieval.text_to_sql.node_labels import NODE_LABELS
 __all__ = [
     "NODE_LABELS",
     "ChatRequest",
+    "ManualMessageRequest",
     "build_result_message",
     "charts_to_fenced_content",
     "stringify_sql_response",
 ]
+
+
+class ManualMessageRequest(BaseModel):
+    """A caller-produced turn; source selection is validated by the shared DAL."""
+
+    role: Literal["user", "assistant"]
+    content: str = ""
+    sql_code: str | None = None
+    sql_response: str | None = None
+    connection_id: StrictStr | None = None
+    connection_label: StrictStr | None = None
+    target_db: StrictStr | None = None
 
 
 class ChatRequest(BaseModel):
@@ -55,12 +68,20 @@ class ChatRequest(BaseModel):
     # False -> exclude prediction; classify as information or calculation
     # None  -> classify among all intents (default)
     prediction: bool | None = None
-    # Scope retrieval/SQL to one connected database. When omitted (and more
-    # than one connector is loaded), the pipeline does not pin a database.
-    target_db: str | None = Field(
+    connection_id: StrictStr | None = Field(
+        default=None,
+        description="Exact active source ID; mutually exclusive with connection_label and target_db.",
+    )
+    connection_label: StrictStr | None = Field(
+        default=None,
+        description="Source display label (PostgreSQL normalized); mutually exclusive with other selectors.",
+    )
+    target_db: StrictStr | None = Field(
         default=None,
         description=(
-            "Catalog database UUID or database name used to scope retrieval and SQL."
+            "Legacy source UUID or unambiguous physical database name (not a label). "
+            "Mutually exclusive with connection_id and connection_label. With no "
+            "selector, only a single active source can be selected automatically."
         ),
     )
 

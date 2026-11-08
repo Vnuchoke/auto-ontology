@@ -13,7 +13,9 @@ from auto_ontology.connectors.kyuubi import KyuubiDatabase
 from auto_ontology.connectors.mysql import MySQLDatabase
 from auto_ontology.connectors.postgres import PostgresDatabase
 from auto_ontology.connectors.registry import (
+    get_connector,
     get_connectors,
+    get_connectors_for_subject_token,
     invalidate_connectors_cache,
 )
 from auto_ontology.connectors.snowflake import SnowflakeDatabase
@@ -32,6 +34,8 @@ __all__ = [
     "SnowflakeDatabase",
     "SQLiteDatabase",
     "TrinoDatabase",
+    "get_connector",
     "get_connectors",
+    "get_connectors_for_subject_token",
     "invalidate_connectors_cache",
 ]

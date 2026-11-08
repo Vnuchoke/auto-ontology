@@ -581,7 +581,7 @@ def _judge_with_llm(
 # ---------------------------------------------------------------------------
 
 
-def suggest_sql_attributes(database_name: str) -> int:
+def suggest_sql_attributes(connection_id: str) -> int:
     """Suggest and persist SqlAttributes from query history for every Term.
 
     For each Term:
@@ -595,8 +595,11 @@ def suggest_sql_attributes(database_name: str) -> int:
 
     Returns the total number of new SqlAttribute nodes written.
     """
+    from auto_ontology.semantic.domain import selected_source
+
+    database_name = selected_source(connection_id).database_name
     logger.info("Collecting SQL expressions per term…")
-    term_rows = fetch_terms_with_sqls(SEMANTIC_SOURCE, database_name=database_name)
+    term_rows = fetch_terms_with_sqls(SEMANTIC_SOURCE, connection_id=connection_id)
 
     if not term_rows:
         logger.info(
@@ -612,7 +615,7 @@ def suggest_sql_attributes(database_name: str) -> int:
 
     schema_map: dict[str, str] = {}
     try:
-        schema_map = fetch_table_schema_map(database_name)
+        schema_map = fetch_table_schema_map(connection_id)
         logger.info(
             "Loaded schema map: %d table(s) with schema qualifiers.", len(schema_map)
         )
@@ -711,7 +714,7 @@ def suggest_sql_attributes(database_name: str) -> int:
                     description=s.description,
                     expression=valid_sql,
                     term_id=term_id,
-                    connector=database_name,
+                    connection_id=connection_id,
                     source=SQL_ATTR_SOURCE_SQL,
                 )
                 attr_id: str = row_result["id"]

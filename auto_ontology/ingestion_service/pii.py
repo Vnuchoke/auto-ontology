@@ -25,17 +25,17 @@ from auto_ontology.pii_detection.service import propagate_pii_to_attributes
 logger = logging.getLogger(__name__)
 
 
-def run_pii_propagation(label: str) -> None:
+def run_pii_propagation(label: str, *, connection_id: str) -> None:
     """Tag attributes of PII columns, swallowing a failure.
 
     *label* names the pass or database in the log line.
     """
     try:
-        propagate_pii_to_attributes()
+        propagate_pii_to_attributes(connection_id=connection_id)
     except Exception:
         logger.exception("%s: could not propagate PII tags to attributes", label)
 
 
-async def run_pii_propagation_in_thread(label: str) -> None:
+async def run_pii_propagation_in_thread(label: str, *, connection_id: str) -> None:
     """:func:`run_pii_propagation`, off the event loop."""
-    await asyncio.to_thread(run_pii_propagation, label)
+    await asyncio.to_thread(run_pii_propagation, label, connection_id=connection_id)

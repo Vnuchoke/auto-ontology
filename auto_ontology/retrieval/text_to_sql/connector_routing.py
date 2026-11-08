@@ -66,6 +66,35 @@ def resolve_connector_from_tables(
     if not connectors:
         return None
 
+    tables = list(tables or [])
+    connection_ids = {
+        table["connection_id"]
+        for table in tables
+        if isinstance(table, dict) and table.get("connection_id")
+    }
+    if len(connection_ids) > 1:
+        raise ValueError("Relevant tables span multiple source connections.")
+    if connection_ids:
+        connection_id = next(iter(connection_ids))
+        matches = [
+            connector
+            for connector in connectors
+            if getattr(connector, "connection_id", None) == connection_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "No unique configured connector matches the source connection."
+            )
+        return matches[0]
+
+    # CID-aware runtime connectors must never route legacy unowned dependencies.
+    if any(getattr(connector, "connection_id", None) for connector in connectors):
+        if tables:
+            raise ValueError("Relevant tables do not identify a source connection.")
+        if len(connectors) == 1:
+            return connectors[0]
+        raise ValueError("Multiple source connections require an explicit selection.")
+
     db_to_connector: dict[str, SQLDatabase] = {
         str(getattr(c, "database_name", "")): c
         for c in connectors

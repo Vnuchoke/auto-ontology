@@ -6,6 +6,8 @@
 
 from unittest.mock import patch
 
+from auto_ontology.connectors.sources import SourceDescriptor
+
 from auto_ontology.semantic.bridge_tables import build_bridge_tables_sql_attributes
 
 
@@ -18,6 +20,12 @@ def test_structural_bridge_is_marked_before_downstream_skip() -> None:
     }
 
     with (
+        patch(
+            "auto_ontology.connectors.sources.list_active_sources",
+            return_value=[
+                SourceDescriptor("warehouse", "Test", "sales", "postgres", "managed")
+            ],
+        ),
         patch(
             "auto_ontology.semantic.bridge_tables.fetch_bridge_table_candidates",
             return_value=[candidate],

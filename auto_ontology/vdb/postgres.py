@@ -6,8 +6,8 @@
 
 Backed by :class:`langchain_postgres.PGVectorStore` (the v2 vector store API).
 Records are carried as :class:`langchain_core.documents.Document` objects
-throughout. Per-database identification is stored in a real ``database_name``
-column so it can be used as a delete/search filter.
+throughout. ``connection_id`` is the promoted source identity; physical
+``database_name`` is descriptive metadata, never a routing or deletion key.
 """
 
 from __future__ import annotations
@@ -25,10 +25,17 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_postgres import Column, PGEngine, PGVectorStore
 
+from auto_ontology.vdb.records import (
+    global_pql_projection_id,
+    projection_id,
+    validate_global_pql_metadata,
+)
+
 logger = logging.getLogger(__name__)
 
 _DATABASE_METADATA_COLUMN = "database_name"
 _LABEL_METADATA_COLUMN = "label"
+_CONNECTION_METADATA_COLUMN = "connection_id"
 
 
 class _UnusableEmbeddings(Embeddings):
@@ -143,9 +150,8 @@ class PostgresVDB:
     pipeline are bulk-loaded into PGVectorStore via ``add_embeddings`` so we
     don't re-run the embedder on the write path.
 
-    The metadata field ``database_name`` is promoted to a real column on the
-    underlying table so it can be used as a filter for bulk deletes and
-    similarity searches.
+    Source projections use stable vector IDs and a promoted ``connection_id``
+    column for scoped deletion and similarity search.
     """
 
     # Tells upstream ``search_semantic_index`` to build per-query metadata
@@ -171,18 +177,40 @@ class PostgresVDB:
 
         self._engine: Optional[PGEngine] = None
         self._store: Optional[PGVectorStore] = None
-        self.vector_size: Optional[int] = kwargs.get("vector_size", 2048)
-        # Resetting the database embeddings prior to ingestion
-        # In order to support without recreate:
-        # 1. The ingestion should return which tables/columns were added/updated/deleted
-        # 2. The implemtation should support be fault tolerant and support incremental ingestion, which is challenging.
+        self.vector_size: Optional[int] = kwargs.get("vector_size")
         self.database_name = kwargs.get("database_name")
-        if self.database_name and reset:
-            ids = self.delete_by_database(self.database_name)
-            logger.info(
-                "PostgresVDB.delete_by_database: deleted %d rows for database %s",
-                len(ids),
-                self.database_name,
+        self.global_pql: bool = kwargs.get("global_pql", False)
+        self.connection_id = kwargs.get("connection_id")
+        if self.global_pql and self.connection_id is not None:
+            raise ValueError(
+                "invalid_global_pql: a global PQL client cannot bind a source"
+            )
+        if self.connection_id is not None:
+            self._source_scope(self.connection_id)
+        if reset:
+            self.delete_by_connection(self._source_scope(self.connection_id))
+
+    def _source_scope(self, connection_id: Any) -> str:
+        """Validate source selection before any store or embedding I/O."""
+        if self.global_pql:
+            raise ValueError("invalid_global_pql: global PQL cannot select a source")
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise ValueError("source_required: a single connection_id is required")
+        if self.connection_id is not None and connection_id != self.connection_id:
+            raise ValueError("source_conflict: connection_id differs from bound source")
+        return connection_id
+
+    def _require_source_schema(self) -> None:
+        """Existing collections must be explicitly migrated, never backfilled here."""
+        with psycopg.connect(self.connection_string) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = %s AND column_name = 'connection_id' AND data_type = 'text'",
+                (self.schema_name, self.collection_name),
+            ).fetchone()
+        if row is None:
+            raise ValueError(
+                "source_not_ready: vector collection requires identity migration"
             )
 
     # ------------------------------------------------------------------
@@ -245,17 +273,21 @@ class PostgresVDB:
                 )
             conn.commit()
 
-    def _get_store(self) -> Optional[PGVectorStore]:
+    def _get_store(self, *, create: bool = False) -> Optional[PGVectorStore]:
         """Return the vector store, creating the table on first write.
 
-        If the table doesn't exist and ``vector_size`` is not provided (e.g.
-        on read paths), returns ``None`` so callers can short-circuit.
+        Missing collections return ``None`` unless explicitly creating with a
+        known dimension. Existing legacy schemas require operator migration.
         """
         if self._store is not None:
             return self._store
 
-        engine = self._get_engine()
         if not self._table_exists():
+            if not create:
+                return None
+            if not self.vector_size:
+                raise ValueError("vector_size is required to create a collection")
+            engine = self._get_engine()
             self._ensure_schema()
             engine.init_vectorstore_table(
                 table_name=self.collection_name,
@@ -264,16 +296,31 @@ class PostgresVDB:
                 metadata_columns=[
                     Column(_DATABASE_METADATA_COLUMN, "VARCHAR(100)", nullable=True),
                     Column(_LABEL_METADATA_COLUMN, "VARCHAR(100)", nullable=True),
+                    Column(_CONNECTION_METADATA_COLUMN, "TEXT", nullable=True),
                 ],
             )
+            with psycopg.connect(self.connection_string) as conn:
+                conn.execute(
+                    sql.SQL(
+                        "CREATE INDEX IF NOT EXISTS {} ON {} (connection_id)"
+                    ).format(
+                        sql.Identifier(f"ix_{self.collection_name}_connection_id"),
+                        sql.Identifier(self.schema_name, self.collection_name),
+                    )
+                )
             self._create_vector_index()
 
+        self._require_source_schema()
         self._store = PGVectorStore.create_sync(
-            engine=engine,
+            engine=self._get_engine(),
             embedding_service=self.embeddings,
             table_name=self.collection_name,
             schema_name=self.schema_name,
-            metadata_columns=[_DATABASE_METADATA_COLUMN, _LABEL_METADATA_COLUMN],
+            metadata_columns=[
+                _DATABASE_METADATA_COLUMN,
+                _LABEL_METADATA_COLUMN,
+                _CONNECTION_METADATA_COLUMN,
+            ],
         )
         return self._store
 
@@ -336,7 +383,7 @@ class PostgresVDB:
 
     def create_index(self, **kwargs: Any) -> str:
         """Ensure the pgvector extension and underlying table exist."""
-        self._get_store()
+        self._get_store(create=True)
         return self.collection_name
 
     # ------------------------------------------------------------------
@@ -349,9 +396,10 @@ class PostgresVDB:
         batch_size: int = 500,
         **kwargs: Any,
     ) -> int:
-        """Bulk-insert records, returning the number of rows written."""
+        """Upsert source projections, returning the number of rows written."""
         documents: list[Document] = []
         embeddings: list[list[float]] = []
+        ids: list[str] = []
         skipped = 0
 
         for record in _flatten(records):
@@ -363,6 +411,19 @@ class PostgresVDB:
             if not embedding:
                 skipped += 1
                 continue
+
+            if self.global_pql:
+                validate_global_pql_metadata(metadata)
+                ids.append(
+                    global_pql_projection_id(self.collection_name, metadata["id"])
+                )
+            else:
+                if metadata.get("label") == "PqlAnalysis":
+                    raise ValueError(
+                        "invalid_global_pql: use the explicit global PQL client"
+                    )
+                cid = self._source_scope(metadata.get("connection_id"))
+                ids.append(projection_id(self.collection_name, cid, metadata.get("id")))
 
             doc_metadata = {
                 "document_type": record.get("document_type"),
@@ -377,7 +438,13 @@ class PostgresVDB:
             )
             return 0
 
-        store = self._get_store()
+        dimensions = {len(vector) for vector in embeddings}
+        if len(dimensions) != 1 or (
+            self.vector_size is not None and self.vector_size not in dimensions
+        ):
+            raise ValueError("embedding dimensions do not match vector_size")
+        self.vector_size = len(embeddings[0])
+        store = self._get_store(create=True)
         assert store is not None  # vector_size was provided
 
         inserted = 0
@@ -388,6 +455,7 @@ class PostgresVDB:
                 texts=[d.page_content for d in chunk_docs],
                 embeddings=chunk_embs,
                 metadatas=[d.metadata for d in chunk_docs],
+                ids=ids[start : start + batch_size],
             )
             inserted += len(chunk_docs)
 
@@ -400,41 +468,52 @@ class PostgresVDB:
         return inserted
 
     def delete_by_database(self, database_name: str) -> list[str]:
-        """Delete all rows whose ``database_name`` column matches ``database_name``.
+        """Reject unsafe legacy physical-name deletion without touching storage."""
+        raise ValueError("source_required: delete by connection_id, not database_name")
 
-        Returns the list of deleted row IDs (empty if the table doesn't exist
-        or no rows match).
-        """
-        store = self._get_store()
-        if store is None:
-            logger.info(
-                "PostgresVDB.delete_by_database: collection %s not found, "
-                "nothing to delete",
-                self.collection_name,
+    def delete_by_connection(self, connection_id: str) -> list[str]:
+        """Atomically delete just the selected source and return vector IDs."""
+        connection_id = self._source_scope(connection_id)
+        if not self._table_exists():
+            return []
+        self._require_source_schema()
+        with psycopg.connect(self.connection_string) as conn:
+            rows = conn.execute(
+                sql.SQL(
+                    "DELETE FROM {} WHERE connection_id = %s RETURNING langchain_id"
+                ).format(sql.Identifier(self.schema_name, self.collection_name)),
+                (connection_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def projection_connection_ids(self, node_id: str) -> list[str]:
+        """Read only promoted source IDs for vocabulary refresh; no model calls."""
+        if self.global_pql:
+            raise ValueError(
+                "invalid_global_pql: global vocabulary has no source projections"
             )
+        if not self._table_exists():
             return []
-
-        filter: dict[str, Any] = {
-            _DATABASE_METADATA_COLUMN: database_name,
-        }
-
-        existing = store.get(
-            where=filter,
-            include=[],
-        )
-        ids = list(existing.get("ids", []) or [])
-        if not ids:
-            return []
-
-        store.delete(filter=filter)
-        return ids
+        self._require_source_schema()
+        with psycopg.connect(self.connection_string) as conn:
+            rows = conn.execute(
+                sql.SQL(
+                    "SELECT DISTINCT connection_id FROM {} WHERE langchain_metadata ->> 'id' = %s AND connection_id IS NOT NULL ORDER BY connection_id"
+                ).format(sql.Identifier(self.schema_name, self.collection_name)),
+                (node_id,),
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def delete_all(self) -> int:
-        """Delete every row in the collection.
+        """Delete the bound source, or every row for an unbound administrative client.
 
         Returns the number of rows deleted (``0`` when the collection table
         doesn't exist yet).
         """
+        if self.global_pql:
+            return self._delete_global_pql()
+        if self.connection_id is not None:
+            return len(self.delete_by_connection(self.connection_id))
         if not self._table_exists():
             logger.info(
                 "PostgresVDB.delete_all: collection %s not found, nothing to delete",
@@ -442,6 +521,7 @@ class PostgresVDB:
             )
             return 0
 
+        self._require_source_schema()
         with psycopg.connect(self.connection_string) as conn:
             with conn.cursor() as cur:
                 # `schema_name`/`collection_name` are internal config; psycopg
@@ -461,20 +541,40 @@ class PostgresVDB:
         )
         return deleted
 
-    def delete_by_id(self, node_id: str) -> int:
-        """Delete every row whose metadata ``id`` matches ``node_id``.
+    def _delete_global_pql(self, node_id: str | None = None) -> int:
+        """Global deletes never match source projections or other semantic labels."""
+        if not self._table_exists():
+            return 0
+        self._require_source_schema()
+        predicate = sql.SQL("label = 'PqlAnalysis' AND connection_id IS NULL")
+        params: tuple = ()
+        if node_id is not None:
+            predicate += sql.SQL(" AND langchain_metadata ->> 'id' = %s")
+            params = (node_id,)
+        with psycopg.connect(self.connection_string) as conn:
+            result = conn.execute(
+                sql.SQL("DELETE FROM {} WHERE {}").format(
+                    sql.Identifier(self.schema_name, self.collection_name), predicate
+                ),
+                params,
+            )
+            return result.rowcount
 
-        ``id`` lives in the JSONB ``langchain_metadata`` column (it is not
-        a promoted real column — only ``database_name`` and ``label`` are),
-        so the match goes through ``langchain_metadata ->> 'id'`` rather
-        than the typed-filter path used by :meth:`delete_by_database`.
-        Going through ``PGVectorStore.delete(filter=...)`` would be a
-        no-op for this case because the dict-format filter only resolves
-        declared metadata columns.
-
-        Returns the number of rows deleted (``0`` when the collection
-        table doesn't exist yet or nothing matched).
-        """
+    def delete_by_id(self, node_id: str, *, connection_id: str | None = None) -> int:
+        """Delete one source projection, never all occurrences of a node."""
+        if self.global_pql:
+            if connection_id is not None:
+                raise ValueError(
+                    "invalid_global_pql: global delete cannot select a source"
+                )
+            global_pql_projection_id(self.collection_name, node_id)
+            return self._delete_global_pql(node_id)
+        if connection_id is None:
+            raise TypeError(
+                "delete_by_id requires keyword-only connection_id for source projections"
+            )
+        connection_id = self._source_scope(connection_id)
+        vector_id = projection_id(self.collection_name, connection_id, node_id)
         if not self._table_exists():
             logger.info(
                 "PostgresVDB.delete_by_id: collection %s not found, nothing to delete",
@@ -482,6 +582,7 @@ class PostgresVDB:
             )
             return 0
 
+        self._require_source_schema()
         with psycopg.connect(self.connection_string) as conn:
             with conn.cursor() as cur:
                 # `schema_name`/`collection_name` are internal config; psycopg
@@ -491,12 +592,12 @@ class PostgresVDB:
                     sql.SQL(
                         """
                         DELETE FROM {table}
-                        WHERE langchain_metadata ->> 'id' = %s
+                        WHERE langchain_id = %s AND connection_id = %s
                         """
                     ).format(
                         table=sql.Identifier(self.schema_name, self.collection_name)
                     ),
-                    (node_id,),
+                    (vector_id, connection_id),
                 )
                 deleted = cur.rowcount
 
@@ -517,12 +618,32 @@ class PostgresVDB:
         """Cosine-similarity k-NN search for each query vector.
 
         ``kwargs["where"]`` is a langchain-postgres filter dict
-        (e.g. ``{"label": "CustomAnalysis", "database_name": "prod"}``)
+        (e.g. ``{"label": "CustomAnalysis", "connection_id": "source-id"}``)
         applied to the declared metadata columns; passed straight through to
         ``PGVectorStore.similarity_search_with_score_by_vector``.
 
-        Requires an ``embeddings`` instance from the constructor.
+        A single connection ID is required, either bound or in ``where``.
         """
+        where = kwargs.get("where")
+        if where is not None and not isinstance(where, dict):
+            raise ValueError(
+                "source_required: where must select a single connection_id"
+            )
+        where = dict(where or {})
+        if self.global_pql:
+            if (
+                where.get("label", "PqlAnalysis") != "PqlAnalysis"
+                or "connection_id" in where
+                or any(key.startswith("$") for key in where)
+            ):
+                raise ValueError(
+                    "invalid_global_pql: filters must select only global PqlAnalysis"
+                )
+            where.update(label="PqlAnalysis", connection_id={"$exists": False})
+        else:
+            where["connection_id"] = self._source_scope(
+                where.get("connection_id", self.connection_id)
+            )
         store = self._get_store()
         if store is None:
             return [[] for _ in queries]
@@ -539,7 +660,7 @@ class PostgresVDB:
             try:
                 hits = store.similarity_search_with_score_by_vector(
                     embedding=query,
-                    filter=kwargs.get("where", None),
+                    filter=where,
                     k=top_k,
                 )
                 results.append(
@@ -566,7 +687,6 @@ class PostgresVDB:
 
     def run(self, records: list) -> int:
         """Create the collection if needed, then write records to it."""
-        self.create_index()
         return self.write_to_index(records)
 
     #: Seconds to wait for the pool to dispose before giving up on it.

@@ -84,16 +84,17 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from auto_ontology.dal import datasources as datasources_dal
-from auto_ontology.dal.terms import semantic_layer_calculated
+from auto_ontology.connectors.sources import SourceSelectionError
 from auto_ontology.retrieval.text_to_sql.visualization import analyze_and_visualize
 from auto_ontology.server.chat.helpers import (
     NODE_LABELS,
     ChatRequest,
+    ManualMessageRequest,
     build_result_message,
 )
 from auto_ontology.server.chat.conversation_dal import (
     ConversationAccessError,
+    append_message,
     create_stateless_analytics,
     persist_analytics_result,
     persist_assistant_result,
@@ -103,6 +104,7 @@ from auto_ontology.server.chat.conversation_dal import (
 from auto_ontology.server.chat.settings_dal import is_visualization_enabled
 from auto_ontology.server.chat.worker import PrewarmedWorker, get_pool
 from auto_ontology.server.identity import resolve_internal_user
+from auto_ontology.server.models import SourceProvenance
 from auto_ontology.utils.llm_invoke import get_llm_client, get_non_reasoning_llm_client
 from auto_ontology.server.responses import ChatCancelResponse
 
@@ -144,13 +146,6 @@ except (ValueError, EnvironmentError) as e:
     logger.warning("Chart generation: failed to init reasoning LLM: %s", e)
     _reasoning_llm = None
 
-# Returned as the 409 detail when a chat is attempted before the semantic
-# layer has been built.
-_SEMANTIC_MISSING_MSG = (
-    "The semantic layer hasn't been created yet, so I can't answer questions. "
-    "Enable semantic compilation to build it."
-)
-
 # How often the watchdog polls the ASGI disconnect signal. Small enough that
 # a navigate-away → come-back-and-ask flow always finds the slot free.
 _DISCONNECT_POLL_S = 0.1
@@ -171,29 +166,6 @@ _SSE_HEADERS = {
     "Cache-Control": "no-store",
     "X-Accel-Buffering": "no",
 }
-
-
-def _resolve_chat_target_db(target_db: str | None) -> str | None:
-    """Resolve a catalog database UUID or name to its canonical name."""
-    if target_db is None or not target_db.strip():
-        return None
-
-    requested = target_db.strip()
-    databases = datasources_dal.fetch_databases(zone_ids=None)
-    for database in databases:
-        database_id = str(database.get("id") or "").strip()
-        database_name = str(database.get("name") or "").strip()
-        if database_name and (
-            requested == database_id or requested.casefold() == database_name.casefold()
-        ):
-            return database_name
-
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            f"target_db {target_db!r} does not match a catalog database UUID or name."
-        ),
-    )
 
 
 @dataclass
@@ -217,6 +189,7 @@ class _Slot:
     # Latches the moment any path (watchdog or pump) has called back into
     # the pool, so the second path doesn't double-release.
     released: threading.Event
+    source: dict[str, str] = field(default_factory=dict)
     # Append-only log of every SSE event this run has produced so far,
     # filled by ``_pump`` independently of any HTTP connection. Any number
     # of ``_stream_slot`` consumers (the original submitter, plus any
@@ -372,9 +345,13 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
         persist_result_message(
             conversation_id=slot.conversation_id,
             user_id=slot.user_id,
+            connection_id=slot.source["connection_id"],
             content=content,
             sql_response=sql_response,
         )
+    except (SourceSelectionError, ConversationAccessError):
+        logger.warning("Chart/result persistence denied by conversation source guard")
+        return None
     except Exception:  # noqa: BLE001 — persistence must not break SSE
         logger.exception("Failed to persist chart/result message")
 
@@ -422,6 +399,7 @@ def _pump(slot: _Slot) -> None:
                     conversation_id=slot.conversation_id,
                     user_id=slot.user_id,
                     analytics_id=slot.analytics_id,
+                    connection_id=slot.source["connection_id"],
                     response=response,
                     sql_code=sql_code,
                 )
@@ -433,6 +411,9 @@ def _pump(slot: _Slot) -> None:
                     sql_code=sql_code,
                 )
             persisted = True
+        except (SourceSelectionError, ConversationAccessError):
+            persisted = True
+            logger.warning("Assistant persistence denied by conversation source guard")
         except Exception:  # noqa: BLE001 — persistence must not break SSE
             logger.exception("Failed to persist assistant conversation turn")
 
@@ -451,6 +432,14 @@ def _pump(slot: _Slot) -> None:
                 # Streamed straight through for the live view; remembered so
                 # the failure paths above have something to persist.
                 slot.last_sql = str(event.get("sql") or "") or None
+            elif event.get("type") == "result":
+                event = {
+                    **event,
+                    "answer": {
+                        **(event.get("answer") or {}),
+                        "source": dict(slot.source),
+                    },
+                }
             persist_event(event)
             with slot.buffer_lock:
                 slot.buffer.append(event)
@@ -474,33 +463,38 @@ def _pump(slot: _Slot) -> None:
         _release(slot)
 
 
-def _subject_token(http_request: Request) -> str | None:
+def _subject_token(http_request: Request, connection_id: str) -> str | None:
     """Return the caller's SSO JWT when a connection authenticates as the user.
 
     The frontend forwards the browser user's SSO token (or a service caller's
-    own bearer token) as ``Authorization: Bearer``. Fail closed: when any
+    own bearer token) as ``Authorization: Bearer``. Fail closed: when the selected
     connection has "Authenticate as signed-in user" enabled, a request without a
     token is rejected rather than allowed to run under that connection's PAT.
+    Only the selected connection is inspected; bearer exchange happens in the worker.
     """
     from auto_ontology.connectors.databricks_oauth import (
-        any_connection_uses_sso_federation,
+        DatabricksOAuthError,
     )
-
-    if not any_connection_uses_sso_federation():
-        return None
+    from auto_ontology.connectors.registry import get_connectors_for_subject_token
 
     header = http_request.headers.get("authorization") or ""
     scheme, _, token = header.partition(" ")
     token = token.strip()
-    if scheme.lower() != "bearer" or not token:
+    if scheme.lower() == "bearer" and token:
+        return token
+    try:
+        get_connectors_for_subject_token(None, connection_id=connection_id)
+    except DatabricksOAuthError:
         raise HTTPException(
             status_code=401,
             detail=(
                 "A connection is configured to authenticate as the signed-in "
                 "user, but the request carried no SSO bearer token."
             ),
-        )
-    return token
+        ) from None
+    except Exception:
+        raise HTTPException(503, "source_unavailable") from None
+    return None
 
 
 def _stream_slot(slot: _Slot) -> Generator[str, None, None]:
@@ -552,8 +546,10 @@ async def chat_completions(
     persistence happen server-side regardless of whether anyone keeps
     listening (see ``_build_charts_event``).
 
-    Requires a compiled semantic layer; without one the request is rejected with
-    409 rather than run against a bare schema. ``conversation_id`` persists the
+    Requires a selected, source-ready semantic and vector context (503 if not
+    ready). The first SSE event is ``source``; ``answer.source`` repeats that
+    authoritative snapshot. Missing selection with multiple sources is 422.
+    ``conversation_id`` persists the
     turn and claims that conversation's single run slot — a second concurrent
     request for the same conversation gets 409 too. Omitting ``conversation_id``
     runs the question statelessly: no history, no persisted turn, and no chart
@@ -561,12 +557,20 @@ async def chat_completions(
     """
     logger.info("Chat completions request: %s", request.model_dump())
 
-    # Block chat when the semantic layer hasn't been built — no connectors/graph
-    # run happens. The chat page gates on the status API; this is the backstop.
-    if not semantic_layer_calculated():
-        raise HTTPException(status_code=409, detail=_SEMANTIC_MISSING_MSG)
+    from auto_ontology.retrieval.source_context import resolve_query_source
 
-    target_db = await asyncio.to_thread(_resolve_chat_target_db, request.target_db)
+    source = None
+    subject_token = None
+    if request.conversation_id is None:
+        try:
+            source = await asyncio.to_thread(
+                resolve_query_source,
+                connection_id=request.connection_id,
+                connection_label=request.connection_label,
+                target_db=request.target_db,
+            )
+        except SourceSelectionError as exc:
+            raise HTTPException(exc.status_code, exc.code) from None
 
     # Conversation persistence trusts identity forwarded by the private Next.js
     # gateway; only calls that persist (i.e. carry a conversation_id) need it.
@@ -579,7 +583,10 @@ async def chat_completions(
         else str(uuid.uuid4())
     )
 
-    subject_token = _subject_token(http_request)
+    if source is not None:
+        subject_token = await asyncio.to_thread(
+            _subject_token, http_request, source.connection_id
+        )
 
     pool = get_pool()
     worker = await asyncio.to_thread(pool.acquire)
@@ -619,20 +626,30 @@ async def chat_completions(
                 user_id=user_id,
                 question=request.question,
                 source=http_request.headers.get("x-auto-ontology-source") or "api",
+                connection_id=request.connection_id,
+                connection_label=request.connection_label,
+                target_db=request.target_db,
             )
+        except SourceSelectionError as exc:
+            slot.finished.set()
+            _release(slot)
+            raise HTTPException(exc.status_code, exc.code) from None
         except ConversationAccessError as exc:
+            slot.finished.set()
             _release(slot)
             raise HTTPException(
                 status_code=404, detail="Conversation not found"
             ) from exc
         except Exception as exc:
             logger.exception("Failed to prepare conversation history")
+            slot.finished.set()
             _release(slot)
             raise HTTPException(
                 status_code=503, detail="Conversation storage unavailable"
             ) from exc
 
         slot.analytics_id = prepared.analytics_id
+        source = prepared.source
         conversation_history = [
             {
                 "question": turn.question,
@@ -652,14 +669,52 @@ async def chat_completions(
         except Exception:  # noqa: BLE001 — analytics is best-effort
             logger.exception("Failed to create stateless conversation analytics")
 
-    worker.submit(
-        request.question,
-        prediction=request.prediction,
-        target_db=target_db,
-        subject_token=subject_token,
-        conversation_history=conversation_history,
-        evidence=request.evidence,
-    )
+    assert source is not None
+    slot.source = SourceProvenance(
+        connection_id=source.connection_id,
+        display_label=source.display_label,
+        database_name=source.database_name,
+    ).model_dump()
+    with slot.buffer_lock:
+        slot.buffer.append({"type": "source", "source": dict(slot.source)})
+
+    try:
+        if request.conversation_id is not None:
+            subject_token = await asyncio.to_thread(
+                _subject_token, http_request, source.connection_id
+            )
+        worker.submit(
+            request.question,
+            prediction=request.prediction,
+            connection_id=source.connection_id,
+            subject_token=subject_token,
+            conversation_history=conversation_history,
+            evidence=request.evidence,
+        )
+    except Exception as exc:
+        failure_message = "Agent failed: selected source unavailable"
+        with slot.buffer_lock:
+            slot.buffer.append({"type": "error", "message": failure_message})
+        if slot.conversation_id is not None and slot.analytics_id is not None:
+            try:
+                await asyncio.to_thread(
+                    persist_assistant_result,
+                    conversation_id=slot.conversation_id,
+                    user_id=slot.user_id,
+                    analytics_id=slot.analytics_id,
+                    connection_id=source.connection_id,
+                    response=failure_message,
+                    sql_code=None,
+                )
+            except (SourceSelectionError, ConversationAccessError):
+                logger.warning("Accepted-turn error persistence denied by source guard")
+            except Exception:
+                logger.exception("Failed to persist accepted-turn source error")
+        slot.finished.set()
+        _release(slot)
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(503, "source_unavailable") from None
     threading.Thread(target=_pump, args=(slot,), daemon=True).start()
     asyncio.create_task(_watch_disconnect(http_request, slot))
 
@@ -668,6 +723,30 @@ async def chat_completions(
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+@router.post("/chat/conversations/{conversation_id}/messages", status_code=201)
+def manual_message(
+    conversation_id: UUID, body: ManualMessageRequest, request: Request
+) -> dict[str, Any]:
+    """Append a caller-produced message through the shared source-binding transaction.
+
+    Unknown and foreign conversations return 404. Bound conversations inherit their
+    source; explicit conflicts and legacy unbound history are read-only (409).
+    This operation never starts a worker, model, connector, or SSO exchange.
+    """
+    user_id = resolve_internal_user(request, required=True)
+    try:
+        return append_message(
+            conversation_id=conversation_id, user_id=user_id, **body.model_dump()
+        )
+    except ConversationAccessError:
+        raise HTTPException(404, "Conversation not found") from None
+    except SourceSelectionError as exc:
+        raise HTTPException(exc.status_code, exc.code) from None
+    except Exception:
+        logger.warning("Manual message storage unavailable")
+        raise HTTPException(503, "Conversation storage unavailable") from None
 
 
 @router.get(

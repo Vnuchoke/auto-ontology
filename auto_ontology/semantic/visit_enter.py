@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import pandas as pd
 
-from auto_ontology.connectors import get_connectors
+from auto_ontology.connectors import get_connector
+from auto_ontology.connectors.sources import list_active_sources
 from auto_ontology.connectors.db_errors import is_infrastructure_error
 from auto_ontology.dal.attributes import merge_column_attribute
 from auto_ontology.dal.datasources import (
@@ -139,16 +140,11 @@ def _terms_with_assignments(
     return persisted
 
 
-def _resolve_connector(database_name: str | None) -> "SQLDatabase | None":
-    """Return the loaded connector whose ``database_name`` matches, or None."""
-    if not database_name:
-        return None
-    key = database_name.casefold()
-    for connector in get_connectors():
-        db = getattr(connector, "database_name", None)
-        if db is not None and db.casefold() == key:
-            return connector
-    return None
+def _resolve_connector(connection_id: str) -> "SQLDatabase | None":
+    """Open only the selected source; never scan same-name neighbours."""
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("source_not_ready: connection_id is required")
+    return get_connector(connection_id)
 
 
 def _execute_capped(connector: "SQLDatabase", sql: str) -> pd.DataFrame:
@@ -158,6 +154,7 @@ def _execute_capped(connector: "SQLDatabase", sql: str) -> pd.DataFrame:
     every attribute with something truthy, and silently passing ``timeout_s``
     to a connector that does not take it would be a TypeError in production.
     """
+    _sampling_breaker._key(connector)
     if getattr(connector, "supports_statement_timeout", False) is True:
         return connector.execute(sql, timeout_s=_PROFILING_QUERY_TIMEOUT_SECONDS)
     return connector.execute(sql)
@@ -184,12 +181,10 @@ class _SamplingCircuitBreaker:
 
     @staticmethod
     def _key(connector: "SQLDatabase") -> str:
-        # Casefolded to match _resolve_connector: a connector loaded from
-        # CONNECTION_STRINGS can spell its database differently from the
-        # catalog name a run is compiled under, and a key that disagrees with
-        # the reset would leave the breaker open for every later run.
-        name = getattr(connector, "database_name", None)
-        return str(name).casefold() if name else str(id(connector))
+        connection_id = getattr(connector, "connection_id", None)
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise ValueError("source_not_ready: connector requires connection_id")
+        return connection_id
 
     def is_open(self, connector: "SQLDatabase") -> bool:
         with self._lock:
@@ -220,8 +215,8 @@ class _SamplingCircuitBreaker:
         )
         return True
 
-    def reset(self, database_name: str) -> None:
-        key = database_name.casefold()
+    def reset(self, connection_id: str) -> None:
+        key = connection_id
         with self._lock:
             self._failures.pop(key, None)
             self._tripped.discard(key)
@@ -230,8 +225,8 @@ class _SamplingCircuitBreaker:
 _sampling_breaker = _SamplingCircuitBreaker()
 
 
-def reset_sampling_breaker(database_name: str) -> None:
-    """Re-enable sampling for *database_name* at the start of a run.
+def reset_sampling_breaker(connection_id: str) -> None:
+    """Re-enable sampling for the exact *connection_id* at the start of a run.
 
     The breaker is process-wide and long-lived, so without this a warehouse
     that was down during one run would stay un-sampled for every later run in
@@ -240,7 +235,7 @@ def reset_sampling_breaker(database_name: str) -> None:
     breaker would hand a run already in flight back the warehouse it had just
     proven dead.
     """
-    _sampling_breaker.reset(database_name)
+    _sampling_breaker.reset(connection_id)
 
 
 def _is_excluded_sample_type(data_type: str | None) -> bool:
@@ -451,6 +446,9 @@ def calculate_columns_profiling(
     bool, "format": str | None}}`` for *all* columns (values unfiltered —
     includes dates, uuids and long strings).
     """
+    connection_id = _sampling_breaker._key(connector)
+    if table.get("connection_id") != connection_id:
+        raise ValueError("source_conflict: table and connector must match")
     schema_name = table.get("schema_name")
     table_name = table["name"]
     # Qualification is the connector's rule, not ours: engines with a
@@ -754,6 +752,7 @@ def process_table(
     table: dict[str, Any],
     ctx: dict[str, Any],
     *,
+    connection_id: str,
     domain_summary: DomainSummary | None,
     embedder: SemanticEmbedder | None = None,
     database_name: str | None = None,
@@ -769,7 +768,25 @@ def process_table(
 
     ``commit_slot`` lets the parallel pipeline impose canonical table ordering
     only on persistence. Direct callers fall back to the process-local lock.
+
+    ``connection_id`` must be active and match both table/context ancestry and
+    the optional embedder before any model, profiling or persistence work.
+    ``database_name`` is physical display context only, never source identity.
     """
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("source_not_ready: connection_id is required")
+    if any(row.get("connection_id") != connection_id for row in (table, ctx)):
+        raise ValueError(
+            "source_conflict: table and context must match selected source"
+        )
+    if embedder is not None and embedder.connection_id != connection_id:
+        raise ValueError("source_conflict: embedder must match selected source")
+    source = next(
+        (item for item in list_active_sources() if item.connection_id == connection_id),
+        None,
+    )
+    if source is None:
+        raise ValueError("source_not_ready: selected source is not active")
     table_id = table["id"]
     table_name = table["name"]
 
@@ -778,7 +795,12 @@ def process_table(
     # the setting gates the unbounded DISTINCT probes inside. It persists
     # sample_values, is_unique, and format onto Column nodes, and maps those
     # values for FK detection below.
-    connector = _resolve_connector(database_name)
+    connector = _resolve_connector(source.connection_id)
+    if (
+        connector is not None
+        and _sampling_breaker._key(connector) != source.connection_id
+    ):
+        raise ValueError("source_conflict: connector must match selected source")
     columns_profiling_samples: dict[str, dict[str, Any]] = {}
     if connector is not None and _sampling_breaker.is_open(connector):
         # Already established that this warehouse is not answering samples.
@@ -805,9 +827,9 @@ def process_table(
             )
     else:
         logger.info(
-            "[%s] Skipping value sampling — no live connector for %r",
+            "[%s] Skipping value sampling — no live connector for source %r",
             table_name,
-            database_name,
+            source.connection_id,
         )
 
     # --- FK detection (LLM + declared); results not written to the store ---
@@ -891,11 +913,23 @@ def process_table(
         # Fetch persisted terms — used for embedding.
         try:
             terms, attrs = fetch_terms_and_attributes_for_table(table_id)
+        except Exception:
+            logger.warning("[%s] failed to fetch persisted terms", table_name)
+        else:
+            if any(
+                row.get("connection_id") != source.connection_id
+                for row in (*terms, *attrs)
+            ):
+                raise ValueError(
+                    "source_conflict: embedding requires source projections"
+                )
+            if any(attr.get("table_id") != table_id for attr in attrs):
+                raise ValueError(
+                    "source_conflict: embedding attributes require owning table"
+                )
             for attr in attrs:
                 if attr.get("term_name"):
                     attrs_by_term[attr["term_name"]].append(attr)
-        except Exception:
-            logger.warning("[%s] failed to fetch persisted terms", table_name)
 
         if embedder is not None and terms:
             try:

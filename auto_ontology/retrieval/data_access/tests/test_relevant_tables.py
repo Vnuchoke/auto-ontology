@@ -24,6 +24,7 @@ def test_get_relevant_tables_uses_default_limit_when_k_is_omitted(
         per_label_k: int,
         database_name: str | None,
         schema_name: str | None,
+        connection_id: str,
     ) -> list[dict]:
         captured.update(
             {
@@ -32,6 +33,7 @@ def test_get_relevant_tables_uses_default_limit_when_k_is_omitted(
                 "per_label_k": per_label_k,
                 "database_name": database_name,
                 "schema_name": schema_name,
+                "connection_id": connection_id,
             }
         )
         return [
@@ -50,9 +52,11 @@ def test_get_relevant_tables_uses_default_limit_when_k_is_omitted(
         object(),
         "show orders",
         database_name="retail",
+        connection_id="retail-cid",
     )
 
     assert captured["per_label_k"] == 1
+    assert captured["connection_id"] == "retail-cid"
     assert captured["label_filter"] == [Labels.TABLE]
     assert result[0]["name"] == "orders"
 

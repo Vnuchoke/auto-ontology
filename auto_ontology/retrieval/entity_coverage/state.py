@@ -28,6 +28,8 @@ class EntityCoveragePayload(TypedDict):
     acronyms: NotRequired[list[dict[str, str]]]
     custom_prompts: NotRequired[str]
     target_db: NotRequired[str]
+    connection_id: NotRequired[str]
+    connection_label: NotRequired[str]
     max_distance: NotRequired[float]
     return_uncovered_entities: NotRequired[bool]
 

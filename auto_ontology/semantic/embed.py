@@ -39,6 +39,7 @@ class SemanticEmbedder:
     """Embeds one Term + its ColumnAttributes into the semantic VDB per call."""
 
     database_name: str
+    connection_id: str
     embed_params: EmbedParams
     vdb: PostgresVDB
 
@@ -50,13 +51,16 @@ class SemanticEmbedder:
         """Embed and ingest one Term and its attribute rows in a single batch.
 
         ``term`` entries: ``{"name", "description", "id"}``.
-        ``attrs`` entries include ``name``, ``term_name``, ``source_column``,
-        ``description``, ``id``, and the owning table metadata.
+        ``term`` and ``attrs`` are DAL source projections carrying the verified
+        ``connection_id``; attributes also carry their owning ``table_id``.
+        Unscoped dictionary reads are not embedding input.
         ``id`` is the catalog ``id`` (UUID) and, when present, lands
         in the embedded row's metadata.
         Returns the number of rows actually written to the VDB.
         """
-        rows = _build_rows(self.database_name, term, attrs)
+        rows = _build_rows(
+            self.database_name, term, attrs, connection_id=self.connection_id
+        )
         if not rows:
             return 0
 
@@ -91,9 +95,12 @@ class SemanticEmbedder:
 def build_semantic_embedder(
     database_name: str,
     *,
+    connection_id: str,
     reset: bool,
 ) -> SemanticEmbedder | None:
     """Construct an embedder bound to the semantic VDB, or None when disabled."""
+    if not connection_id:
+        raise ValueError("connection_id is required for semantic embedding")
     api_key = resolve("EMBED", "API_KEY")
     if not api_key:
         logger.warning(
@@ -107,9 +114,12 @@ def build_semantic_embedder(
         model_name=resolve("EMBED", "MODEL"),
         api_key=api_key,
     )
-    vdb = get_semantic_vdb(database_name=database_name, reset=reset)
+    vdb = get_semantic_vdb(
+        connection_id=connection_id, database_name=database_name, reset=reset
+    )
     return SemanticEmbedder(
         database_name=database_name,
+        connection_id=connection_id,
         embed_params=embed_params,
         vdb=vdb,
     )
@@ -118,9 +128,9 @@ def build_semantic_embedder(
 def embed_all_semantic_nodes(
     embedder: SemanticEmbedder,
 ) -> int:
-    """Embed every Term + ColumnAttribute currently in the store in a single batch.
+    """Rebuild this source's Term + ColumnAttribute projections in a single batch.
 
-    Fetches all semantic nodes, builds one combined DataFrame, makes a single
+    Fetches source-filtered semantic nodes before text construction, makes a single
     HTTP call to the embed endpoint, and writes all results to the VDB in one
     pass.  Returns the total number of rows written.
     """
@@ -128,16 +138,16 @@ def embed_all_semantic_nodes(
 
     from auto_ontology.dal.terms import fetch_all_terms_and_attributes
 
-    terms, attrs = fetch_all_terms_and_attributes()
+    terms, attrs = fetch_all_terms_and_attributes(connection_id=embedder.connection_id)
     if not terms and not attrs:
         logger.info("embed_all_semantic_nodes: nothing to embed")
         return 0
 
     attrs_by_term: dict[str, list[dict]] = defaultdict(list)
     for attr in attrs:
-        term_name = attr.get("term_name") or ""
-        if term_name:
-            attrs_by_term[term_name].append(attr)
+        term_id = attr.get("term_id")
+        if term_id:
+            attrs_by_term[term_id].append(attr)
 
     all_rows: list[dict] = []
     for term in terms:
@@ -147,14 +157,9 @@ def embed_all_semantic_nodes(
         all_rows.extend(
             _build_rows(
                 embedder.database_name,
-                {
-                    "name": term_name,
-                    "description": term.get("description") or "",
-                    "synonyms": term.get("synonyms") or [],
-                    "id": term.get("id"),
-                    "schema_names": term.get("schema_names") or [],
-                },
-                attrs_by_term.get(term_name, []),
+                term,
+                attrs_by_term.get(term["id"], []),
+                connection_id=embedder.connection_id,
             )
         )
 
@@ -207,7 +212,20 @@ def _build_rows(
     database_name: str,
     term: dict[str, Any],
     attrs: list[dict[str, Any]],
+    *,
+    connection_id: str,
 ) -> list[dict[str, Any]]:
+    if not connection_id:
+        raise ValueError("connection_id is required for semantic embedding")
+    # Only DAL source projections may supply content; never retag a global read.
+    if term.get("name") and term.get("connection_id") != connection_id:
+        raise ValueError("Term requires a matching connection_id projection")
+    if any(
+        a.get("connection_id") != connection_id or not a.get("table_id") for a in attrs
+    ):
+        raise ValueError(
+            "ColumnAttribute requires a matching connection_id and owning table"
+        )
     rows: list[dict[str, Any]] = []
 
     term_name = term.get("name")
@@ -218,6 +236,7 @@ def _build_rows(
             "label": "Term",
             "name": term_name,
             "database_name": database_name,
+            "connection_id": connection_id,
             "source_path": path,
         }
         if term.get("id"):
@@ -265,6 +284,7 @@ def _build_rows(
             # semantic_fk._resolve_via_vdb.
             "is_unique": a.get("is_unique"),
             "database_name": database_name,
+            "connection_id": connection_id,
             "source_path": path,
         }
         if a.get("schema_name"):

@@ -14,6 +14,7 @@ error; it is the diff silently doing nothing.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from threading import Lock
 
 import pandas as pd
@@ -29,7 +30,7 @@ from auto_ontology.catalog.model.node import CatalogNode
 from auto_ontology.catalog.model.schema import Schema
 from auto_ontology.catalog.normalize import normalize_columns, normalize_tables
 from auto_ontology.catalog.store.registry import entity_spec
-from auto_ontology.catalog.store.rows import upsert_row
+from auto_ontology.catalog.store.rows import resolve_id, upsert_row
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import store, write_transaction
 
@@ -50,7 +51,8 @@ def _catalog_join():
     )
 
 
-def get_schema_columns(database_name, schema_name):
+def get_schema_columns(connection_id: str, schema_name: str) -> pd.DataFrame:
+    """Read one source's columns; physical names are returned, never selectors."""
     rows = store().query_read(
         select(
             s.catalog_database.c.name.label("database"),
@@ -64,7 +66,7 @@ def get_schema_columns(database_name, schema_name):
         .select_from(_catalog_join())
         .where(
             and_(
-                s.catalog_database.c.name == database_name,
+                s.catalog_database.c.id == connection_id,
                 s.catalog_schema.c.name == schema_name,
             )
         )
@@ -72,7 +74,8 @@ def get_schema_columns(database_name, schema_name):
     return normalize_columns(pd.DataFrame(rows))
 
 
-def get_schema_tables(database_name, schema_name):
+def get_schema_tables(connection_id: str, schema_name: str) -> pd.DataFrame:
+    """Read one source's tables by root ID and schema name."""
     rows = store().query_read(
         select(
             s.catalog_database.c.name.label("database"),
@@ -92,7 +95,7 @@ def get_schema_tables(database_name, schema_name):
         )
         .where(
             and_(
-                s.catalog_database.c.name == database_name,
+                s.catalog_database.c.id == connection_id,
                 s.catalog_schema.c.name == schema_name,
             )
         )
@@ -105,8 +108,10 @@ def get_schema_tables(database_name, schema_name):
     return normalize_tables(frame)
 
 
-def load_schema_from_graph(database_name, schema_name, database_node=None):
-    """Rebuild a stored schema, or ``None`` when there is nothing stored.
+def load_schema_from_graph(
+    connection_id: str, schema_name: str, database_node: CatalogNode | None = None
+) -> Schema | None:
+    """Rebuild one ID-scoped schema, or ``None`` when there is nothing stored.
 
     Returning ``None`` rather than a ``Schema`` whose frames are ``None`` is
     what the caller in :mod:`auto_ontology.catalog.diff` already tests for. Handing back
@@ -116,22 +121,33 @@ def load_schema_from_graph(database_name, schema_name, database_node=None):
     stored with tables but no columns could never re-ingest and never
     self-healed.
     """
-    tables_df = get_schema_tables(database_name, schema_name)
-    columns_df = get_schema_columns(database_name, schema_name)
+    tables_df = get_schema_tables(connection_id, schema_name)
+    columns_df = get_schema_columns(connection_id, schema_name)
     if tables_df.empty or columns_df.empty:
         return None
 
     if database_node is None:
         database_node = CatalogNode(
-            name=database_name, label=Labels.DB, props={"name": database_name}
+            name=tables_df.iloc[0]["database"],
+            label=Labels.DB,
+            props={"name": tables_df.iloc[0]["database"]},
+            existing_id=connection_id,
         )
+    elif database_node.get_id() != connection_id:
+        raise ValueError("Database node conflicts with catalog source context")
 
     schema = Schema(database_node, tables_df, columns_df)
-    schema.create_schema_node(schema_name)
+    schema.create_schema_node(
+        schema_name,
+        id=resolve_id(
+            Labels.SCHEMA, {"connection_id": connection_id, "name": schema_name}
+        ),
+    )
     return schema
 
 
-def get_schemas_ids_and_names(database_id: str = None, database_name: str = None):
+def get_schemas_ids_and_names(database_id: str) -> list[dict]:
+    """List schemas under one explicit root ID, never a physical name."""
     statement = select(
         s.catalog_schema.c.name.label("schema_name"),
         s.catalog_schema.c.id.label("schema_id"),
@@ -141,15 +157,12 @@ def get_schemas_ids_and_names(database_id: str = None, database_name: str = None
             s.catalog_schema.c.database_id == s.catalog_database.c.id,
         )
     )
-    if database_id:
-        statement = statement.where(s.catalog_database.c.id == database_id)
-    elif database_name:
-        statement = statement.where(s.catalog_database.c.name == database_name)
+    statement = statement.where(s.catalog_database.c.id == database_id)
     return store().query_read(statement)
 
 
-def get_table_ids(tables_df: pd.DataFrame, database_name: str) -> pd.DataFrame:
-    """Add an ``id`` column carrying each table's stored id, or None.
+def get_table_ids(tables_df: pd.DataFrame, connection_id: str) -> pd.DataFrame:
+    """Add an ``id`` column carrying each table's ID in this source, or None.
 
     This is what makes ids stable across re-ingests: the parser reads them back
     out here and writes the same values, so nothing referencing a table by id
@@ -172,17 +185,15 @@ def get_table_ids(tables_df: pd.DataFrame, database_name: str) -> pd.DataFrame:
                 s.catalog_schema.c.database_id == s.catalog_database.c.id,
             )
         )
-        .where(s.catalog_database.c.name == database_name)
+        .where(s.catalog_database.c.id == connection_id)
     )
-    if not rows:
-        return tables_df
-    return tables_df.merge(
-        pd.DataFrame(rows), on=["table_name", "table_schema"], how="left"
+    return _merge_stored_ids(
+        tables_df, rows, ["table_name", "table_schema"], Labels.TABLE
     )
 
 
-def get_column_ids(columns_df: pd.DataFrame, database_name: str) -> pd.DataFrame:
-    """Add an ``id`` column carrying each column's stored id, or None."""
+def get_column_ids(columns_df: pd.DataFrame, connection_id: str) -> pd.DataFrame:
+    """Reuse only this source's IDs, rejecting explicit foreign-source IDs."""
     if columns_df is None or columns_df.empty:
         return columns_df
 
@@ -195,15 +206,35 @@ def get_column_ids(columns_df: pd.DataFrame, database_name: str) -> pd.DataFrame
             s.catalog_column.c.pii_processed.label("pii_processed"),
         )
         .select_from(_catalog_join())
-        .where(s.catalog_database.c.name == database_name)
+        .where(s.catalog_database.c.id == connection_id)
     )
-    if not rows:
-        return columns_df
-    return columns_df.merge(
-        pd.DataFrame(rows),
-        on=["table_name", "table_schema", "column_name"],
-        how="left",
+    return _merge_stored_ids(
+        columns_df, rows, ["table_name", "table_schema", "column_name"], Labels.COLUMN
     )
+
+
+def _merge_stored_ids(
+    frame: pd.DataFrame, rows: list[dict], keys: list[str], label: str
+) -> pd.DataFrame:
+    """Reuse IDs only within the selected source; explicit foreign IDs are errors."""
+    stored = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[*keys, "id"])
+    merged = frame.merge(
+        stored.rename(columns={"id": "_stored_id"}), on=keys, how="left"
+    )
+    if "id" in frame:
+        for incoming, existing in zip(merged["id"], merged["_stored_id"], strict=True):
+            if (
+                pd.notna(incoming)
+                and incoming != existing
+                and resolve_id(label, {"id": incoming}) is not None
+            ):
+                raise ValueError(
+                    "Explicit catalog ID conflicts with source/parent context"
+                )
+        merged["id"] = merged["_stored_id"].combine_first(merged["id"])
+    else:
+        merged["id"] = merged["_stored_id"]
+    return merged.drop(columns="_stored_id")
 
 
 def add_schemas_edge(edge, created):
@@ -220,12 +251,13 @@ def add_schemas_edge(edge, created):
                 node_from.get_match_props(),
                 node_from.get_properties(),
             )
-            upsert_row(
+            child_id = upsert_row(
                 node_to.get_label(),
                 node_to.get_match_props(),
                 node_to.get_properties(),
                 parent_id=parent_id,
             )
+            node_to.replace_id(child_id)
     except Exception as err:
         logger.exception(err)
         raise Exception(f'Error in "add_schemas_edge" when adding edge: {edge}')
@@ -353,15 +385,14 @@ def merge_schema_edges(edges, from_label, to_label, pending: PendingRows):
             )
             continue
 
-        # Already written by an earlier pass; just re-point it.
-        store().query_write(
-            update(child.table)
-            .where(child.table.c.id == child_id)
-            .values(**{child.parent_column: parent_id})
-        )
+        # An existing child may be checked, never reparented by an ingest.
+        if resolve_id(to_label, {"id": child_id}, parent_id=parent_id) is None:
+            raise ValueError("Catalog child is missing from the supplied parent")
 
 
-def add_fks(fks_df, last_seen, database_name: str):
+def add_fks(
+    fks_df: pd.DataFrame | None, last_seen: datetime, connection_id: str
+) -> None:
     """Record each foreign key, stamping *last_seen* so stale ones can be found.
 
     One read to resolve every column id, then one insert for the whole set.
@@ -373,7 +404,7 @@ def add_fks(fks_df, last_seen, database_name: str):
     if fks_df is None or fks_df.empty:
         return
 
-    ids = _column_ids_by_name(database_name)
+    ids = _column_ids_by_name(connection_id)
 
     rows = []
     seen = set()
@@ -417,7 +448,7 @@ def add_fks(fks_df, last_seen, database_name: str):
     )
 
 
-def delete_old_fks(last_seen, database_name: str):
+def delete_old_fks(last_seen: datetime, connection_id: str) -> None:
     """Remove foreign keys this ingest did not see.
 
     Scoped to the database being ingested — a global delete would drop another
@@ -441,7 +472,7 @@ def delete_old_fks(last_seen, database_name: str):
                         s.catalog_schema.c.database_id == s.catalog_database.c.id,
                     )
                 )
-                .where(s.catalog_database.c.name == database_name)
+                .where(s.catalog_database.c.id == connection_id)
             ),
             # NOT `is_distinct_from`: that is true for NULL, and an imported
             # foreign key has no `last_seen`. Using it deleted every curated FK
@@ -454,7 +485,7 @@ def delete_old_fks(last_seen, database_name: str):
     )
 
 
-def reset_pks(database_name: str):
+def reset_pks(connection_id: str) -> None:
     store().query_write(
         update(s.catalog_table)
         .where(
@@ -466,14 +497,14 @@ def reset_pks(database_name: str):
                         s.catalog_schema.c.database_id == s.catalog_database.c.id,
                     )
                 )
-                .where(s.catalog_database.c.name == database_name)
+                .where(s.catalog_database.c.id == connection_id)
             )
         )
         .values(pk=None)
     )
 
 
-def add_pks(pks_df, database_name: str):
+def add_pks(pks_df: pd.DataFrame | None, connection_id: str) -> None:
     """Append each primary-key column name to its table's ``pk`` array.
 
     Appending rather than assigning
@@ -497,7 +528,7 @@ def add_pks(pks_df, database_name: str):
     if pks_df is None or pks_df.empty:
         return
 
-    ids = _table_ids_by_name(database_name)
+    ids = _table_ids_by_name(connection_id)
 
     if "ordinal_position" in pks_df.columns:
         pks_df = pks_df.assign(
@@ -539,7 +570,7 @@ def _append_to_pk(column, value):
     return func.array_append(func.coalesce(column, cast([], ARRAY(Text))), value)
 
 
-def _table_ids_by_name(database_name: str) -> dict[tuple[str, str], str]:
+def _table_ids_by_name(connection_id: str) -> dict[tuple[str, str], str]:
     """``(schema, table) -> id`` for one database, in a single read.
 
     A whole database's tables at once rather than one lookup per row: the
@@ -560,12 +591,12 @@ def _table_ids_by_name(database_name: str) -> dict[tuple[str, str], str]:
                 s.catalog_schema.c.database_id == s.catalog_database.c.id,
             )
         )
-        .where(s.catalog_database.c.name == database_name)
+        .where(s.catalog_database.c.id == connection_id)
     )
     return {(r["schema_name"], r["table_name"]): r["id"] for r in rows}
 
 
-def _column_ids_by_name(database_name: str) -> dict[tuple[str, str, str], str]:
+def _column_ids_by_name(connection_id: str) -> dict[tuple[str, str, str], str]:
     """``(schema, table, column) -> id`` for one database, in a single read."""
     rows = store().query_read(
         select(
@@ -575,7 +606,7 @@ def _column_ids_by_name(database_name: str) -> dict[tuple[str, str, str], str]:
             s.catalog_column.c.id,
         )
         .select_from(_catalog_join())
-        .where(s.catalog_database.c.name == database_name)
+        .where(s.catalog_database.c.id == connection_id)
     )
     return {
         (r["schema_name"], r["table_name"], r["column_name"]): r["id"] for r in rows

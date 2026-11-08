@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Load and cache SQLDatabase connectors from CONNECTION_STRINGS."""
+"""Resolve active source IDs before loading and caching their connectors."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import re
 from urllib.parse import urlparse
 
 from auto_ontology.catalog.table_filter import TableFilter, from_connection
+from auto_ontology.connectors import sources
 from auto_ontology.connectors.base import SQLDatabase
 
 from auto_ontology.connectors.connection_string_factory import build_connection_string
@@ -55,7 +56,8 @@ CONNECTOR_REGISTRY: dict[str, type[SQLDatabase]] = {
     "trino": TrinoDatabase,
 }
 
-_connectors: list[SQLDatabase] | None = None
+_connectors: dict[str, SQLDatabase] = {}
+_connection_specs: dict[str, tuple[str | None, dict]] = {}
 
 
 def parse_connection_strings(raw: str) -> list[str]:
@@ -119,14 +121,13 @@ def _table_filter(connection: dict) -> TableFilter:
 
 def invalidate_connectors_cache() -> None:
     """Drop cached connectors so the next :func:`get_connectors` reloads."""
-    global _connectors
-    if _connectors is not None:
-        for connector in _connectors:
-            try:
-                connector.close()
-            except Exception:
-                logger.exception("Failed to close connector during cache invalidation")
-    _connectors = None
+    for connection_id, connector in _connectors.items():
+        try:
+            connector.close()
+        except Exception:
+            logger.warning("Failed to close connector %s", connection_id)
+    _connectors.clear()
+    _connection_specs.clear()
 
 
 def create_connector(
@@ -156,10 +157,7 @@ def create_connector(
         connector_class = CONNECTOR_REGISTRY.get(connector_type)
 
         if connector_class is None:
-            raise ValueError(
-                f"Unsupported database type: {connector_type!r}. "
-                f"Connection string: {connection_string}"
-            )
+            raise ValueError("Unsupported database type")
 
         if schemas and connector_class in (
             DatabricksDatabase,
@@ -179,139 +177,132 @@ def create_connector(
         return connector
 
     except Exception:
-        logger.exception(
-            "Failed to initialize connector for connection string: %s",
-            _redact(connection_string),
+        raise ValueError("source_unavailable: could not initialize connector") from None
+
+
+def _resolve_source(connection_id: str | None) -> sources.SourceDescriptor:
+    active = sources.list_active_sources()
+    if connection_id is None:
+        if len(active) > 1:
+            raise ValueError("source_required: select a connection ID")
+        if len(active) == 1:
+            return active[0]
+    else:
+        for source in active:
+            if source.connection_id == connection_id:
+                return source
+    raise ValueError("source_unavailable: selected source is not active")
+
+
+def _load_spec(source: sources.SourceDescriptor) -> tuple[str | None, dict]:
+    """Read secrets only after the active source context has been validated."""
+    from auto_ontology.dal.connections import load_source_connection
+
+    try:
+        if source.configuration_origin == "managed":
+            return None, load_source_connection(source.connection_id)
+        desired = sources.parse_env_sources(os.environ.get("CONNECTION_STRINGS", ""))
+        matches = [
+            item
+            for item in desired
+            if item.connection_id == source.connection_id
+            or (
+                item.connection_id is None
+                and item.database_name == source.database_name
+            )
+        ]
+        if len(matches) == 1:
+            return matches[0]._driver_url, {}
+    except Exception:
+        pass
+    raise ValueError("source_unavailable: selected source configuration unavailable")
+
+
+def _create_source_connector(
+    source: sources.SourceDescriptor, spec: tuple[str | None, dict]
+) -> SQLDatabase:
+    url, settings = spec
+    try:
+        connector = create_connector(
+            url if url is not None else build_connection_string(settings),
+            schemas=_schema_filter(settings),
+            table_filter=_table_filter(settings),
         )
-        raise
+        connector.connection_id = source.connection_id
+        return connector
+    except Exception:
+        raise ValueError(
+            "source_unavailable: could not initialize selected source"
+        ) from None
+
+
+def _cached_connector(
+    source: sources.SourceDescriptor, spec: tuple[str | None, dict] | None = None
+) -> SQLDatabase:
+    source_id = source.connection_id
+    if source_id not in _connectors:
+        spec = spec if spec is not None else _load_spec(source)
+        connector = _create_source_connector(source, spec)
+        _connectors[source_id] = connector
+        _connection_specs[source_id] = spec
+    return _connectors[source_id]
+
+
+def get_connector(connection_id: str) -> SQLDatabase:
+    """Return this active source's cached stored-credential connector."""
+    return _cached_connector(_resolve_source(connection_id))
 
 
 def get_connectors_for_subject_token(
-    subject_token: str | None,
+    subject_token: str | None, connection_id: str | None = None
 ) -> list[SQLDatabase]:
-    """Build connectors, authenticating federated connections as the caller.
+    """Return one selected connector; federated callers never use the stored PAT.
 
-    Connections with "Authenticate as signed-in user" enabled get their stored
-    PAT replaced by a token exchanged from *subject_token* (the caller's SSO
-    JWT), so SQL runs under that user's Unity Catalog grants. Every other
-    connection is untouched and reuses the shared cache.
-
-    Fail-closed: a federated connection with no usable subject token raises
-    rather than falling back to the stored PAT — otherwise the query would
-    silently run with the PAT's broader privileges.
-
-    Raises:
-        DatabricksOAuthError: no subject token, or the exchange was rejected.
+    Omitting the ID is supported only with one active descriptor. Per-user
+    connectors are fresh and never enter the service-credential cache.
     """
     from auto_ontology.connectors.databricks_oauth import (
         DatabricksOAuthError,
         exchange_subject_token,
         uses_sso_federation,
     )
-    from auto_ontology.dal.connections import list_connections
 
-    try:
-        connections = list_connections()
-    except Exception:
-        logger.exception("Failed to load connections for per-user Databricks auth")
-        raise
-
-    federated = [conn for conn in connections if uses_sso_federation(conn)]
-    if not federated:
-        return get_connectors()
-
+    source = _resolve_source(connection_id)
+    spec = _connection_specs.get(source.connection_id)
+    if spec is None:
+        spec = _load_spec(source)
+    _, settings = spec
+    if not uses_sso_federation(settings):
+        return [_cached_connector(source, spec)]
     if not subject_token:
         raise DatabricksOAuthError(
-            "This connection authenticates as the signed-in user, but the "
-            "request carried no SSO token"
+            "Selected source requires a signed-in user's SSO token"
         )
-
-    loaded: list[SQLDatabase] = []
-    federated_names: set[str] = set()
-    for conn in federated:
+    try:
         access_token = exchange_subject_token(
-            str(conn.get("host") or ""), subject_token
+            str(settings.get("host") or ""), subject_token
         )
-        connection_string = build_connection_string(
-            {**conn, "access_token_override": access_token}
+        if not access_token:
+            raise DatabricksOAuthError
+    except Exception:
+        raise DatabricksOAuthError(
+            "Selected source SSO token exchange failed"
+        ) from None
+    return [
+        _create_source_connector(
+            source, (None, {**settings, "access_token_override": access_token})
         )
-        connector = create_connector(
-            connection_string,
-            schemas=_schema_filter(conn),
-            table_filter=_table_filter(conn),
-        )
-        federated_names.add(connector.database_name)
-        loaded.append(connector)
-
-    # Non-federated connections keep their own credentials; reuse the shared
-    # cache rather than rebuilding them per request.
-    loaded.extend(
-        connector
-        for connector in get_connectors()
-        if connector.database_name not in federated_names
-    )
-    return loaded
+    ]
 
 
 def get_connectors() -> list[SQLDatabase]:
-    """Return cached connectors for all configured connections.
-
-    Text-to-SQL resolves the execution connector from
-    ``relevant_tables[*].database_name`` (see
-    ``auto_ontology.retrieval.text_to_sql.connector_routing``).
-    Each connector's ``database_name`` must therefore be unique across the
-    returned list — use ``metadata_database`` on Snowflake URLs (or distinct
-    physical databases) when wiring multiple connections.
-    """
-    global _connectors
-    if _connectors is None:
-        from auto_ontology.dal.connections import list_connections
-
-        # Each spec is (connection_string, schema_allowlist, table_filter). The
-        # schema filter is honoured only during ingestion introspection
-        # (Databricks, Snowflake, Kyuubi, and Trino); it is inert for retrieval,
-        # which executes SQL rather than introspecting. The table filter is
-        # likewise ingestion-only, but applies to every connector.
+    """Explicit all-source ingestion enumeration, skipping unavailable sources."""
+    loaded: list[SQLDatabase] = []
+    for source in sources.list_active_sources():
         try:
-            specs: list[tuple[str, list[str] | None, TableFilter]] = [
-                (
-                    build_connection_string(conn),
-                    _schema_filter(conn),
-                    _table_filter(conn),
-                )
-                for conn in list_connections()
-            ]
+            loaded.append(_cached_connector(source))
         except Exception:
-            logger.exception("Failed to load connection strings from the catalog")
-            specs = []
-        if not specs:
-            # CONNECTION_STRINGS carries no connection dict, so an env-configured
-            # connection cannot express a table filter.
-            raw = os.environ.get("CONNECTION_STRINGS", "")
-            specs = [
-                (connection_string, None, TableFilter())
-                for connection_string in parse_connection_strings(raw)
-            ]
-        if not specs:
             logger.warning(
-                "No connections configured. Add CONNECTION_STRINGS to your .env "
-                "or create a connection in Settings → Connections."
+                "Source %s unavailable; skipping connector", source.connection_id
             )
-            return []
-
-        loaded: list[SQLDatabase] = []
-        seen_database_names: set[str] = set()
-        for cs, schemas, table_filter in specs:
-            connector = create_connector(cs, schemas=schemas, table_filter=table_filter)
-            database_name = connector.database_name
-            if database_name in seen_database_names:
-                logger.warning(
-                    "Duplicate connector database_name %r — NeMo routes SQL by "
-                    "database_name, so only one connector per name can be used. "
-                    "Set metadata_database on the connection string to disambiguate.",
-                    database_name,
-                )
-            seen_database_names.add(database_name)
-            loaded.append(connector)
-        _connectors = loaded
-    return list(_connectors)
+    return loaded

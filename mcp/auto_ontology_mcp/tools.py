@@ -60,6 +60,18 @@ class ToolSpec:
 CURATED: tuple[ToolSpec, ...] = (
     ToolSpec(
         method="GET",
+        path="/api/connections/sources",
+        name="list_sources",
+        description=(
+            "List active sources with safe IDs, display labels, physical database "
+            "names and dialects. Select an explicit connection_id or connection_label "
+            "for ask_question when several sources are available. Use the same "
+            "source projection for check_answerable and semantic tools; this is "
+            "source discovery, not physical schema or column browsing."
+        ),
+    ),
+    ToolSpec(
+        method="GET",
         path="/api/terms",
         name="search_terms",
         description=(

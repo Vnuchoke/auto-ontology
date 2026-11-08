@@ -1,0 +1,86 @@
+{
+  "description": "Synthetic only. local is preexisting; remote is a new source, not a second legacy database row.",
+  "sources": [
+    {
+      "connection_id": "11111111-1111-4111-8111-111111111111",
+      "connection_label": "Local sales",
+      "connection": {
+        "type": "postgresql",
+        "host": "local-sales.example.invalid",
+        "port": "5432",
+        "database": "sales",
+        "user": "test_dummy_local",
+        "password": "TEST_DUMMY_LOCAL_PASSWORD",
+        "schemas": ["public"]
+      },
+      "table": {
+        "id": "11111111-1111-4111-8111-111111111113",
+        "connection_id": "11111111-1111-4111-8111-111111111111",
+        "database_name": "sales",
+        "schema_name": "public",
+        "name": "orders",
+        "columns": ["order_id", "amount", "draft_status"],
+        "sample_rows": [{"order_id": 101, "amount": 111, "draft_status": "LOCAL_DRAFT_ONLY"}]
+      }
+    },
+    {
+      "connection_id": "22222222-2222-4222-8222-222222222221",
+      "connection_label": "Remote sales",
+      "connection": {
+        "type": "postgresql",
+        "host": "remote-sales.example.invalid",
+        "port": "5432",
+        "database": "sales",
+        "user": "test_dummy_remote",
+        "password": "TEST_DUMMY_REMOTE_PASSWORD",
+        "schemas": ["public"]
+      },
+      "table": {
+        "id": "22222222-2222-4222-8222-222222222223",
+        "connection_id": "22222222-2222-4222-8222-222222222221",
+        "database_name": "sales",
+        "schema_name": "public",
+        "name": "orders",
+        "columns": ["order_id", "amount", "shipment_status"],
+        "sample_rows": [{"order_id": 202, "amount": 222, "shipment_status": "REMOTE_SHIPPED_ONLY"}]
+      }
+    }
+  ],
+  "shared_term": {
+    "id": "33333333-3333-4333-8333-333333333333",
+    "name": "Order",
+    "table_ids": ["11111111-1111-4111-8111-111111111113", "22222222-2222-4222-8222-222222222223"]
+  },
+  "legacy_snapshot": {
+    "catalog_database": [{
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "sales",
+      "description": "Curated legacy sales database"
+    }],
+    "catalog_schema": [{
+      "id": "11111111-1111-4111-8111-111111111112",
+      "database_id": "11111111-1111-4111-8111-111111111111",
+      "name": "public"
+    }],
+    "catalog_table": [{
+      "id": "11111111-1111-4111-8111-111111111113",
+      "schema_id": "11111111-1111-4111-8111-111111111112",
+      "name": "orders",
+      "description": "Curated legacy orders"
+    }],
+    "catalog_column": [
+      {"id": "11111111-1111-4111-8111-111111111114", "table_id": "11111111-1111-4111-8111-111111111113", "name": "order_id", "sample_values": "[101]"},
+      {"id": "11111111-1111-4111-8111-111111111115", "table_id": "11111111-1111-4111-8111-111111111113", "name": "amount", "sample_values": "[111]"},
+      {"id": "11111111-1111-4111-8111-111111111116", "table_id": "11111111-1111-4111-8111-111111111113", "name": "draft_status", "sample_values": "[\"LOCAL_DRAFT_ONLY\"]"}
+    ],
+    "credential_storage_variants": {
+      "description": "Alternative snapshots of the SAME old root, never simultaneous rows. Inline connection_ref selects sources[0].connection; Vault reference is an exact dummy legacy name path.",
+      "inline": {"root_id": "11111111-1111-4111-8111-111111111111", "connection_ref": "sources[0].connection"},
+      "vault": {"root_id": "11111111-1111-4111-8111-111111111111", "connection": null, "credential_ref": "test-dummy/connections/sales"}
+    },
+    "conversations": [
+      {"id": "44444444-4444-4444-8444-444444444441", "user_id": "test_dummy_user", "title": "Legacy sales question", "connection_id": null},
+      {"id": "44444444-4444-4444-8444-444444444442", "user_id": "test_dummy_user", "title": "Empty legacy chat", "connection_id": null}
+    ]
+  }
+}

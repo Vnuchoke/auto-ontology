@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 def ingest_catalog(connector: "SQLDatabase") -> tuple[pd.DataFrame, pd.DataFrame]:
     """Extract *connector*'s catalog, write it to the store, return what landed.
 
+    The connector must carry its previously registered ``connection_id``.
+    ``database_name`` remains the physical SQL name, never a catalog root key.
+
     The returned ``(tables_df, columns_df)`` pair is concatenated across every
     ingested :class:`~auto_ontology.catalog.model.schema.Schema` and carries the ids
     assigned to each Table/Column node, so downstream embedding can build its
@@ -53,4 +56,6 @@ def ingest_catalog(connector: "SQLDatabase") -> tuple[pd.DataFrame, pd.DataFrame
     columns = [s.columns_df for s in schemas.values() if s.columns_df is not None]
     tables_df = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
     columns_df = pd.concat(columns, ignore_index=True) if columns else pd.DataFrame()
+    for frame in (tables_df, columns_df):
+        frame["connection_id"] = connector.connection_id
     return tables_df, columns_df

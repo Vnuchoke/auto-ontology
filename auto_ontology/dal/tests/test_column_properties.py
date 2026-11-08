@@ -47,7 +47,7 @@ def _add(table, **values) -> str:
 class World:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        self.db = _add(s.catalog_database, name=prefix)
+        self.db = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.db, name="public")
         self.tables: dict[str, str] = {}
         self.columns: dict[str, str] = {}

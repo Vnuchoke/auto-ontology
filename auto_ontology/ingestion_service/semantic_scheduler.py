@@ -8,6 +8,8 @@ Runs :func:`run_semantic_compilation` for every configured connection once at
 startup, then again every 24h measured from the end of the previous run. An
 API-triggered run also resets that 24h timer, so the next automatic run is
 always one interval after the most recent run — scheduled or manual.
+Discovery uses the same metadata-only, env-first source IDs as data ingestion;
+it never opens a connector just to enumerate a physical database name.
 
 Every pass re-checks the ``semantic_compilation_enabled`` settings flag and
 no-ops when it is off, so disabling in the UI takes effect on the next run
@@ -40,7 +42,7 @@ import time
 from datetime import timedelta
 
 from auto_ontology.ingestion_service.config import is_semantic_compilation_enabled
-from auto_ontology.ingestion_service.connections import resolve_database_names
+from auto_ontology.ingestion_service.connections import resolve_connection_ids
 from auto_ontology.ingestion_service.history import (
     RUN_FAILED,
     RUN_SUCCEEDED,
@@ -151,15 +153,15 @@ class SemanticScheduler(IntervalScheduler):
             # after the very first one returns immediately here.
             await self._depends_on.wait_first_pass()
 
-        databases = resolve_database_names()
-        if not databases:
+        connection_ids = resolve_connection_ids()
+        if not connection_ids:
             logger.info(
                 "semantic: no connections configured; nothing to compile. "
                 "Add a connection in Settings → Connections."
             )
             return
 
-        logger.info("semantic: starting (%d database(s))", len(databases))
+        logger.info("semantic: starting (%d database(s))", len(connection_ids))
         started = time.monotonic()
         succeeded = failed = 0
         total_tables = 0
@@ -172,7 +174,7 @@ class SemanticScheduler(IntervalScheduler):
         # aborted run leaves the row NULL rather than storing an outcome.
         outcome: str | None = RUN_SUCCEEDED
         try:
-            for index, database_name in enumerate(databases):
+            for index, connection_id in enumerate(connection_ids):
                 # Checked per database rather than once per pass, so a stop
                 # request or a disable ends the run at the next boundary instead
                 # of after every database. The database in flight is not
@@ -183,7 +185,7 @@ class SemanticScheduler(IntervalScheduler):
                 if self.aborting:
                     logger.info(
                         "semantic: stopped on request; %d database(s) not compiled",
-                        len(databases) - index,
+                        len(connection_ids) - index,
                     )
                     if outcome != RUN_FAILED:
                         outcome = None
@@ -191,7 +193,7 @@ class SemanticScheduler(IntervalScheduler):
                 if not is_semantic_compilation_enabled():
                     logger.info(
                         "semantic: disabled mid-run; %d database(s) not compiled",
-                        len(databases) - index,
+                        len(connection_ids) - index,
                     )
                     if outcome != RUN_FAILED:
                         outcome = None
@@ -200,7 +202,7 @@ class SemanticScheduler(IntervalScheduler):
                 try:
                     database_started = time.monotonic()
                     tables_processed = await asyncio.to_thread(
-                        run_semantic_compilation, database_name
+                        run_semantic_compilation, connection_id
                     )
                     succeeded += 1
                     total_tables += tables_processed
@@ -211,14 +213,14 @@ class SemanticScheduler(IntervalScheduler):
                     logger.info(
                         "Finished semantic compilation successfully for database %s: "
                         "%d table(s) compiled in %.1fs",
-                        database_name,
+                        connection_id,
                         tables_processed,
                         time.monotonic() - database_started,
                     )
                 except Exception:
                     failed += 1
                     outcome = RUN_FAILED
-                    logger.exception("semantic: failed for database %s", database_name)
+                    logger.exception("semantic: failed for database %s", connection_id)
 
             # The boundary checks above catch a stop/disable before the next
             # database. There is no next boundary after the final database, so
@@ -242,7 +244,10 @@ class SemanticScheduler(IntervalScheduler):
 
             # Before the rules, so a rule matching on the PII tag sees the
             # attributes compilation just created already labelled.
-            await run_pii_propagation_in_thread(self.name)
+            for connection_id in connection_ids:
+                await run_pii_propagation_in_thread(
+                    self.name, connection_id=connection_id
+                )
             await self._reapply_rules()
         finally:
             # A no-op when outcome is None (stop/disable) — see
@@ -260,7 +265,7 @@ class SemanticScheduler(IntervalScheduler):
                     "semantic: stopped — %d of %d database(s) compiled, "
                     "%d table(s) processed in %.1fs",
                     succeeded,
-                    len(databases),
+                    len(connection_ids),
                     total_tables,
                     elapsed,
                 )
@@ -269,7 +274,7 @@ class SemanticScheduler(IntervalScheduler):
                     "semantic: finished with errors — %d of %d database(s) succeeded, "
                     "%d failed, %d table(s) processed in %.1fs",
                     succeeded,
-                    len(databases),
+                    len(connection_ids),
                     failed,
                     total_tables,
                     elapsed,

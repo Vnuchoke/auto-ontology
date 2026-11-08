@@ -108,6 +108,7 @@ class SQLFromTablesAgent(BaseAgent):
                 state["data_retriever"],
                 question,
                 database_name=path_state.get("target_db"),
+                connection_id=state["connection_id"],
             )
         similar_questions = []
 

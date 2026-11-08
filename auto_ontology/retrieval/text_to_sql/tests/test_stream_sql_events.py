@@ -17,6 +17,7 @@ import pytest
 
 from auto_ontology.retrieval.text_to_sql.state import TextToSQLPayload
 from auto_ontology.utils import llm_invoke
+from .source_fixtures import graph_state
 
 
 @pytest.fixture(name="main")
@@ -96,7 +97,7 @@ def _run(
     needs a live LLM — neither is what's under test, so both are replaced.
     """
 
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(
         main,
         "app",
@@ -440,7 +441,7 @@ def test_generator_iterates_lazily(
             [{"execute_sql_query": {"path_state": {"sql_code": "SELECT 1"}}}]
         )
 
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(
         main,
         "app",
@@ -449,6 +450,7 @@ def test_generator_iterates_lazily(
 
     stream = main.stream_agent_response(cast(TextToSQLPayload, {"question": "q"}))
 
+    assert next(stream)["type"] == "source"
     assert next(stream)["phase"] == "start"
     assert next(stream)["phase"] == "end"
     assert next(stream)["type"] == "sql"
@@ -497,8 +499,9 @@ def test_entry_router_is_not_streamed(
         [{"_entry_router": {"path_state": {"final_response": {"response": "routed"}}}}],
     )
 
-    assert [event["type"] for event in events] == ["result"]
-    assert events[0]["answer"] == {"response": "routed"}
+    assert [event["type"] for event in events] == ["source", "result"]
+    assert events[1]["answer"]["response"] == "routed"
+    assert events[1]["answer"]["source"] == events[0]["source"]
 
 
 def test_start_precedes_the_nodes_own_update(
@@ -514,7 +517,7 @@ def test_start_precedes_the_nodes_own_update(
         order.append("node finished")
         yield ("updates", {"reconstruct_sql": {"path_state": {}}})
 
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(
         main,
         "app",
@@ -522,6 +525,7 @@ def test_start_precedes_the_nodes_own_update(
     )
 
     stream = main.stream_agent_response(cast(TextToSQLPayload, {"question": "q"}))
+    assert next(stream)["type"] == "source"
     first = next(stream)
 
     assert (first["phase"], first["node"]) == ("start", "reconstruct_sql")
@@ -539,7 +543,7 @@ def test_unknown_custom_payloads_are_ignored(
         yield ("custom", {"type": "step_start"})  # no node name
         yield from _stream_items([_validation_ok_step("SELECT 1")])
 
-    monkeypatch.setattr(main, "_build_state", lambda payload: {"path_state": {}})
+    monkeypatch.setattr(main, "_build_state", graph_state)
     monkeypatch.setattr(
         main,
         "app",

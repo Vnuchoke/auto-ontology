@@ -10,8 +10,8 @@ those from another Python thread, so cancellation has to go through the
 OS via process kill — same constraint as before.
 
 What's new vs. spawn-per-request: we keep **one** subprocess alive
-between requests. It imports the agent and builds the
-retriever/connector singletons once, then loops on an input queue:
+between requests. It imports the agent once, then loops on an input queue;
+source resources are opened only after each question's source/readiness gate:
 ``("ask", question)`` → stream agent events on the output queue → idle
 again. The cold-start cost is paid at server boot and at each cancel
 (when we kill+respawn), not per request.
@@ -35,8 +35,8 @@ from typing import Any, Generator
 
 logger = logging.getLogger(__name__)
 
-# Wire-format tags. ``ready`` is sent once after imports + retriever/connector
-# init complete, so the pool can tell a warming worker from a fully usable
+# Wire-format tags. ``ready`` is sent once imports complete, so the pool can
+# tell a warming worker from a fully usable
 # one (the parent doesn't strictly *need* to wait — submit() will just block
 # on the worker's in_queue.get() until the loop runs — but knowing readiness
 # helps with logging/health checks).
@@ -81,7 +81,8 @@ def _worker_loop(
         )
         from auto_ontology.retrieval.text_to_sql.follow_up import resolve_follow_up
 
-        from auto_ontology.connectors import get_connectors
+        from auto_ontology.connectors.registry import get_connectors_for_subject_token
+        from auto_ontology.retrieval.source_context import resolve_query_source
         from auto_ontology.utils.llm_invoke import (
             get_llm_client,
             get_non_reasoning_llm_client,
@@ -95,20 +96,6 @@ def _worker_loop(
             fetch_custom_prompts,
         )
 
-        # Eagerly build the heavyweights so they're hot before the first ask.
-        data_retriever = get_data_objects_retriever()
-        semantic_retriever = get_semantic_objects_retriever()
-        connectors = get_connectors()
-        try:
-            follow_up_llm = get_non_reasoning_llm_client(max_tokens=1024)
-        except Exception:
-            try:
-                follow_up_llm = get_llm_client(max_tokens=1024)
-            except Exception:
-                logger.exception(
-                    "No LLM available for follow-up resolution; using raw questions"
-                )
-                follow_up_llm = None
     except BaseException as exc:  # noqa: BLE001 — surface init failure to parent
         logger.exception("Worker init failed")
         try:
@@ -141,35 +128,25 @@ def _worker_loop(
             subject_token,
             conversation_history,
             evidence,
+            connection_id,
         ) = payload
         try:
-            # Connections are resolved once at worker init. If that
-            # lookup came back empty — the store not yet reachable when this
-            # subprocess booted, or the first connection created afterwards —
-            # the snapshot would stay empty for the life of the process and
-            # every question would fail with "missing required 'connectors'"
-            # until the pod restarted. Re-resolve lazily so the worker heals
-            # itself; get_connectors() caches a non-empty result and only
-            # retries while there is nothing to cache, so this costs nothing
-            # on the normal path.
-            #
-            # This has to run BEFORE ``ask_connectors`` is bound: binding first
-            # would capture the stale empty list, and rebinding ``connectors``
-            # here would not update it, leaving the healing ineffective.
-            if not connectors:
-                connectors = get_connectors()
-
-            # Per-user Databricks auth trades the prewarmed connectors for ones
-            # bound to the caller's exchanged token. Databricks connectors open
-            # connections per operation, so rebuilding them here is cheap.
-            if subject_token is not None:
-                from auto_ontology.connectors.registry import (
-                    get_connectors_for_subject_token,
-                )
-
-                ask_connectors = get_connectors_for_subject_token(subject_token)
-            else:
-                ask_connectors = connectors
+            source = resolve_query_source(
+                connection_id=connection_id, target_db=target_db
+            )
+            ask_connectors = get_connectors_for_subject_token(
+                subject_token, connection_id=source.connection_id
+            )
+            data_retriever = get_data_objects_retriever()
+            semantic_retriever = get_semantic_objects_retriever()
+            try:
+                follow_up_llm = get_non_reasoning_llm_client(max_tokens=1024)
+            except Exception:
+                try:
+                    follow_up_llm = get_llm_client(max_tokens=1024)
+                except Exception:
+                    logger.exception("No LLM available for follow-up resolution")
+                    follow_up_llm = None
 
             is_follow_up, processing_question = resolve_follow_up(
                 question=question,
@@ -185,6 +162,7 @@ def _worker_loop(
 
             agent_payload = {
                 "question": question,
+                "connection_id": source.connection_id,
                 "evidence": evidence or "",
                 "processing_question": processing_question,
                 "prediction": prediction,
@@ -194,8 +172,6 @@ def _worker_loop(
                 "acronyms": fetch_acronyms(),
                 "custom_prompts": custom_prompts,
             }
-            if target_db:
-                agent_payload["target_db"] = target_db
             for event in stream_agent_response(agent_payload):
                 out_q.put((_TAG_EVENT, event))
         except BaseException as exc:  # noqa: BLE001 — surface to parent
@@ -246,15 +222,18 @@ class PrewarmedWorker:
         subject_token: str | None = None,
         conversation_history: list[dict[str, str | None]] | None = None,
         evidence: str | None = None,
+        *,
+        connection_id: str | None = None,
     ) -> None:
         """Ask *question*, optionally forcing the prediction/SQL branch.
 
         *prediction* mirrors the API parameter: True or False skips the
         classification step, None classifies as usual.
-        *target_db* scopes the run to one connected database when set.
+        *connection_id* is the canonical source selector; *target_db* is its
+        legacy adapter and cannot be combined with it.
         *subject_token* is the caller's SSO JWT. When present the worker builds
-        per-user connectors for this question instead of using the prewarmed
-        ones, so SQL executes under that user's own Databricks grants.
+        the selected per-user connector for this question, so SQL executes
+        under that user's own Databricks grants.
         *evidence* is optional authoritative evidence kept separate from
         the question.
         """
@@ -268,6 +247,7 @@ class PrewarmedWorker:
                     subject_token,
                     conversation_history or [],
                     evidence,
+                    connection_id,
                 ),
             )
         )

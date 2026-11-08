@@ -14,40 +14,27 @@ Usage::
 from __future__ import annotations
 
 import logging
-import os
-
-from auto_ontology.utils.embedding_rows import (
-    CatalogEmbeddingRowsOp,
-)
-from auto_ontology.catalog import ingest_catalog
-from auto_ontology.utils import get_embed_params
-from auto_ontology.utils.embedding import batch_embed
-from auto_ontology.vdb import get_data_vdb
-from auto_ontology.vdb.records import write_embedded_rows
-from auto_ontology.connectors.registry import create_connector
+from auto_ontology.connectors.registry import get_connector
+from auto_ontology.connectors.sources import bootstrap_sources, list_active_sources
+from auto_ontology.dal.schema_version import require_current_schema
+from auto_ontology.ingestion_service.ingest import run_ingest as ingest_connector
 
 logger = logging.getLogger("dev_tools.local_ingest")
 
 
-def run_ingest(connection_string: str) -> None:
-    """Ingest the catalog, embed it, and write the embeddings to pgvector."""
-    connector = create_connector(connection_string)
-    database_name = connector.database_name
+def run_ingest(connection_id: str) -> None:
+    """Ingest only a registered, active source through the shared pipeline."""
+    ingest_connector(get_connector(connection_id))
 
-    schema_data = ingest_catalog(connector)
 
-    embed_rows = CatalogEmbeddingRowsOp(database_name=database_name)(schema_data)
-    result_df = batch_embed(embed_rows, get_embed_params())
-
-    # PostgresVDB.__init__ wipes existing rows for `database_name` before we
-    # re-ingest, so the store starts clean for this database.
-    vdb = get_data_vdb(database_name=database_name)
-
-    if result_df is not None and not result_df.empty:
-        written = write_embedded_rows(vdb, result_df)
-        logger.info("Tabular ingest: %d rows written to pgvector.", written)
-    else:
-        logger.info("Tabular ingest: no rows produced.")
+def main() -> None:
+    """Register env metadata, then ingest the first configured source as before."""
+    require_current_schema()
+    bootstrap_sources()
+    sources = list_active_sources()
+    if not sources:
+        raise EnvironmentError("No active sources configured for local ingest")
+    run_ingest(sources[0].connection_id)
 
 
 if __name__ == "__main__":
@@ -55,17 +42,8 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Remote source DB to extract tabular schema/embeddings from. Kept separate
-    # from the local POSTGRES_* vars (which point at the pgvector store).
-    _CONNECTION_STRINGS = os.environ.get("CONNECTION_STRINGS", "")
-    connection_string = _CONNECTION_STRINGS.split(",")[0].strip()
-    if not connection_string:
-        raise EnvironmentError(
-            "CONNECTION_STRINGS is not set. Add it to your .env, e.g.:\n\n"
-            "    CONNECTION_STRINGS=postgresql://user:password@host:5432/dbname"
-        )
     try:
-        run_ingest(connection_string)
+        main()
     except KeyboardInterrupt:
         logger.info("local_ingest: shutting down")
         raise SystemExit(0)

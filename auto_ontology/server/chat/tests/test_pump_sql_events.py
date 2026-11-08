@@ -52,6 +52,11 @@ def _run_pump(events: list[dict[str, Any]]) -> router._Slot:
         client_alive=threading.Event(),
         cancelled=threading.Event(),
         released=threading.Event(),
+        source={
+            "connection_id": "accepted-source",
+            "display_label": "East",
+            "database_name": "sales",
+        },
     )
     router._pump(slot)
     return slot
@@ -92,6 +97,7 @@ def test_error_persists_the_last_streamed_sql(
 
     assert persisted[0]["sql_code"] == "SELECT b"
     assert persisted[0]["response"] == "Agent failed: boom"
+    assert persisted[0]["connection_id"] == "accepted-source"
 
 
 def test_answer_without_sql_falls_back_to_the_last_attempt(

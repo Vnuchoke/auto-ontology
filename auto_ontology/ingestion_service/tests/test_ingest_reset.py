@@ -22,6 +22,7 @@ import pytest
 
 class _Connector:
     database_name = "pagila"
+    connection_id = "A"
 
 
 class _RecordingVdb:
@@ -40,6 +41,7 @@ def _row(node_id: str, embedding: list[float] | None) -> dict:
         "name": node_id,
         "source_path": f"auto_ontology:{node_id}",
         "database_name": "pagila",
+        "connection_id": "A",
         "content_metadata": {"id": node_id},
     }
     if embedding is not None:
@@ -64,7 +66,11 @@ def resets(monkeypatch: pytest.MonkeyPatch) -> list[_RecordingVdb]:
     created: list[_RecordingVdb] = []
 
     def _get_data_vdb(**kwargs: Any) -> _RecordingVdb:
-        assert kwargs.get("reset") is True
+        assert kwargs == {
+            "reset": True,
+            "connection_id": "A",
+            "database_name": "pagila",
+        }
         vdb = _RecordingVdb()
         created.append(vdb)
         return vdb

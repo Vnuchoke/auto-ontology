@@ -16,6 +16,8 @@ import sqlglot
 from langchain_core.messages import SystemMessage
 from pydantic import Field, model_validator
 from sqlglot import exp
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+from sqlglot.optimizer.scope import traverse_scope
 
 from auto_ontology.retrieval.text_to_sql.agents.empty_like_result_check import (
     _set_sql_code,
@@ -214,24 +216,42 @@ def _normalize_query(sql: str) -> str:
 def _allowed_probe_tables(sql: str, tables: list[dict], dialect: str | None) -> bool:
     """Restrict model-authored probes to the already-retrieved table scope."""
     try:
-        tree = sqlglot.parse_one(sql, read=dialect)
+        tree = normalize_identifiers(
+            sqlglot.parse_one(sql, read=dialect), dialect=dialect
+        )
+        referenced = [
+            source
+            for scope in traverse_scope(tree)
+            for _, source in scope.selected_sources.values()
+            if isinstance(source, exp.Table)
+        ]
     except Exception:
         return False
+
+    def identifier(value: str) -> str:
+        # Catalog names are actual identifiers; quoted case is significant on Postgres.
+        return normalize_identifiers(
+            exp.to_identifier(value, quoted=True), dialect=dialect
+        ).name
+
     allowed = {
-        str(table.get("name") or "").strip().casefold()
+        tuple(
+            identifier(str(table.get(key) or ""))
+            for key in ("database_name", "schema_name", "name")
+        )
         for table in tables
         if table.get("name")
     }
-    ctes = {
-        str(cte.alias_or_name or "").strip().casefold()
-        for cte in tree.find_all(exp.CTE)
-    }
-    referenced = {
-        str(table.name or "").strip().casefold()
-        for table in tree.find_all(exp.Table)
-        if str(table.name or "").strip().casefold() not in ctes
-    }
-    return bool(referenced) and referenced <= allowed
+    return bool(referenced) and all(
+        sum(
+            name == table.name
+            and (not table.db or table.db == (schema or catalog))
+            and (not table.catalog or table.catalog == catalog)
+            for catalog, schema, name in allowed
+        )
+        == 1
+        for table in referenced
+    )
 
 
 def _literal_skeleton(sql: str, dialect: str | None) -> str | None:
@@ -660,14 +680,14 @@ class SQLValueValidationAgent(BaseAgent):
             probe_sql = action.arguments.sql
             signature = _normalize_query(probe_sql)
             cache_key = f"{connector_key}::{signature}"
-            if cache_key in query_cache:
-                result = query_cache[cache_key]
-            elif not _allowed_probe_tables(probe_sql, tables, dialect):
+            if not _allowed_probe_tables(probe_sql, tables, dialect):
                 result = {
                     "ok": False,
                     "rows": None,
                     "error": "query references a table outside the relevant schema",
                 }
+            elif cache_key in query_cache:
+                result = query_cache[cache_key]
             else:
                 result = executor.run(probe_sql, purpose=action.arguments.purpose)
                 query_cache[cache_key] = result

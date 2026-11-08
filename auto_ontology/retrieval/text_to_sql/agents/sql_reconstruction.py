@@ -504,6 +504,7 @@ class SQLReconstructionAgent(BaseAgent):
                     query_text,
                     k=3,
                     database_name=database_name,
+                    connection_id=state["connection_id"],
                 )
                 combined.extend(hits)
             except Exception:
@@ -528,7 +529,7 @@ class SQLReconstructionAgent(BaseAgent):
             self.logger.info("Discovery found no tables beyond existing set")
             return []
 
-        enriched = fetch_tables_by_ids(new_ids)
+        enriched = fetch_tables_by_ids(new_ids, connection_id=state["connection_id"])
         self.logger.info(
             "Discovery found %d new table(s): %s",
             len(enriched),

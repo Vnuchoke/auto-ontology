@@ -156,6 +156,18 @@ def test_publishes_exactly_the_curated_tools_plus_the_handwritten_ones() -> None
         "ask_question",
         "check_readiness",
     }
+    assert names == {
+        "list_sources",
+        "search_terms",
+        "get_term",
+        "get_term_columns",
+        "get_term_sql_attributes",
+        "get_sql_attribute",
+        "describe_table",
+        "check_answerable",
+        "ask_question",
+        "check_readiness",
+    }
 
 
 def test_every_tool_carries_a_description() -> None:
@@ -180,7 +192,83 @@ def test_ask_question_reports_a_structured_answer() -> None:
     ask = next(tool for tool in _tools() if tool.name == "ask_question")
 
     assert ask.outputSchema is not None
-    assert set(ask.outputSchema["properties"]) >= {"answer", "sql", "rows"}
+    assert set(ask.outputSchema["properties"]) >= {"answer", "sql", "rows", "source"}
+    assert set(ask.inputSchema["properties"]) == {
+        "question",
+        "conversation_id",
+        "evidence",
+        "connection_id",
+        "connection_label",
+    }
+
+
+@pytest.mark.parametrize("status", [200, 403])
+def test_generated_list_sources_calls_discovery_as_the_signed_in_caller(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    requests: list[httpx.Request] = []
+    sources = [
+        {
+            "connection_id": "local-id",
+            "display_label": "sales-local",
+            "database_name": "sales",
+            "dialect": "postgresql",
+        },
+        {
+            "connection_id": "prod-id",
+            "display_label": "sales-prod",
+            "database_name": "sales",
+            "dialect": "postgresql",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            status,
+            json={"data": sources, "count": 2}
+            if status == 200
+            else {"detail": "Missing chat:use permission"},
+        )
+
+    client = httpx.AsyncClient(
+        base_url=_settings().api_url,
+        auth=CallerAuth(),
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(server, "build_client", lambda settings: client)
+    monkeypatch.setattr(server, "auto_ontology_access_token", lambda: "chat-only-token")
+    mcp, owned_client = build_server(_settings())
+
+    async def run() -> Any:
+        try:
+            async with Client(mcp) as session:
+                return await session.call_tool("list_sources", {})
+        finally:
+            await owned_client.aclose()
+
+    if status == 403:
+        with pytest.raises(ToolError, match="403"):
+            asyncio.run(run())
+    else:
+        result = asyncio.run(run())
+        assert result.structured_content == {"data": sources, "count": 2}
+        assert all(
+            set(source)
+            == {
+                "connection_id",
+                "display_label",
+                "database_name",
+                "dialect",
+            }
+            for source in result.structured_content["data"]
+        )
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == "/api/connections/sources"
+    assert requests[0].url.query == b""
+    assert requests[0].headers["authorization"] == "Bearer chat-only-token"
 
 
 def test_handshake_advertises_the_auto_ontology_version() -> None:
@@ -240,6 +328,9 @@ def test_instructions_point_at_the_primary_tool() -> None:
     assert "ask_question" in INSTRUCTIONS
     assert "check_answerable" in INSTRUCTIONS
     assert "check_readiness" in INSTRUCTIONS
+    assert "list_sources" in INSTRUCTIONS
+    assert "connection_id" in INSTRUCTIONS
+    assert "`check_answerable` with the selected source" in INSTRUCTIONS
 
 
 def _sent_headers(

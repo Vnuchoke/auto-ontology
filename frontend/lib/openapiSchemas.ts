@@ -23,12 +23,48 @@ import { z } from 'zod';
 const uuid = () => z.string().meta({ format: 'uuid' });
 const timestamp = () => z.string().meta({ format: 'date-time' });
 
+/** Select at most one source; a bound conversation may omit all three. */
+export const sourceSelectors = {
+	connection_id: z
+		.string()
+		.min(1)
+		.nullish()
+		.describe('Stable source ID from list_sources; exclusive with other source selectors.'),
+	connection_label: z
+		.string()
+		.min(1)
+		.nullish()
+		.describe('Unique source label; exclusive with other source selectors.'),
+	target_db: z
+		.string()
+		.min(1)
+		.nullish()
+		.describe('Legacy physical name; rejected when ambiguous. Prefer connection_id.'),
+};
+
+/** Authoritative query snapshot; never contains credentials or connection settings. */
+export const sourceDescriptorSchema = z.object({
+	connection_id: z.string().min(1),
+	display_label: z.string().min(1),
+	database_name: z.string().min(1),
+});
+
+export const sourceErrorSchema = z.object({
+	detail: z.union([z.string(), z.object({ code: z.string() })]),
+});
+
 /** `NextResponse.json({ error }, { status })`, the shape every handler uses. */
 export const errorSchema = z.object({ error: z.string() });
 
 export const conversationSchema = z.object({
 	id: uuid(),
 	user_id: z.string().describe('Owner of the conversation; always the caller.'),
+	connection_id: z
+		.string()
+		.nullable()
+		.describe(
+			'Immutable source binding set by the backend when accepting the first turn; null for unbound or legacy conversations.',
+		),
 	title: z.string(),
 	created_at: timestamp(),
 	updated_at: timestamp(),

@@ -36,6 +36,30 @@
       "ChatRequest": {
         "description": "Payload sent by the frontend to start a chat completion.",
         "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact active source ID; mutually exclusive with connection_label and target_db.",
+            "title": "Connection Id"
+          },
+          "connection_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Source display label (PostgreSQL normalized); mutually exclusive with other selectors.",
+            "title": "Connection Label"
+          },
           "conversation_id": {
             "anyOf": [
               {
@@ -86,7 +110,7 @@
                 "type": "null"
               }
             ],
-            "description": "Catalog database UUID or database name used to scope retrieval and SQL.",
+            "description": "Legacy source UUID or unambiguous physical database name (not a label). Mutually exclusive with connection_id and connection_label. With no selector, only a single active source can be selected automatically.",
             "title": "Target Db"
           }
         },
@@ -902,6 +926,17 @@
             "additionalProperties": true,
             "title": "Connection",
             "type": "object"
+          },
+          "display_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Label"
           }
         },
         "required": [
@@ -917,6 +952,17 @@
             "title": "Connection",
             "type": "object"
           },
+          "display_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Label"
+          },
           "replacing": {
             "anyOf": [
               {
@@ -927,6 +973,17 @@
               }
             ],
             "title": "Replacing"
+          },
+          "replacing_connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replacing Connection Id"
           }
         },
         "required": [
@@ -958,10 +1015,50 @@
         "title": "ConnectionTestResponse",
         "type": "object"
       },
+      "ConnectionUpdateBody": {
+        "properties": {
+          "connection": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection"
+          },
+          "display_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Label"
+          }
+        },
+        "title": "ConnectionUpdateBody",
+        "type": "object"
+      },
       "CustomAnalysis": {
         "additionalProperties": true,
         "description": "A verified SQL example, joined with the text of its ``Sql`` node.",
         "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "description": {
             "anyOf": [
               {
@@ -1008,6 +1105,17 @@
       },
       "CustomAnalysisCreate": {
         "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "description": {
             "title": "Description",
             "type": "string"
@@ -1033,6 +1141,28 @@
       },
       "CustomAnalysisValidate": {
         "properties": {
+          "analysis_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis Id"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "sql": {
             "minLength": 1,
             "title": "Sql",
@@ -1587,6 +1717,17 @@
             ],
             "title": "Description"
           },
+          "display_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Label"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -1715,6 +1856,28 @@
       "EntityCoverageRequest": {
         "description": "Payload for the entity-coverage route.",
         "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
+          "connection_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Label"
+          },
           "max_distance": {
             "default": 0.75,
             "description": "Maximum L2 vector distance for a candidate to count (lower score = closer match).",
@@ -1726,6 +1889,17 @@
             "minLength": 1,
             "title": "Question",
             "type": "string"
+          },
+          "target_db": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Db"
           }
         },
         "required": [
@@ -1748,6 +1922,16 @@
           "coverage": {
             "title": "Coverage",
             "type": "number"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "uncovered_entities": {
             "anyOf": [
@@ -2747,6 +2931,28 @@
         "title": "ListResponse[PublicConnection]",
         "type": "object"
       },
+      "ListResponse_SourceSummary_": {
+        "additionalProperties": true,
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SourceSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data",
+          "count"
+        ],
+        "title": "ListResponse[SourceSummary]",
+        "type": "object"
+      },
       "ListResponse_SqlAttribute_": {
         "additionalProperties": true,
         "properties": {
@@ -2833,6 +3039,84 @@
           "count"
         ],
         "title": "ListResponse[Zone]",
+        "type": "object"
+      },
+      "ManualMessageRequest": {
+        "description": "A caller-produced turn; source selection is validated by the shared DAL.",
+        "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
+          "connection_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Label"
+          },
+          "content": {
+            "default": "",
+            "title": "Content",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "sql_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql Code"
+          },
+          "sql_response": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql Response"
+          },
+          "target_db": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Db"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "ManualMessageRequest",
         "type": "object"
       },
       "ModelFormat": {
@@ -3317,7 +3601,7 @@
       },
       "PublicConnection": {
         "additionalProperties": true,
-        "description": "A UI-managed connection with its credentials stripped.\n\n``connection`` is absent from the delete response, which echoes only the\ndatabase name it tore down; the list and create reads carry the full\ncredential-free config.",
+        "description": "A UI-managed connection with its credentials stripped.\n\nStable ID and label are independent of the physical name. ``connection``\nis absent on removal; the list/create reads carry credential-free settings.",
         "properties": {
           "connection": {
             "anyOf": [
@@ -3331,12 +3615,22 @@
             ],
             "title": "Connection"
           },
+          "connection_id": {
+            "title": "Connection Id",
+            "type": "string"
+          },
           "database_name": {
             "title": "Database Name",
+            "type": "string"
+          },
+          "display_label": {
+            "title": "Display Label",
             "type": "string"
           }
         },
         "required": [
+          "connection_id",
+          "display_label",
           "database_name"
         ],
         "title": "PublicConnection",
@@ -3737,6 +4031,67 @@
         "title": "SemanticStatusResponse",
         "type": "object"
       },
+      "SourceProvenance": {
+        "additionalProperties": true,
+        "description": "Credential-free source snapshot captured at the query boundary.",
+        "properties": {
+          "connection_id": {
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "database_name": {
+            "title": "Database Name",
+            "type": "string"
+          },
+          "display_label": {
+            "title": "Display Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "display_label",
+          "database_name"
+        ],
+        "title": "SourceProvenance",
+        "type": "object"
+      },
+      "SourceSummary": {
+        "additionalProperties": true,
+        "description": "Active source metadata available to chat callers without driver probes.",
+        "properties": {
+          "connection_id": {
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "database_name": {
+            "title": "Database Name",
+            "type": "string"
+          },
+          "dialect": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialect"
+          },
+          "display_label": {
+            "title": "Display Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "display_label",
+          "database_name"
+        ],
+        "title": "SourceSummary",
+        "type": "object"
+      },
       "SqlAttribute": {
         "additionalProperties": true,
         "description": "A SqlAttribute with its owning Term and the SQL text behind it.\n\n``zones`` is resolved only by the single-attribute read; ``sql_id`` and\n``database_name`` only by the create/update writes.",
@@ -3751,6 +4106,17 @@
               }
             ],
             "title": "Certified"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
           },
           "created": {
             "anyOf": [
@@ -3960,6 +4326,17 @@
       },
       "SqlAttributeCreate": {
         "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "description": {
             "title": "Description",
             "type": "string"
@@ -4071,6 +4448,17 @@
             ],
             "title": "Certified"
           },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "description": {
             "anyOf": [
               {
@@ -4137,6 +4525,17 @@
       },
       "SqlAttributeUpdate": {
         "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "description": {
             "title": "Description",
             "type": "string"
@@ -4182,6 +4581,17 @@
               }
             ],
             "title": "Attribute Id"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
           },
           "expression": {
             "minLength": 1,
@@ -4588,10 +4998,18 @@
       },
       "SsoFederationState": {
         "additionalProperties": true,
-        "description": "The one flag ``PATCH /connections/{database_name}/sso-federation`` sets.\n\nThe route deliberately echoes just the flag rather than the connection, so\na caller never has to re-send credentials to toggle it.",
+        "description": "The flag set on one stable connection ID (legacy names must be unique).\n\nThe route deliberately echoes just the flag rather than the connection, so\na caller never has to re-send credentials to toggle it.",
         "properties": {
+          "connection_id": {
+            "title": "Connection Id",
+            "type": "string"
+          },
           "database_name": {
             "title": "Database Name",
+            "type": "string"
+          },
+          "display_label": {
+            "title": "Display Label",
             "type": "string"
           },
           "sso_federation": {
@@ -4600,6 +5018,8 @@
           }
         },
         "required": [
+          "connection_id",
+          "display_label",
           "database_name",
           "sso_federation"
         ],
@@ -6315,7 +6735,7 @@
     },
     "/api/chat/completions": {
       "post": {
-        "description": "Run the text-to-SQL agent and stream OpenAI-style SSE frames back.\n\nEmits a ``sql`` event once the agent has a validated query, just before it\nexecutes, so callers can show the SQL while it runs. Emits the final SQL\nand formatted answer as a ``result`` event, then \u2014 if that\nanswer has an executed result \u2014 generates and persists the chart/table\nbubble itself and streams it back as a ``charts`` event before the stream\ncloses with ``[DONE]``. Callers that only care about the text/SQL answer\ncan still stop reading after ``result``; the chart step and its\npersistence happen server-side regardless of whether anyone keeps\nlistening (see ``_build_charts_event``).\n\nRequires a compiled semantic layer; without one the request is rejected with\n409 rather than run against a bare schema. ``conversation_id`` persists the\nturn and claims that conversation's single run slot \u2014 a second concurrent\nrequest for the same conversation gets 409 too. Omitting ``conversation_id``\nruns the question statelessly: no history, no persisted turn, and no chart\nstep (``_build_charts_event`` needs a conversation to save into).",
+        "description": "Run the text-to-SQL agent and stream OpenAI-style SSE frames back.\n\nEmits a ``sql`` event once the agent has a validated query, just before it\nexecutes, so callers can show the SQL while it runs. Emits the final SQL\nand formatted answer as a ``result`` event, then \u2014 if that\nanswer has an executed result \u2014 generates and persists the chart/table\nbubble itself and streams it back as a ``charts`` event before the stream\ncloses with ``[DONE]``. Callers that only care about the text/SQL answer\ncan still stop reading after ``result``; the chart step and its\npersistence happen server-side regardless of whether anyone keeps\nlistening (see ``_build_charts_event``).\n\nRequires a selected, source-ready semantic and vector context (503 if not\nready). The first SSE event is ``source``; ``answer.source`` repeats that\nauthoritative snapshot. Missing selection with multiple sources is 422.\n``conversation_id`` persists the\nturn and claims that conversation's single run slot \u2014 a second concurrent\nrequest for the same conversation gets 409 too. Omitting ``conversation_id``\nruns the question statelessly: no history, no persisted turn, and no chart\nstep (``_build_charts_event`` needs a conversation to save into).",
         "operationId": "chat_completions_api_chat_completions_post",
         "requestBody": {
           "content": {
@@ -6350,6 +6770,62 @@
           }
         },
         "summary": "Chat Completions",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/conversations/{conversation_id}/messages": {
+      "post": {
+        "description": "Append a caller-produced message through the shared source-binding transaction.\n\nUnknown and foreign conversations return 404. Bound conversations inherit their\nsource; explicit conflicts and legacy unbound history are read-only (409).\nThis operation never starts a worker, model, connector, or SSO exchange.",
+        "operationId": "manual_message_api_chat_conversations__conversation_id__messages_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Manual Message Api Chat Conversations  Conversation Id  Messages Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Manual Message",
         "tags": [
           "chat"
         ]
@@ -6478,7 +6954,7 @@
     },
     "/api/connections": {
       "get": {
-        "description": "List every configured database connection, credential-free.\n\nCredentials \u2014 passwords, private keys and the Kyuubi truststore password \u2014\nare stripped from each connection object, so the payload is safe to render\nin the UI. ``database_name`` doubles as the connection's identity in the\nother routes here.",
+        "description": "List every configured database connection, credential-free.\n\nID and label are separate from the physical database name. Credentials and\ncredential references are never returned; this settings route retains its\nexisting permissions (chat discovery is a separate endpoint).",
         "operationId": "list_connections_api_connections_get",
         "responses": {
           "200": {
@@ -6498,7 +6974,7 @@
         ]
       },
       "post": {
-        "description": "Register a database connection and return it credential-free.\n\nThe connection is validated on the way in; anything the driver rejects comes\nback as 422 with the failure message rather than a 500. Call\n``POST /connections/test`` first to check credentials and list the schemas\navailable for the picker.",
+        "description": "Register a database connection and return it credential-free.\n\nAn omitted label defaults to the physical name only if free. Blank labels\nare invalid; normalized label conflicts return 409 without replacing an\nexisting source. Test credentials separately with ``POST /connections/test``.",
         "operationId": "create_connection_api_connections_post",
         "requestBody": {
           "content": {
@@ -6538,6 +7014,206 @@
         ]
       }
     },
+    "/api/connections/by-id/{connection_id}": {
+      "delete": {
+        "description": "Retire only this ID and enqueue its captured ID for data cleanup.\n\nHistory remains bound to the retired ID. Missing IDs return 404; failed\ncredential removal returns 503, without deleting a same-name neighbor.",
+        "operationId": "delete_connection_by_id_api_connections_by_id__connection_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_PublicConnection_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Connection By Id",
+        "tags": [
+          "connections"
+        ]
+      },
+      "put": {
+        "description": "Update this managed ID; physical database and driver type cannot change.\n\nSend only display_label for a metadata-only rename. Blank secrets retain\nthis ID's stored values. Label conflicts return 409, unknown IDs 404, and\nunavailable credentials 503; another source is never substituted.",
+        "operationId": "update_connection_by_id_api_connections_by_id__connection_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionUpdateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_PublicConnection_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Connection By Id",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/api/connections/by-id/{connection_id}/sso-federation": {
+      "patch": {
+        "description": "Toggle selected-source SSO without changing credentials of other IDs.",
+        "operationId": "set_sso_federation_by_id_api_connections_by_id__connection_id__sso_federation_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoFederationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_SsoFederationState_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Sso Federation By Id",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/api/connections/by-id/{connection_id}/test": {
+      "post": {
+        "description": "Test this source's proposed settings, retaining its own blank secrets.",
+        "operationId": "test_connection_by_id_api_connections_by_id__connection_id__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Connection By Id",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
     "/api/connections/source": {
       "get": {
         "description": "Report whether connections are managed via the ``CONNECTION_STRINGS`` env.",
@@ -6561,9 +7237,31 @@
         ]
       }
     },
+    "/api/connections/sources": {
+      "get": {
+        "description": "List active source identities without credentials or source-driver probes.",
+        "operationId": "list_sources_api_connections_sources_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_SourceSummary_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Sources",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
     "/api/connections/test": {
       "post": {
-        "description": "Validate a connection and return its schemas (for the schema picker).\n\nSet ``replacing`` to the ``database_name`` of the connection an edit is\nabout to overwrite. Without it the test rejects the connection for already\nexisting, and blank credentials stay blank instead of being taken from the\nstored connection the way ``PUT /connections/{database_name}`` would.",
+        "description": "Validate a connection and return its schemas (for the schema picker).\n\n``replacing_connection_id`` retains blank credentials from exactly that\nsource. Legacy ``replacing`` accepts only an unambiguous physical name.\nSupplying both selectors is invalid. New sources may share physical names.",
         "operationId": "test_connection_api_connections_test_post",
         "requestBody": {
           "content": {
@@ -6605,16 +7303,16 @@
     },
     "/api/connections/{database_name}": {
       "delete": {
-        "description": "Remove a connection, echoing the database name it tore down.\n\n404 when no connection carries that ``database_name``. The connection\nrecord is removed synchronously, but deleting the data already ingested\nfrom it is handed to the ingestion service and is best-effort \u2014 a 200 means\nthe connection is gone, not that its graph is.",
+        "description": "Legacy removal: ambiguous names return 409 before any deletion.\n\nThe response echoes the captured ID, not just a reusable name. Cleanup of\ningested data is asynchronous; success retires the connection, not its history.",
         "operationId": "delete_connection_api_connections__database_name__delete",
         "parameters": [
           {
-            "description": "Catalog database name, which doubles as the connection's identity.",
+            "description": "Legacy physical name; must identify exactly one managed source.",
             "in": "path",
             "name": "database_name",
             "required": true,
             "schema": {
-              "description": "Catalog database name, which doubles as the connection's identity.",
+              "description": "Legacy physical name; must identify exactly one managed source.",
               "title": "Database Name",
               "type": "string"
             }
@@ -6648,16 +7346,16 @@
         ]
       },
       "put": {
-        "description": "Rewrite a connection's settings and return it credential-free.\n\n``database`` and ``type`` are the connection's identity and cannot change \u2014\nsending different ones is a 422. Credentials left blank keep their stored\nvalue, since the UI is never given them to send back. Re-ingest is\ntriggered only when the ``schemas`` allowlist changed.\n\n404 when no connection carries that ``database_name``.",
+        "description": "Legacy update: ambiguous names return 409 before any mutation.\n\nPrefer the by-id endpoint. Blank secrets retain this source's credentials;\nlabel-only updates do not test connectivity or trigger ingestion.",
         "operationId": "update_connection_api_connections__database_name__put",
         "parameters": [
           {
-            "description": "Catalog database name, which doubles as the connection's identity.",
+            "description": "Legacy physical name; must identify exactly one managed source.",
             "in": "path",
             "name": "database_name",
             "required": true,
             "schema": {
-              "description": "Catalog database name, which doubles as the connection's identity.",
+              "description": "Legacy physical name; must identify exactly one managed source.",
               "title": "Database Name",
               "type": "string"
             }
@@ -6667,7 +7365,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ConnectionBody"
+                "$ref": "#/components/schemas/ConnectionUpdateBody"
               }
             }
           },
@@ -6703,16 +7401,16 @@
     },
     "/api/connections/{database_name}/sso-federation": {
       "patch": {
-        "description": "Toggle whether chat runs this connection's SQL as the signed-in user.",
+        "description": "Legacy SSO toggle; ambiguous names return 409 without credential writes.",
         "operationId": "set_sso_federation_api_connections__database_name__sso_federation_patch",
         "parameters": [
           {
-            "description": "Catalog database name, which doubles as the connection's identity.",
+            "description": "Legacy physical name; must identify exactly one managed source.",
             "in": "path",
             "name": "database_name",
             "required": true,
             "schema": {
-              "description": "Catalog database name, which doubles as the connection's identity.",
+              "description": "Legacy physical name; must identify exactly one managed source.",
               "title": "Database Name",
               "type": "string"
             }
@@ -6842,7 +7540,7 @@
         ]
       },
       "post": {
-        "description": "Create a new CustomAnalysis with its Sql node.\n\nStrict insert: input shape is enforced by :class:`CustomAnalysisCreate`\nand the frontend is responsible for trimming and rejecting blank\nvalues before sending. Updating an existing analysis goes through\n``PUT /custom-analyses/{analysis_id}``.\n\nReturns 409 when ``name`` or ``sql`` is already used by another\nCustomAnalysis (both are unique natural keys), and 422 when the SQL\ncan't be parsed against the current catalog (no recognised tables) \u2014\nwithout those references the analysis would be invisible to\nretrieval.",
+        "description": "Create a new CustomAnalysis with its Sql node.\n\nStrict insert: input shape is enforced by :class:`CustomAnalysisCreate`\nand the frontend is responsible for trimming and rejecting blank\nvalues before sending. Updating an existing analysis goes through\n``PUT /custom-analyses/{analysis_id}``.\n\nSelect ``connection_id`` when multiple sources are active. Returns 409\nwhen ``name`` or ``sql`` is already used in that source, and 422 for\ninvalid source selection or when the SQL\ncan't be parsed against the current catalog (no recognised tables) \u2014\nwithout those references the analysis would be invisible to\nretrieval.",
         "operationId": "create_custom_analysis_api_custom_analyses_post",
         "requestBody": {
           "content": {
@@ -6885,7 +7583,7 @@
     },
     "/api/custom-analyses/validate": {
       "post": {
-        "description": "Validate a SQL expression against the full catalog.\n\nDoes not create a CustomAnalysis. Returns 422 when the SQL can't be\nparsed or doesn't resolve to a known table.",
+        "description": "Validate SQL in one active source, not the full catalog.\n\nSelect ``connection_id`` with multiple active sources; ``analysis_id``\ninherits existing immutable ownership. Does not create a CustomAnalysis.\nReturns 422 for invalid source selection or when the SQL can't be\nparsed or doesn't resolve to a known table.",
         "operationId": "validate_custom_analysis_sql_api_custom_analyses_validate_post",
         "requestBody": {
           "content": {
@@ -6970,7 +7668,7 @@
         ]
       },
       "put": {
-        "description": "Replace a CustomAnalysis (matched by id) and re-link its Sql node.\n\nReturns 404 when no CustomAnalysis with ``analysis_id`` exists, 409\nwhen ``name`` or ``sql`` is already taken by a different\nCustomAnalysis, and 422 when the SQL can't be parsed against the\ncurrent catalog \u2014 all surface the failure to the UI without\nproducing an inconsistent graph.",
+        "description": "Replace a CustomAnalysis (matched by id) and re-link its Sql node.\n\nSource ownership is inherited; a different ``connection_id`` is rejected.\nReturns 404 when no CustomAnalysis with ``analysis_id`` exists, 409\nwhen ``name`` or ``sql`` is already taken by a different\nCustomAnalysis, and 422 when the SQL can't be parsed against the\ncurrent catalog \u2014 all surface the failure to the UI without\nproducing an inconsistent graph.",
         "operationId": "update_custom_analysis_api_custom_analyses__analysis_id__put",
         "parameters": [
           {
@@ -7562,6 +8260,54 @@
               ],
               "description": "Page size, at most 100. Omit to return every matching row in one response.",
               "title": "Limit"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_db",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Db"
             }
           }
         ],
@@ -8749,8 +9495,27 @@
     },
     "/api/semantic-compilation/reset": {
       "post": {
-        "description": "Ask the ingestion service to rebuild every database's semantic layer.\n\nThe service deletes the semantic nodes and embeddings and compiles them\nagain, so the layer is rebuilt without waiting for the next scheduled run.",
+        "description": "Queue a semantic rebuild by opaque ID, or all sources if omitted.\n\nThe service deletes the semantic nodes and embeddings and compiles them\nagain, so the layer is rebuilt without waiting for the next scheduled run.\nGlobal PQL vocabulary survives. Legacy physical-name selectors are rejected;\na 202 acknowledges queueing, not successful deletion or rebuild.",
         "operationId": "reset_api_semantic_compilation_reset_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "\\S",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          }
+        ],
         "responses": {
           "202": {
             "content": {
@@ -8761,6 +9526,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Reset",
@@ -8835,7 +9610,7 @@
         ]
       },
       "post": {
-        "description": "Create a SqlAttribute with its Sql node, linked to a Term.\n\nThe connector is resolved server-side (never chosen by the client \u2014\nsee ``auto_ontology/connectors/registry.py``). ``owner_id``, when set,\nnames a user or a group that can edit the catalog; omit it to leave the\nattribute unassigned. The caller is stored as ``created_by`` so the side\npanel can name them. Returns 400 when that id cannot be assigned, 409\nwhen the name is already taken, 422 when the target Term does not exist\nor the SQL can't be parsed.",
+        "description": "Create a SqlAttribute with its Sql node, linked to a Term.\n\nSelect ``connection_id`` when multiple sources are active. ``owner_id``, when set,\nnames a user or a group that can edit the catalog; omit it to leave the\nattribute unassigned. The caller is stored as ``created_by`` so the side\npanel can name them. Returns 400 when that id cannot be assigned, 409\nwhen the name is already taken, 422 when the target Term does not exist\nor the SQL can't be parsed.",
         "operationId": "create_sql_attribute_api_sql_attributes_post",
         "requestBody": {
           "content": {
@@ -8877,7 +9652,7 @@
     },
     "/api/sql-attributes/validate": {
       "post": {
-        "description": "Validate a SQL expression against the catalog.\n\nThe connector is resolved server-side (never chosen by the client \u2014\nsee ``auto_ontology/connectors/registry.py``). Does not create a SqlAttribute.\nReturns 422 when the SQL can't be parsed or doesn't resolve to a\nknown table.",
+        "description": "Validate a SQL expression against the catalog.\n\nSelect ``connection_id`` when multiple sources are active; an existing\nattribute inherits its immutable source. Does not create a SqlAttribute.\nReturns 422 when the SQL can't be parsed or doesn't resolve to a\nknown table.",
         "operationId": "validate_sql_attribute_api_sql_attributes_validate_post",
         "requestBody": {
           "content": {
@@ -8971,6 +9746,54 @@
               "title": "Attr Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_db",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Db"
+            }
           }
         ],
         "responses": {
@@ -9052,7 +9875,7 @@
         ]
       },
       "put": {
-        "description": "Replace a SqlAttribute, re-parse SQL, and re-link to a Term.\n\nThe connector is resolved server-side (never chosen by the client \u2014\nsee ``auto_ontology/connectors/registry.py``). Returns 404 when no SqlAttribute\nwith that id exists, 409 on name conflict, 422 when the Term doesn't\nexist or SQL can't be parsed. Returns 403 when the caller may not edit\nthis attribute, the same check as the metadata patch.",
+        "description": "Replace a SqlAttribute, re-parse SQL, and re-link to a Term.\n\nSource ownership is inherited; a different ``connection_id`` is rejected.\nReturns 404 when no SqlAttribute\nwith that id exists, 409 on name conflict, 422 when the Term doesn't\nexist or SQL can't be parsed. Returns 403 when the caller may not edit\nthis attribute, the same check as the metadata patch.",
         "operationId": "update_sql_attribute_api_sql_attributes__attr_id__put",
         "parameters": [
           {
@@ -9710,6 +10533,54 @@
               "description": "Page size, at most 100. Omit to return every matching row in one response.",
               "title": "Limit"
             }
+          },
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_db",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Db"
+            }
           }
         ],
         "responses": {
@@ -9752,6 +10623,54 @@
             "schema": {
               "title": "Term Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_db",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Db"
             }
           }
         ],
@@ -9879,6 +10798,54 @@
               ],
               "description": "Page size, at most 100. Omit to return every matching row in one response.",
               "title": "Limit"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_db",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Db"
             }
           }
         ],
@@ -10019,6 +10986,54 @@
               ],
               "description": "Page size, at most 100. Omit to return every matching row in one response.",
               "title": "Limit"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "connection_label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_db",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Db"
             }
           }
         ],

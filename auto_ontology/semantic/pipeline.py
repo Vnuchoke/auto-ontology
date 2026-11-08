@@ -17,7 +17,11 @@ from auto_ontology.dal.datasources import (
 )
 from auto_ontology.infra.feature_flags import is_distinct_value_probing_enabled
 from auto_ontology.semantic.cancellation import is_cancelled
-from auto_ontology.semantic.domain import DomainSummary, load_domain_summary
+from auto_ontology.semantic.domain import (
+    DomainSummary,
+    load_domain_summary,
+    selected_source,
+)
 from auto_ontology.semantic.embed import SemanticEmbedder
 from auto_ontology.semantic.models import ProcessTableResult
 from auto_ontology.semantic.visit_enter import process_table, reset_sampling_breaker
@@ -113,10 +117,10 @@ class _OrderedCommitSlot:
         self._completed = True
 
 
-def _table_commit_key(database_name: str, table: dict) -> tuple[str, ...]:
+def _table_commit_key(connection_id: str, table: dict) -> tuple[str, ...]:
     """Canonical table order used to decide unqualified Term-name ownership."""
     parts = (
-        database_name,
+        connection_id,
         str(table.get("schema_name") or ""),
         str(table.get("name") or ""),
     )
@@ -124,12 +128,12 @@ def _table_commit_key(database_name: str, table: dict) -> tuple[str, ...]:
 
 
 def compile_semantic_layer(
-    database_name: str,
+    connection_id: str,
     *,
     domain_summary: DomainSummary | None = None,
     embedder: SemanticEmbedder | None = None,
 ) -> int:
-    """Run full taxonomy compilation over every table in the store.
+    """Compile only the registered active connection's tables.
 
     Tables are processed in parallel (LLM calls for FK detection and term
     extraction run concurrently). Term commits run in canonical table order,
@@ -138,11 +142,12 @@ def compile_semantic_layer(
     """
     # A warehouse that was unreachable during an earlier run in this worker
     # must not stay un-sampled for this one.
-    reset_sampling_breaker(database_name)
-    summary = domain_summary or load_domain_summary(database_name)
+    database_name = selected_source(connection_id).database_name
+    reset_sampling_breaker(connection_id)
+    summary = domain_summary or load_domain_summary(connection_id)
     tables = sorted(
-        fetch_all_tables_without_term(database_name),
-        key=lambda table: _table_commit_key(database_name, table),
+        fetch_all_tables_without_term(connection_id=connection_id),
+        key=lambda table: _table_commit_key(connection_id, table),
     )
     commit_queue = _OrderedCommitQueue()
     # Read once per run, not once per table: the flag lives in Postgres and
@@ -181,7 +186,7 @@ def compile_semantic_layer(
             commit_slot.skip_if_unused()
             return None
         try:
-            ctx = fetch_table_context(table["id"])
+            ctx = fetch_table_context(table["id"], connection_id=connection_id)
 
             if not ctx.get("columns"):
                 logger.warning("Table %s has no columns — skipping", table_name)
@@ -199,6 +204,7 @@ def compile_semantic_layer(
                 domain_summary=summary,
                 embedder=embedder,
                 database_name=database_name,
+                connection_id=connection_id,
                 probe_distinct_values=is_probe_distinct_values,
                 commit_slot=commit_slot,
             )

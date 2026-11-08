@@ -71,7 +71,9 @@ class World:
         self.prefix = f"gz{uuid.uuid4().hex[:8]}"
         p = self.prefix
 
-        self.database = _add(s.catalog_database, name=f"{p}_warehouse")
+        self.database = _add(
+            s.catalog_database, name=f"{p}_warehouse", display_label=f"{p}_warehouse"
+        )
         self.schema = _add(
             s.catalog_schema, database_id=self.database, name=f"{p}_public"
         )
@@ -508,7 +510,9 @@ class DataWorld:
         self.prefix = f"dz{uuid.uuid4().hex[:8]}"
         p = self.prefix
 
-        self.left = _add(s.catalog_database, name=f"{p}_left")
+        self.left = _add(
+            s.catalog_database, name=f"{p}_left", display_label=f"{p}_left"
+        )
         self.sales = _add(s.catalog_schema, database_id=self.left, name=f"{p}_sales")
         self.finance = _add(
             s.catalog_schema, database_id=self.left, name=f"{p}_finance"
@@ -527,7 +531,9 @@ class DataWorld:
         )
         self.amount = _add(s.catalog_column, table_id=self.orders, name=f"{p}_amount")
 
-        self.right = _add(s.catalog_database, name=f"{p}_right")
+        self.right = _add(
+            s.catalog_database, name=f"{p}_right", display_label=f"{p}_right"
+        )
         self.archive = _add(
             s.catalog_schema, database_id=self.right, name=f"{p}_archive"
         )

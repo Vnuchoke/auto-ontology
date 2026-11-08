@@ -63,3 +63,69 @@ def test_rejects_unknown_target_database() -> None:
             "42d62c22-b1c4-4ed7-8173-6aec9e2bd432",
             connectors,
         )
+
+
+@pytest.mark.parametrize("selected_index", [0, 1], ids=["local", "remote"])
+def test_routes_same_name_tables_by_connection_id(
+    same_name_sources: dict,
+    selected_index: int,
+) -> None:
+    from copy import deepcopy
+
+    sources = same_name_sources["sources"]
+    connectors = [
+        cast(
+            SQLDatabase,
+            SimpleNamespace(
+                database_name=source["connection"]["database"],
+                connection_id=source["connection_id"],
+            ),
+        )
+        for source in sources
+    ]
+    selected = connectors[selected_index]
+    neighbor = connectors[1 - selected_index]
+    tables_before = deepcopy([source["table"] for source in sources])
+    # Put the neighbor last: the current name-keyed dictionary picks it incorrectly.
+    ordered = [selected, neighbor]
+    assert (
+        resolve_connector_from_tables(
+            [sources[1 - selected_index]["table"]],
+            ordered,
+        )
+        is neighbor
+    )
+    assert (
+        resolve_connector_from_tables(
+            [sources[selected_index]["table"]],
+            ordered,
+        )
+        is selected
+    )
+    assert [source["table"] for source in sources] == tables_before
+
+
+def test_rejects_mixed_connection_id_dependencies_with_same_database_name(
+    same_name_sources: dict,
+) -> None:
+    sources = same_name_sources["sources"]
+    connectors = [
+        cast(
+            SQLDatabase,
+            SimpleNamespace(
+                database_name=source["connection"]["database"],
+                connection_id=source["connection_id"],
+            ),
+        )
+        for source in sources
+    ]
+    assert (
+        resolve_connector_from_tables([sources[1]["table"]], connectors)
+        is connectors[1]
+    )
+    with pytest.raises(
+        ValueError, match=r"(?i)(multiple|mixed|cross).*(connection|source)"
+    ):
+        resolve_connector_from_tables(
+            [source["table"] for source in sources], connectors
+        )

@@ -38,7 +38,7 @@ _DIMENSIONS = 2048
 
 
 @pytest.fixture
-def collection():
+def collection(identity_database: None):
     """A collection shaped like the one ``init_vectorstore_table`` creates."""
     name = f"probe_{uuid.uuid4().hex[:8]}"
     try:

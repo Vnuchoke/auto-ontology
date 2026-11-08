@@ -59,32 +59,27 @@ def _null_transaction():
 
 @pytest.fixture(autouse=True)
 def _no_live_connection_lookup():
-    """Sever the two connection lookups ``export_model`` reaches through.
-
-    ``service.export_model`` calls ``_dialect_by_database_name()``, which reads
-    ``get_connectors()`` and ``list_connections()`` — and the latter queries
-    Postgres. Patching only the ``dal`` calls each test names leaves that path
-    live, so these mock-backed tests quietly opened a connection and failed with
-    ``OperationalError`` on any machine without the local stack up. CI never
-    caught it: the workflow provides a Postgres service, so the call succeeded
-    there and returned nothing.
-
-    Autouse rather than per-test decorators so a test added later cannot
-    reopen the hole. Both boundaries are stubbed instead of
-    ``_dialect_by_database_name`` itself, which keeps its merge logic under
-    test; a test that wants real dialects can patch these with its own values.
-    """
+    """Export reads synthetic root metadata, never credentials or connectors."""
     with (
         patch(
             "auto_ontology.server.model_interchange.service.get_connectors",
-            return_value=[],
-        ),
+            side_effect=AssertionError("export must not open connectors"),
+            create=True,
+        ) as connectors,
         patch(
             "auto_ontology.server.model_interchange.service.list_connections",
+            side_effect=AssertionError("export must not read credentials"),
+            create=True,
+        ) as connections,
+        patch(
+            "auto_ontology.server.model_interchange.service.list_source_metadata",
             return_value=[],
+            create=True,
         ),
     ):
         yield
+        connectors.assert_not_called()
+        connections.assert_not_called()
 
 
 def _catalog_rows(*, db_id: str = "db-1", db_name: str = "retail") -> list[dict]:
@@ -92,6 +87,8 @@ def _catalog_rows(*, db_id: str = "db-1", db_name: str = "retail") -> list[dict]
         {
             "db_id": db_id,
             "db_name": db_name,
+            "db_dialect": "sqlite",
+            "display_label": db_name,
             "schema_id": "sch-1",
             "schema_name": "main",
             "table_id": "tbl-1",
@@ -153,6 +150,7 @@ def _export_rows(*, db_id: str = "db-1", db_name: str = "retail") -> dict:
                 "sql": "SELECT id FROM orders",
                 "term_id": "term-1",
                 "database_name": db_name,
+                "connection_id": db_id,
             },
             {
                 "id": "sa-table",
@@ -163,6 +161,7 @@ def _export_rows(*, db_id: str = "db-1", db_name: str = "retail") -> dict:
                 "sql": "SELECT 1",
                 "term_id": "term-1",
                 "database_name": db_name,
+                "connection_id": db_id,
             },
             {
                 "id": "sa-sql",
@@ -173,6 +172,7 @@ def _export_rows(*, db_id: str = "db-1", db_name: str = "retail") -> dict:
                 "sql": "SELECT 2",
                 "term_id": "term-1",
                 "database_name": db_name,
+                "connection_id": db_id,
             },
             {
                 "id": "sa-bridge",
@@ -183,6 +183,7 @@ def _export_rows(*, db_id: str = "db-1", db_name: str = "retail") -> dict:
                 "sql": "SELECT 3",
                 "term_id": "term-1",
                 "database_name": db_name,
+                "connection_id": db_id,
             },
         ],
         "custom_analyses": [
@@ -192,6 +193,7 @@ def _export_rows(*, db_id: str = "db-1", db_name: str = "retail") -> dict:
                 "description": "Example",
                 "sql": "SELECT * FROM orders",
                 "database_name": db_name,
+                "connection_id": db_id,
             },
         ],
     }
@@ -272,7 +274,11 @@ def test_import_catalog_encodes_supplied_sample_values(
         sql_column_resolver=lambda _sql, _db: [],
     )
 
-    _import_catalog(document, {}, defaultdict(int), defaultdict(int), None, {})
+    with patch(
+        "auto_ontology.dal.model_interchange._database_names_for_ids",
+        return_value={"live-db-1": "retail"},
+    ):
+        _import_catalog(document, {}, defaultdict(int), defaultdict(int), None, {})
 
     column_calls = [
         call for call in mock_resolve.call_args_list if call[0][0] is s.catalog_column
@@ -494,6 +500,7 @@ def test_export_model_ossie_reports_all_duplicate_custom_analysis_names(
     rows["custom_analyses"] = [
         {
             "id": "ca-1",
+            "connection_id": "db-1",
             "name": "name25",
             "description": "",
             "sql": "SELECT 1",
@@ -501,6 +508,7 @@ def test_export_model_ossie_reports_all_duplicate_custom_analysis_names(
         },
         {
             "id": "ca-2",
+            "connection_id": "db-1",
             "name": "name25",
             "description": "",
             "sql": "SELECT 1",
@@ -508,6 +516,7 @@ def test_export_model_ossie_reports_all_duplicate_custom_analysis_names(
         },
         {
             "id": "ca-3",
+            "connection_id": "db-1",
             "name": "name3",
             "description": "",
             "sql": "SELECT 1",
@@ -515,6 +524,7 @@ def test_export_model_ossie_reports_all_duplicate_custom_analysis_names(
         },
         {
             "id": "ca-4",
+            "connection_id": "db-1",
             "name": "name3",
             "description": "",
             "sql": "SELECT 1",
@@ -637,27 +647,17 @@ def test_export_model_auto_ontology_keeps_every_represented_table(
     assert len(term["columns_attributes"]) == 3
 
 
-def test_dialects_fall_back_to_saved_settings_when_a_database_is_unreachable(
+def test_dialect_metadata_unavailable_is_informational_and_does_not_leak_errors(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One unreachable database must not fail the whole export."""
-    with (
-        patch(
-            "auto_ontology.server.model_interchange.service.get_connectors",
-            side_effect=ConnectionError("Can't connect to MySQL server"),
-        ),
-        patch(
-            "auto_ontology.server.model_interchange.service.list_connections",
-            return_value=[
-                {"name": "dw", "type": "mysql"},
-                {"name": "wwi", "type": "postgresql"},
-            ],
-        ),
+    with patch(
+        "auto_ontology.server.model_interchange.service.list_source_metadata",
+        side_effect=ConnectionError("private-endpoint-and-secret"),
     ):
         dialects = service._dialect_by_database_name()
 
-    assert dialects == {"dw": "mysql", "wwi": "postgresql"}
-    assert "Can't connect to MySQL server" in caplog.text
+    assert dialects == {}
+    assert "private-endpoint-and-secret" not in caplog.text
 
 
 @patch(
@@ -667,12 +667,12 @@ def test_dialects_fall_back_to_saved_settings_when_a_database_is_unreachable(
 @patch("auto_ontology.server.model_interchange.service.dal.fetch_export_rows")
 @patch("auto_ontology.server.model_interchange.service.dal.validate_database_ids")
 @patch(
-    "auto_ontology.server.model_interchange.service.get_connectors",
-    side_effect=ConnectionError("Can't connect to MySQL server"),
+    "auto_ontology.server.model_interchange.service.list_source_metadata",
+    side_effect=ConnectionError("private metadata failure"),
 )
 @pytest.mark.parametrize("model_format", list(ModelFormat))
-def test_export_model_succeeds_with_an_unreachable_database(
-    _mock_connectors: MagicMock,
+def test_export_model_succeeds_without_informational_dialect_metadata(
+    _mock_metadata: MagicMock,
     _mock_validate: MagicMock,
     mock_fetch: MagicMock,
     _mock_resolver: MagicMock,
@@ -683,6 +683,48 @@ def test_export_model_succeeds_with_an_unreachable_database(
     yaml_text = service.export_model(ExportRequest(databases=[], format=model_format))
 
     assert yaml.safe_load(yaml_text)
+
+
+@patch(
+    "auto_ontology.server.model_interchange.service.dal.make_cached_sql_column_resolver",
+    return_value=lambda *_args: [],
+)
+@patch("auto_ontology.server.model_interchange.service.dal.fetch_export_rows")
+@patch("auto_ontology.server.model_interchange.service.dal.validate_database_ids")
+def test_public_export_uses_id_keyed_metadata_for_same_physical_names(
+    mock_validate: MagicMock,
+    mock_fetch: MagicMock,
+    _mock_resolver: MagicMock,
+) -> None:
+    rows = _export_rows(db_id="source-b", db_name="sales")
+    rows["catalog"][0]["db_dialect"] = None
+    mock_fetch.return_value = rows
+    with patch(
+        "auto_ontology.server.model_interchange.service.list_source_metadata",
+        return_value=[
+            {"id": "source-a", "name": "sales", "dialect": "mysql"},
+            {"id": "source-b", "name": "sales", "dialect": "postgres"},
+            {"id": "source-c", "name": "sales", "dialect": None},
+        ],
+    ):
+        assert service._dialect_by_database_name() == {
+            "source-a": "mysql",
+            "source-b": "postgres",
+            "source-c": "",
+        }
+        payload = yaml.safe_load(
+            service.export_model(ExportRequest(databases=["source-b"]))
+        )
+        database = payload["data_layer"]["databases"][0]
+        assert database["id"] == "source-b"
+        assert database["dialect"] == "postgres"
+        rows["catalog"][0]["db_dialect"] = "sqlite"
+        stored = yaml.safe_load(
+            service.export_model(ExportRequest(databases=["source-b"]))
+        )
+        assert stored["data_layer"]["databases"][0]["dialect"] == "sqlite"
+    mock_validate.assert_called_with(["source-b"])
+    mock_fetch.assert_called_with(["source-b"])
 
 
 def test_detect_model_format_tells_the_vocabularies_apart() -> None:
@@ -812,6 +854,7 @@ def test_flush_import_embeddings_skips_without_api_key(
 def test_build_catalog_embed_rows_match_tabular_shape() -> None:
     column_row = build_column_data_row(
         live_id="col-live",
+        connection_id="source",
         column_name="id",
         column_description="pk",
         data_type="INTEGER",
@@ -822,6 +865,7 @@ def test_build_catalog_embed_rows_match_tabular_shape() -> None:
     )
     table_row = build_table_data_row(
         live_id="tbl-live",
+        connection_id="source",
         table_name="orders",
         table_description="Orders",
         schema_name="main",

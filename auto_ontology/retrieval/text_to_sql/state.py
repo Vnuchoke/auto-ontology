@@ -35,6 +35,8 @@ class TextToSQLPayload(TypedDict):
     """Payload for the text-to-SQL agent flow (data + semantic retrievers)."""
 
     question: str
+    connection_id: NotRequired[str]
+    connection_label: NotRequired[str]
     evidence: NotRequired[str]
     # Question/SQL pairs retrieved as structural precedent for this question,
     # each a ``{"question": ..., "sql": ...}`` mapping. Unlike `evidence` these
@@ -84,6 +86,8 @@ class AgentState(TypedDict):
     """State object passed through the LangGraph."""
 
     llm: ChatNVIDIA
+    connection_id: str
+    source: dict[str, str]
     reasoning_llm: NotRequired[ChatNVIDIA]
     initial_question: str
     evidence: NotRequired[str]

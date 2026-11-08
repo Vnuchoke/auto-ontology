@@ -19,13 +19,21 @@ export const connectionsApi = {
 
 	isEnvSource: () => requests.get<boolean>('connections/source'),
 
-	create: (input: ConnectionInput): Promise<CreateResponse> =>
-		requests.post<{ data: Connection }>('connections', { connection: input }),
+	create: (input: ConnectionInput, displayLabel: string): Promise<CreateResponse> =>
+		requests.post<{ data: Connection }>('connections', {
+			connection: input,
+			display_label: displayLabel,
+		}),
 
-	test: async (input: ConnectionInput, replacing?: string): Promise<TestResponse> => {
+	test: async (input: ConnectionInput, replacingConnectionId?: string): Promise<TestResponse> => {
 		const res = await requests.post<{ success: boolean; schemas?: string[] }>(
 			'connections/test',
-			{ connection: input, ...(replacing == null ? {} : { replacing }) },
+			{
+				connection: input,
+				...(replacingConnectionId == null
+					? {}
+					: { replacing_connection_id: replacingConnectionId }),
+			},
 		);
 
 		if (res.error || res.success !== true) {
@@ -37,25 +45,44 @@ export const connectionsApi = {
 		return { success: true, schemas: res.schemas ?? [] };
 	},
 
-	// Rewrites every setting except the connection's identity: `database` (which
-	// doubles as the connection's name) and `type` come back as a 422 if they
-	// differ from the stored ones. Credentials left blank keep their stored
+	// Physical `database` and connector `type` remain immutable settings.
+	// Credentials left blank keep their stored
 	// value, since `getAll` strips them and the edit form has none to send back.
-	update: (databaseName: string, input: ConnectionInput): Promise<CreateResponse> =>
-		requests.put<{ data: Connection }>(`connections/${encodeURIComponent(databaseName)}`, {
-			connection: input,
-		}),
+	update: (
+		connectionId: string,
+		input: ConnectionInput,
+		displayLabel: string,
+	): Promise<CreateResponse> =>
+		requests.put<{ data: Connection }>(
+			`connections/by-id/${encodeURIComponent(connectionId)}`,
+			{
+				connection: input,
+				display_label: displayLabel,
+			},
+		),
+
+	rename: (connectionId: string, displayLabel: string): Promise<CreateResponse> =>
+		requests.put<{ data: Connection }>(
+			`connections/by-id/${encodeURIComponent(connectionId)}`,
+			{
+				display_label: displayLabel,
+			},
+		),
 
 	// Narrow update: flips "authenticate as signed-in user" without re-sending
 	// credentials, so the connections page can toggle it inline.
-	setSsoFederation: (databaseName: string, enabled: boolean) =>
-		requests.patch<{ data: { database_name: string; sso_federation: boolean } }>(
-			`connections/${encodeURIComponent(databaseName)}/sso-federation`,
-			{ enabled },
-		),
+	setSsoFederation: (connectionId: string, enabled: boolean) =>
+		requests.patch<{
+			data: {
+				connection_id: string;
+				display_label: string;
+				database_name: string;
+				sso_federation: boolean;
+			};
+		}>(`connections/by-id/${encodeURIComponent(connectionId)}/sso-federation`, { enabled }),
 
-	delete: (databaseName: string) =>
-		requests.delete<{ data: { database_name: string } }>(
-			`connections/${encodeURIComponent(databaseName)}`,
-		),
+	delete: (connectionId: string) =>
+		requests.delete<{
+			data: { connection_id: string; display_label: string; database_name: string };
+		}>(`connections/by-id/${encodeURIComponent(connectionId)}`),
 };

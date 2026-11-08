@@ -6,6 +6,7 @@ import type { Conversation, ChatMessage } from '@/types/chat';
 
 export type ConversationSummary = {
 	id: string;
+	connection_id: string | null;
 	title: string;
 	created_at: string;
 	updated_at: string;
@@ -53,6 +54,9 @@ export const conversationsApi = {
 	addMessage: (
 		conversationId: string,
 		msg: {
+			connectionId?: string;
+			connectionLabel?: string;
+			target_db?: string;
 			role: string;
 			content: string;
 			sqlCode?: string | null;
@@ -66,6 +70,9 @@ export const conversationsApi = {
 			// speaks snake_case, so the rename happens here rather than at
 			// every call site.
 			body: JSON.stringify({
+				connection_id: msg.connectionId,
+				connection_label: msg.connectionLabel,
+				target_db: msg.target_db,
 				role: msg.role,
 				content: msg.content,
 				sql_code: msg.sqlCode ?? null,
@@ -77,6 +84,7 @@ export const conversationsApi = {
 export function toConversation(detail: ConversationDetail): Conversation {
 	return {
 		id: detail.id,
+		connectionId: detail.connection_id ?? null,
 		title: detail.title,
 		createdAt: new Date(detail.created_at).getTime(),
 		messages: detail.messages.map(toMessage),

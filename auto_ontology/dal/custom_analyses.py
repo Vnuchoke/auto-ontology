@@ -22,7 +22,9 @@ from sqlalchemy import delete, func, literal, select
 
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import store, write_transaction
-from auto_ontology.dal.sql_fragments import column_description_expr, name_contains
+from auto_ontology.dal.source_scope import definition_source_scope
+from auto_ontology.dal.sql_fragments import name_contains
+from auto_ontology.dal.datasources import query_column_description_expr
 from auto_ontology.dal.users import resolve_accessible_catalog_ids
 from auto_ontology.server.sql_utils import SqlParseError
 
@@ -64,7 +66,12 @@ def _sql_text():
                 s.sql_query, s.sql_query.c.id == s.custom_analysis__sql.c.sql_query_id
             )
         )
-        .where(s.custom_analysis__sql.c.analysis_id == s.custom_analysis.c.id)
+        .where(
+            s.custom_analysis__sql.c.analysis_id == s.custom_analysis.c.id,
+            s.sql_query.c.connection_id.is_not_distinct_from(
+                s.custom_analysis.c.connection_id
+            ),
+        )
         .order_by(s.sql_query.c.id)
         .limit(1)
         .correlate(s.custom_analysis)
@@ -112,7 +119,15 @@ def _out_of_zone(table_ids: list[str]):
 # ---------------------------------------------------------------------------
 
 
-def _matching(zone_ids: list[str] | None, search: str | None) -> list:
+def _source_scope(connection_id: str) -> Any:
+    return definition_source_scope(
+        s.custom_analysis, s.custom_analysis__sql, "analysis_id", connection_id
+    )
+
+
+def _matching(
+    zone_ids: list[str] | None, search: str | None, connection_id: str | None = None
+) -> list:
     """The WHERE every read of the visible analysis set applies.
 
     One function so :func:`list_custom_analyses` and
@@ -121,6 +136,8 @@ def _matching(zone_ids: list[str] | None, search: str | None) -> list:
     for rows that are not there.
     """
     conditions = [_has_sql()]
+    if connection_id is not None:
+        conditions.append(_source_scope(connection_id))
     if zone_ids is not None:
         resolved = resolve_accessible_catalog_ids(zone_ids)
         conditions.append(~_out_of_zone(list(resolved["table_ids"])))
@@ -135,6 +152,7 @@ def list_custom_analyses(
     search: str | None = None,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Analyses with their SQL text, paged.
 
@@ -155,11 +173,12 @@ def list_custom_analyses(
     statement = (
         select(
             s.custom_analysis.c.id,
+            s.custom_analysis.c.connection_id,
             s.custom_analysis.c.name,
             s.custom_analysis.c.description,
             _sql_text().label("sql"),
         )
-        .where(*_matching(zone_ids, search))
+        .where(*_matching(zone_ids, search, connection_id))
         .order_by(func.lower(s.custom_analysis.c.name), s.custom_analysis.c.id)
         .offset(skip or None)
     )
@@ -173,11 +192,12 @@ def count_custom_analyses(
     zone_ids: list[str] | None = None,
     *,
     search: str | None = None,
+    connection_id: str | None = None,
 ) -> int:
     """The unpaged size of :func:`list_custom_analyses`, from the same filter."""
     rows = store().query_read(
         select(func.count(s.custom_analysis.c.id).label("total")).where(
-            *_matching(zone_ids, search)
+            *_matching(zone_ids, search, connection_id)
         )
     )
     return int(rows[0]["total"]) if rows else 0
@@ -186,10 +206,13 @@ def count_custom_analyses(
 def find_analysis_by_name(
     name: str,
     exclude_id: str | None,
+    *,
+    connection_id: str,
 ) -> dict[str, str] | None:
     """Another analysis already using *name*, or ``None``."""
     statement = select(s.custom_analysis.c.id, s.custom_analysis.c.name).where(
-        s.custom_analysis.c.name == name
+        s.custom_analysis.c.name == name,
+        s.custom_analysis.c.connection_id == connection_id,
     )
     if exclude_id is not None:
         statement = statement.where(s.custom_analysis.c.id != exclude_id)
@@ -200,6 +223,8 @@ def find_analysis_by_name(
 def find_analysis_by_sql(
     sql: str,
     exclude_id: str | None,
+    *,
+    connection_id: str,
 ) -> dict[str, str] | None:
     """Another analysis already linked to this exact SQL, or ``None``.
 
@@ -218,7 +243,11 @@ def find_analysis_by_sql(
                 s.sql_query, s.sql_query.c.id == s.custom_analysis__sql.c.sql_query_id
             )
         )
-        .where(s.sql_query.c.sql_full_query == sql)
+        .where(
+            s.sql_query.c.sql_full_query == sql,
+            s.custom_analysis.c.connection_id == connection_id,
+            s.sql_query.c.connection_id == connection_id,
+        )
     )
     if exclude_id is not None:
         statement = statement.where(s.custom_analysis.c.id != exclude_id)
@@ -236,7 +265,16 @@ def get_custom_analysis_by_id(analysis_id: str) -> str | None:
     return rows[0]["id"] if rows else None
 
 
-def fetch_custom_analyses() -> list[dict[str, str]]:
+def get_custom_analysis_connection_id(analysis_id: str) -> str | None:
+    rows = store().query_read(
+        select(s.custom_analysis.c.connection_id).where(
+            s.custom_analysis.c.id == analysis_id
+        )
+    )
+    return rows[0]["connection_id"] if rows else None
+
+
+def fetch_custom_analyses(*, connection_id: str | None = None) -> list[dict[str, str]]:
     """Analyses as domain rules: ``{name, description}``, SQL folded into the text.
 
     The ``description`` here is a *rendered blob*, not the column — description
@@ -246,7 +284,11 @@ def fetch_custom_analyses() -> list[dict[str, str]]:
 
     Returns ``[]`` on failure: missing domain rules degrade a prompt, a raised
     exception loses the request.
+    Without connection_id no rules are returned. All SQL/table/column links
+    must belong to the selected source; unresolved legacy is inspection-only.
     """
+    if not connection_id:
+        return []
     try:
         rows = store().query_read(
             select(
@@ -254,7 +296,7 @@ def fetch_custom_analyses() -> list[dict[str, str]]:
                 s.custom_analysis.c.description,
                 _sql_text().label("sql_code"),
             )
-            .where(_has_sql())
+            .where(_has_sql(), _source_scope(connection_id))
             .order_by(s.custom_analysis.c.name)
         )
     except Exception as exc:  # noqa: BLE001
@@ -276,15 +318,18 @@ def fetch_custom_analyses() -> list[dict[str, str]]:
     return rules
 
 
-def fetch_custom_analyses_with_sql(analysis_ids: list[str]) -> list[dict[str, str]]:
+def fetch_custom_analyses_with_sql(
+    analysis_ids: list[str], *, connection_id: str | None = None
+) -> list[dict[str, str]]:
     """``{id, name, description, sql}`` per analysis, values stripped.
 
     Unlike the reads above, an analysis with **no** statement still comes back
     with an empty ``sql`` — the SQL used ``OPTIONAL MATCH`` here alone.
     Preserved: the caller asked for specific ids and a silently missing entry is
     harder to notice than an empty one.
+    A connection_id is required for this query-context read; NULL legacy is excluded.
     """
-    if not analysis_ids:
+    if not analysis_ids or not connection_id:
         return []
     try:
         rows = store().query_read(
@@ -293,7 +338,10 @@ def fetch_custom_analyses_with_sql(analysis_ids: list[str]) -> list[dict[str, st
                 s.custom_analysis.c.name,
                 s.custom_analysis.c.description,
                 _sql_text().label("sql_text"),
-            ).where(s.custom_analysis.c.id.in_(list(analysis_ids)))
+            ).where(
+                s.custom_analysis.c.id.in_(list(analysis_ids)),
+                _source_scope(connection_id),
+            )
         )
     except Exception:
         logger.warning("fetch_custom_analyses_with_sql: query failed", exc_info=True)
@@ -302,6 +350,7 @@ def fetch_custom_analyses_with_sql(analysis_ids: list[str]) -> list[dict[str, st
     return [
         {
             "id": row["id"] or "",
+            "connection_id": connection_id,
             "name": (row["name"] or "").strip(),
             "description": (row["description"] or "").strip(),
             "sql": (row["sql_text"] or "").strip(),
@@ -310,9 +359,11 @@ def fetch_custom_analyses_with_sql(analysis_ids: list[str]) -> list[dict[str, st
     ]
 
 
-def fetch_tables_from_custom_analyses(analysis_ids: list[str]) -> list[dict[str, Any]]:
+def fetch_tables_from_custom_analyses(
+    analysis_ids: list[str], *, connection_id: str | None = None
+) -> list[dict[str, Any]]:
     """The tables these analyses' SQL references, with column summaries."""
-    if not analysis_ids:
+    if not analysis_ids or not connection_id:
         return []
     try:
         rows = store().query_read(
@@ -322,11 +373,14 @@ def fetch_tables_from_custom_analyses(analysis_ids: list[str]) -> list[dict[str,
                 s.catalog_table.c.description,
                 s.catalog_table.c.pk,
                 s.catalog_database.c.name.label("database_name"),
+                s.catalog_database.c.id.label("connection_id"),
                 s.catalog_schema.c.name.label("schema_name"),
                 s.catalog_column.c.name.label("column_name"),
                 s.catalog_column.c.data_type,
                 s.catalog_column.c.ordinal_position,
-                column_description_expr().label("column_description"),
+                query_column_description_expr(connection_id).label(
+                    "column_description"
+                ),
             )
             .select_from(
                 s.custom_analysis__sql.join(
@@ -351,7 +405,13 @@ def fetch_tables_from_custom_analyses(analysis_ids: list[str]) -> list[dict[str,
                     s.catalog_column.c.table_id == s.catalog_table.c.id,
                 )
             )
-            .where(s.custom_analysis__sql.c.analysis_id.in_(list(analysis_ids)))
+            .where(
+                s.custom_analysis__sql.c.analysis_id.in_(list(analysis_ids)),
+                s.custom_analysis__sql.c.analysis_id.in_(
+                    select(s.custom_analysis.c.id).where(_source_scope(connection_id))
+                ),
+                s.catalog_database.c.id == connection_id,
+            )
             .distinct()
             .order_by(s.catalog_table.c.id, s.catalog_column.c.ordinal_position)
         )
@@ -368,6 +428,7 @@ def fetch_tables_from_custom_analyses(analysis_ids: list[str]) -> list[dict[str,
                 "name": row["name"] or "",
                 "description": row["description"] or "",
                 "database_name": row["database_name"] or "",
+                "connection_id": row["connection_id"],
                 "schema_name": row["schema_name"] or "",
                 "label": "Table",
                 # The prediction graph keys its entities on this: a table
@@ -389,46 +450,22 @@ def fetch_tables_from_custom_analyses(analysis_ids: list[str]) -> list[dict[str,
     return list(tables.values())
 
 
-def custom_analysis_exists(database_name: str | None = None) -> bool:
-    """Is there at least one custom analysis, optionally in *database_name*?
+def custom_analysis_exists(
+    database_name: str | None = None, *, connection_id: str | None = None
+) -> bool:
+    """Probe source-owned analyses; a physical name alone cannot select a source.
 
-    Scoped by *database_name* to analyses whose statement references a table in
-    that database; any analysis at all satisfies the unscoped check.
-
-    A ``LIMIT 1`` existence probe, so retrieval can skip the embedding search
-    outright when nothing could match. **Fails open** — a failed probe returns
-    ``True`` rather than silently suppressing a search that might have hit.
+    Missing context fails closed. A failed scoped probe may still permit a
+    source-filtered search, whose own ownership checks remain authoritative.
     """
-    statement = select(literal(1)).select_from(s.custom_analysis).limit(1)
-    if database_name:
-        statement = statement.where(
-            select(literal(1))
-            .select_from(
-                s.custom_analysis__sql.join(
-                    s.sql_query__table,
-                    s.sql_query__table.c.sql_query_id
-                    == s.custom_analysis__sql.c.sql_query_id,
-                )
-                .join(
-                    s.catalog_table,
-                    s.catalog_table.c.id == s.sql_query__table.c.table_id,
-                )
-                .join(
-                    s.catalog_schema,
-                    s.catalog_schema.c.id == s.catalog_table.c.schema_id,
-                )
-                .join(
-                    s.catalog_database,
-                    s.catalog_database.c.id == s.catalog_schema.c.database_id,
-                )
-            )
-            .where(
-                s.custom_analysis__sql.c.analysis_id == s.custom_analysis.c.id,
-                s.catalog_database.c.name == database_name,
-            )
-            .correlate(s.custom_analysis)
-            .exists()
-        )
+    if not connection_id:
+        return False
+    statement = (
+        select(literal(1))
+        .select_from(s.custom_analysis)
+        .where(_has_sql(), _source_scope(connection_id))
+        .limit(1)
+    )
     try:
         return bool(store().query_read(statement))
     except Exception:
@@ -451,16 +488,20 @@ def detach_existing_sql_edges(analysis_id: str) -> None:
 
 
 def delete_custom_analysis_node(analysis_id: str) -> None:
-    """Delete the analysis **and the statements it owns**.
-
-    The SQL's ``DETACH DELETE ca, sql`` deleted both, and that is preserved
-    rather than left to the cascade — which would only remove the link row. An
-    analysis's statement is not shared: it is parsed from text the user typed
-    into this analysis, so leaving it behind accumulates unreachable rows that
-    still show up in query-history reads.
-    """
-    owned = select(s.custom_analysis__sql.c.sql_query_id).where(
-        s.custom_analysis__sql.c.analysis_id == analysis_id
+    """Delete this analysis and only its same-source, otherwise unlinked SQL."""
+    owned = (
+        select(s.custom_analysis__sql.c.sql_query_id)
+        .select_from(
+            s.custom_analysis__sql.join(s.custom_analysis).join(
+                s.sql_query, s.sql_query.c.id == s.custom_analysis__sql.c.sql_query_id
+            )
+        )
+        .where(
+            s.custom_analysis.c.id == analysis_id,
+            s.sql_query.c.connection_id.is_not_distinct_from(
+                s.custom_analysis.c.connection_id
+            ),
+        )
     )
 
     # One unit: deleting the analysis first drops the link rows by cascade, so
@@ -474,7 +515,15 @@ def delete_custom_analysis_node(analysis_id: str) -> None:
         )
         if sql_ids:
             store().query_write(
-                delete(s.sql_query).where(s.sql_query.c.id.in_(sql_ids))
+                delete(s.sql_query).where(
+                    s.sql_query.c.id.in_(sql_ids),
+                    ~select(literal(1))
+                    .where(s.custom_analysis__sql.c.sql_query_id == s.sql_query.c.id)
+                    .exists(),
+                    ~select(literal(1))
+                    .where(s.sql_attribute__sql.c.sql_query_id == s.sql_query.c.id)
+                    .exists(),
+                )
             )
 
 
@@ -483,7 +532,9 @@ def delete_custom_analysis_node(analysis_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _custom_analysis_docs(analysis_id: str | None) -> list[dict[str, Any]]:
+def _custom_analysis_docs(
+    analysis_id: str | None, *, connection_id: str
+) -> list[dict[str, Any]]:
     """Embedding-ready docs.
 
     The text format is what gets embedded, so a changed separator silently
@@ -491,6 +542,8 @@ def _custom_analysis_docs(analysis_id: str | None) -> list[dict[str, Any]]:
     fails — retrieval just quietly degrades. Reproduced literally, including a
     blank description being omitted rather than rendered as an empty clause.
     """
+    if not connection_id:
+        raise ValueError("connection_id is required for custom analysis embeddings")
     statement = (
         select(
             s.custom_analysis.c.id,
@@ -498,7 +551,7 @@ def _custom_analysis_docs(analysis_id: str | None) -> list[dict[str, Any]]:
             s.custom_analysis.c.description,
             _sql_text().label("sql_text"),
         )
-        .where(_has_sql())
+        .where(_has_sql(), _source_scope(connection_id))
         .order_by(s.custom_analysis.c.id)
     )
     if analysis_id is not None:
@@ -518,6 +571,7 @@ def _custom_analysis_docs(analysis_id: str | None) -> list[dict[str, Any]]:
                 "name": row["name"],
                 "label": "CustomAnalysis",
                 "id": row["id"],
+                "connection_id": connection_id,
             }
         )
     return docs
@@ -528,11 +582,14 @@ def embed_custom_analyses(
     vdb: "PostgresVDB",
     analysis_id: str | None = None,
     database_name: str | None = None,
+    *,
+    connection_id: str,
 ) -> None:
     """Embed CustomAnalysis docs and append them to *vdb*."""
-    from auto_ontology.utils.embedding import embed_rows_into_vdb
+    from auto_ontology.utils.embedding import embed_rows
+    from auto_ontology.vdb.records import write_embedded_rows
 
-    docs = _custom_analysis_docs(analysis_id)
+    docs = _custom_analysis_docs(analysis_id, connection_id=connection_id)
     if not docs:
         logger.info(
             "No CustomAnalysis rows found for analysis_id=%r; skipping VDB upsert.",
@@ -556,6 +613,7 @@ def embed_custom_analyses(
             "name": item.get("name", ""),
             "source_path": path,
             "database_name": database_name,
+            "connection_id": connection_id,
         }
         rows.append(
             {
@@ -568,50 +626,29 @@ def embed_custom_analyses(
                 },
             }
         )
-    embed_rows_into_vdb(rows, embed_params, vdb, what="CustomAnalysis")
+    embedded = embed_rows(rows, embed_params, what="CustomAnalysis")
+    for node_id in {row["metadata"]["id"] for row in embedded}:
+        vdb.delete_by_id(node_id, connection_id=connection_id)
+    write_embedded_rows(vdb, embedded)
 
 
 def fetch_database_name_for_analysis(analysis_id: str) -> str | None:
-    """Return the database whose tables an analysis's SQL references.
-
-    Retrieval filters semantic hits on ``database_name``
-    (:func:`auto_ontology.retrieval.data_access.semantic_search.search_semantic_index`),
-    so an analysis embedded without one is invisible to every scoped search.
-
-    The relational path mirrors the edges this replaced -- analysis -> its SQL
-    -> the tables that SQL reads -> schema -> database.
-
-    ``DISTINCT ... LIMIT 1`` is deliberate, and lossy: an analysis whose SQL
-    joins across two databases has two answers and this returns one of them.
-    That matches the behaviour being ported rather than quietly improving on
-    it; the column it feeds holds a single value.
-    """
+    """Return the physical name only for an unambiguously source-owned definition."""
+    connection_id = get_custom_analysis_connection_id(analysis_id)
+    if connection_id is None:
+        return None
     rows = store().query_read(
         select(s.catalog_database.c.name)
         .select_from(
-            s.custom_analysis__sql.join(
-                s.sql_query__table,
-                s.sql_query__table.c.sql_query_id
-                == s.custom_analysis__sql.c.sql_query_id,
-            )
-            .join(
-                s.catalog_table,
-                s.catalog_table.c.id == s.sql_query__table.c.table_id,
-            )
-            .join(
-                s.catalog_schema,
-                s.catalog_schema.c.id == s.catalog_table.c.schema_id,
-            )
-            .join(
+            s.custom_analysis.join(
                 s.catalog_database,
-                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+                s.catalog_database.c.id == s.custom_analysis.c.connection_id,
             )
         )
-        .where(s.custom_analysis__sql.c.analysis_id == analysis_id)
-        .distinct()
-        # Stable across calls: without it two databases would alternate, and the
-        # embedding's scope would depend on plan order.
-        .order_by(s.catalog_database.c.name)
-        .limit(1)
+        .where(
+            s.custom_analysis.c.id == analysis_id,
+            _has_sql(),
+            _source_scope(connection_id),
+        )
     )
     return str(rows[0]["name"]) if rows else None

@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from auto_ontology.connectors.sources import SourceSelectionError
+
 from .types import InteractivePhase
 
 
@@ -19,6 +21,7 @@ class InteractiveSessionState:
     external_kb: str
     original_question: str
     working_question: str
+    connection_id: str | None = field(default=None, kw_only=True)
     max_clarify_turns: int = 5
     clarify_history: list[dict] = field(default_factory=list)  # [{"q": ..., "a": ...}]
     phase: InteractivePhase = InteractivePhase.ROUND1_CLARIFY
@@ -135,3 +138,19 @@ class InteractiveSessionState:
     data_retriever: Any = None
     semantic_retriever: Any = None
     connectors: list = field(default_factory=list)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "connection_id" and self.__dict__.get(name) is not None:
+            if value != self.__dict__[name]:
+                raise AttributeError("Session connection_id is immutable")
+        super().__setattr__(name, value)
+
+    def require_connection_id(self) -> str:
+        if not self.connection_id:
+            raise SourceSelectionError(422, "source_required")
+        return self.connection_id
+
+    def bind_source(self) -> None:
+        """Resume state is not an authority for the session's source."""
+        self.path_state["connection_id"] = self.require_connection_id()
+        self.path_state.pop("target_db", None)

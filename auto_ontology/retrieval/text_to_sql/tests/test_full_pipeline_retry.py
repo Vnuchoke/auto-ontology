@@ -17,6 +17,8 @@ from auto_ontology.retrieval.text_to_sql.state import AgentState, TextToSQLPaylo
 
 
 def _initial_state() -> AgentState:
+    from .source_fixtures import SOURCE
+
     base_messages = [
         SystemMessage(content="base system"),
         HumanMessage(content="original question"),
@@ -44,6 +46,8 @@ def _initial_state() -> AgentState:
             "messages": list(base_messages),
             "decision": "",
             "connectors": [],
+            "connection_id": SOURCE["connection_id"],
+            "source": dict(SOURCE),
             "path_state": dict(baseline_path),
             "data_retriever": object(),
             "semantic_retriever": object(),
@@ -138,6 +142,15 @@ class _AttemptApp:
         else:
             update = _unconstructable_update()
 
+        node_output = next(iter(update.values()))
+        node_output["connection_id"] = "foreign"
+        node_output["source"] = {"connection_id": "foreign"}
+        node_output["path_state"]["connection_id"] = "foreign"
+        node_output["path_state"]["target_db"] = "foreign"
+        final_response = node_output["path_state"].get("final_response")
+        if isinstance(final_response, dict):
+            final_response["source"] = {"connection_id": "foreign"}
+
         if stream_mode:
             node_name = next(iter(update))
             yield ("custom", {"type": main.NODE_START_EVENT, "node": node_name})
@@ -197,10 +210,16 @@ def test_stream_retries_once_then_returns_success(
     assert results == [
         {
             "type": "result",
-            "answer": {"response": "Success.", "sql_code": "SELECT 42"},
+            "answer": {
+                "response": "Success.",
+                "sql_code": "SELECT 42",
+                "source": _initial_state()["source"],
+            },
         }
     ]
     assert [state["full_pipeline_attempt"] for state in app.states] == [1, 2]
+    assert all(state["connection_id"] == "test-source" for state in app.states)
+    assert events[0] == {"type": "source", "source": results[0]["answer"]["source"]}
     assert app.states[1]["initial_question"] == "original question"
     assert app.states[1]["evidence"] == "original evidence"
     assert [message.content for message in app.states[1]["messages"]] == [
@@ -253,6 +272,19 @@ def test_response_with_state_uses_the_same_full_retry_cycle(
     assert result["sql_code"] == "SELECT 42"
     assert result["path_state"]["sql_code"] == "SELECT 42"
     assert result["path_state"]["caller_context"] == "keep"
+    assert result["source"] == _initial_state()["source"]
+    assert result["path_state"]["connection_id"] == "test-source"
+
+
+def test_direct_response_keeps_source_after_full_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _AttemptApp(["failure", "success"])
+    monkeypatch.setattr(main, "_build_state", lambda _payload: _initial_state())
+    monkeypatch.setattr(main, "app", app)
+    result = main.get_agent_response(_payload())
+    assert len(app.states) == 2
+    assert result["source"] == _initial_state()["source"]
 
 
 def test_final_attempt_returns_last_sql_rejected_only_by_intent(

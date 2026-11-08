@@ -181,7 +181,18 @@ def _refresh_vdb_embeddings(node_ids: list[str]) -> None:
         )
         return
 
-    embed_df = CatalogEmbeddingRowsOp(database_name=database_name).process(
+    connection_ids = {
+        cid
+        for frame in (tables_df, columns_df)
+        if not frame.empty
+        for cid in frame["connection_id"]
+    }
+    if len(connection_ids) != 1:
+        raise ValueError("Embedding refresh requires a single connection_id")
+    connection_id = connection_ids.pop()
+    embed_df = CatalogEmbeddingRowsOp(
+        database_name=database_name, connection_id=connection_id
+    ).process(
         (tables_df, columns_df),
     )
     if embed_df.empty:
@@ -200,9 +211,9 @@ def _refresh_vdb_embeddings(node_ids: list[str]) -> None:
     # Embedded before anything is deleted, so a failed embed leaves the old rows.
     rows = embed_rows(records, get_embed_params(), what="tabular")
 
-    vdb = get_data_vdb()
+    vdb = get_data_vdb(connection_id=connection_id)
     for nid in unique_ids:
-        vdb.delete_by_id(nid)
+        vdb.delete_by_id(nid, connection_id=connection_id)
     write_embedded_rows(vdb, rows)
 
 
@@ -212,11 +223,14 @@ def _refresh_semantic_column_attribute_embeddings(column_id: str) -> None:
     for term, attrs in contexts:
         if not attrs:
             continue
-        embedder = build_semantic_embedder(term.get("database_name") or "", reset=False)
+        connection_id = term["connection_id"]
+        embedder = build_semantic_embedder(
+            term.get("database_name") or "", connection_id=connection_id, reset=False
+        )
         if embedder is None:
             return
         for attr in attrs:
             attr_id = attr.get("id")
             if attr_id:
-                embedder.vdb.delete_by_id(attr_id)
+                embedder.vdb.delete_by_id(attr_id, connection_id=connection_id)
         embedder.embed_column_attributes(attrs)

@@ -61,6 +61,8 @@ __all__ = [
     "SqlAttribute",
     "SqlExpressionValidationResult",
     "SqlValidationResult",
+    "SourceProvenance",
+    "SourceSummary",
     "SsoFederationState",
     "TableColumns",
     "TableExplorationDetails",
@@ -98,6 +100,20 @@ class ApiModel(BaseModel):
     """
 
     model_config = ConfigDict(extra="allow")
+
+
+class SourceProvenance(ApiModel):
+    """Credential-free source snapshot captured at the query boundary."""
+
+    connection_id: str
+    display_label: str
+    database_name: str
+
+
+class SourceSummary(SourceProvenance):
+    """Active source metadata available to chat callers without driver probes."""
+
+    dialect: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +315,7 @@ class DatabaseSummary(ApiModel):
 
     id: str
     name: str | None = None
+    display_label: str | None = None
     description: str | None = None
     num_of_schemas: int | None = None
     owner_id: str | None = None
@@ -647,6 +664,7 @@ class SqlAttribute(ApiModel):
     """
 
     id: str
+    connection_id: str | None = None
     name: str | None = None
     description: str | None = None
     description_suggestion: str | None = None
@@ -683,6 +701,7 @@ class CustomAnalysis(ApiModel):
     """A verified SQL example, joined with the text of its ``Sql`` node."""
 
     id: str
+    connection_id: str | None = None
     name: str | None = None
     description: str | None = None
     sql: str | None = None
@@ -1135,22 +1154,25 @@ class ExplorationRelatedNodes(ApiModel):
 class PublicConnection(ApiModel):
     """A UI-managed connection with its credentials stripped.
 
-    ``connection`` is absent from the delete response, which echoes only the
-    database name it tore down; the list and create reads carry the full
-    credential-free config.
+    Stable ID and label are independent of the physical name. ``connection``
+    is absent on removal; the list/create reads carry credential-free settings.
     """
 
+    connection_id: str
+    display_label: str
     database_name: str
     connection: dict[str, Any] | None = None
 
 
 class SsoFederationState(ApiModel):
-    """The one flag ``PATCH /connections/{database_name}/sso-federation`` sets.
+    """The flag set on one stable connection ID (legacy names must be unique).
 
     The route deliberately echoes just the flag rather than the connection, so
     a caller never has to re-send credentials to toggle it.
     """
 
+    connection_id: str
+    display_label: str
     database_name: str
     sso_federation: bool
 
@@ -1176,5 +1198,6 @@ class EntityCoverageResult(ApiModel):
     """
 
     coverage: float
+    source: SourceProvenance | None = None
     candidates: list[EntityCoverageCandidate] = Field(default_factory=list)
     uncovered_entities: list[str] | None = None

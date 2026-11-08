@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Path, Query
+from fastapi import APIRouter, HTTPException, Path, Query
 
 from auto_ontology.server.exploration import service
 from auto_ontology.server.pagination import LIMIT_QUERY, SKIP_QUERY
+from auto_ontology.server.source_context import resolve_semantic_source
 from auto_ontology.server.responses import (
     ColumnAttributeExplorationDetailsResponse,
     ColumnExplorationDetailsResponse,
@@ -100,13 +101,18 @@ def get_table_exploration_details(
     table_id: str,
     skip: int = SKIP_QUERY,
     limit: int | None = LIMIT_QUERY,
+    connection_id: str | None = None,
+    connection_label: str | None = None,
+    target_db: str | None = None,
 ) -> dict:
     """Columns-adjacent SQL and one ordered page of Term details for an Exploration modal."""
-    return {
-        "data": service.fetch_table_exploration_details(
-            table_id, zone_ids=None, skip=skip, limit=limit
-        )
-    }
+    connection_id = resolve_semantic_source(connection_id, connection_label, target_db)
+    data = service.fetch_table_exploration_details(
+        table_id, zone_ids=None, skip=skip, limit=limit, connection_id=connection_id
+    )
+    if data is None:
+        raise HTTPException(status_code=404, detail="Table not found")
+    return {"data": data}
 
 
 @router.get(

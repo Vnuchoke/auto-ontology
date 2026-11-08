@@ -21,6 +21,9 @@ from auto_ontology.catalog.constants import (
     Labels,
     Props,
 )
+from auto_ontology.connectors import sources
+from auto_ontology.dal import custom_analyses as analysis_dal
+from auto_ontology.dal.session import write_transaction
 from auto_ontology.dal.custom_analyses import (
     CustomAnalysisNameConflict,
     CustomAnalysisSqlConflict,
@@ -60,15 +63,40 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def validate_custom_analysis_sql(sql: str) -> dict[str, Any]:
-    """Validate a SQL expression against the full catalog.
+def _resolve_source(connection_id: str | None) -> sources.SourceDescriptor:
+    """Choose from active metadata without opening any connector."""
+    active = sources.list_active_sources()
+    if connection_id is None:
+        if len(active) != 1:
+            raise ValueError("source_required: select an active connection_id")
+        return active[0]
+    for source in active:
+        if source.connection_id == connection_id:
+            return source
+    raise ValueError("invalid_source_selector: unknown or inactive connection_id")
+
+
+def validate_custom_analysis_sql(
+    sql: str, *, connection_id: str | None = None, analysis_id: str | None = None
+) -> dict[str, Any]:
+    """Validate SQL in one active source, inheriting existing ownership.
 
     Does not persist anything — used by the "Validate SQL" step before a
     CustomAnalysis is created or updated.
 
     Raises :class:`CustomAnalysisSqlError` when the SQL can't be resolved.
     """
-    validate_sql(sql, get_dialects(), get_schemas())
+    if analysis_id is not None:
+        if get_custom_analysis_by_id(analysis_id) is None:
+            raise ValueError(f"CustomAnalysis {analysis_id!r} not found")
+        connection_id = _definition_connection_id(analysis_id, connection_id)
+    source = _resolve_source(connection_id)
+    validate_sql(
+        sql,
+        get_dialects(source.connection_id),
+        get_schemas(source.connection_id),
+        connection_id=source.connection_id,
+    )
     return {"valid": True, "sql": sql}
 
 
@@ -86,20 +114,23 @@ def _embed_analysis(analysis_id: str) -> None:
     from auto_ontology.utils import get_embed_params
     from auto_ontology.vdb import get_semantic_vdb
 
-    vdb = get_semantic_vdb()
+    from auto_ontology.dal.custom_analyses import get_custom_analysis_connection_id
+
+    connection_id = get_custom_analysis_connection_id(analysis_id)
+    if connection_id is None:
+        logger.info("Skipping unowned CustomAnalysis %s embedding", analysis_id)
+        return
+    vdb = get_semantic_vdb(connection_id=connection_id)
     database_name = fetch_database_name_for_analysis(analysis_id)
     if database_name is None:
-        logger.warning(
-            "CustomAnalysis %s references no catalogued database; embedding it "
-            "unscoped, so retrieval's database filter will skip it",
-            analysis_id,
-        )
+        return
 
     embed_custom_analyses(
         embed_params=get_embed_params(),
         vdb=vdb,
         analysis_id=analysis_id,
         database_name=database_name,
+        connection_id=connection_id,
     )
 
 
@@ -109,12 +140,15 @@ def _persist_analysis_with_sql(
     query_obj: Any,
 ) -> dict[str, Any]:
     """Link a pre-parsed ``query_obj`` to ``analysis_node`` via HAS_SQL."""
-    query_obj.sql_node.match_props = {"sql_full_query": sql}
+    query_obj.sql_node.match_props = {
+        "sql_full_query": sql,
+        "connection_id": query_obj.connection_id,
+    }
 
     edge_props = {Props.ANALYSIS_ID: analysis_node.get_id()}
     query_obj.edges.append((analysis_node, query_obj.sql_node, edge_props))
 
-    add_query(query_obj.get_edges())
+    add_query(query_obj.get_edges(), connection_id=query_obj.connection_id)
 
     props = analysis_node.get_properties()
     return {
@@ -122,6 +156,7 @@ def _persist_analysis_with_sql(
         "name": props["name"],
         "description": props["description"],
         "sql": sql,
+        "connection_id": query_obj.connection_id,
     }
 
 
@@ -136,13 +171,16 @@ def create_custom_analysis(
     sql: str,
     *,
     embed: bool = True,
+    connection_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a fresh ``CustomAnalysis`` linked to its ``Sql`` node.
 
     Raises :class:`CustomAnalysisNameConflict` when ``name`` is already used.
     Raises :class:`CustomAnalysisSqlConflict` when ``sql`` is already attached.
     Raises :class:`CustomAnalysisSqlError` when the SQL can't be resolved.
-    Returns ``{id, name, description, sql}``.
+    Select ``connection_id`` when multiple sources are active; conflict checks
+    and SQL dependencies use only that source. The returned metadata keeps
+    ``connection_id`` separate from the physical ``database_name``.
 
     *embed* exists for bulk loaders, and defaults to the interactive
     behaviour. Embedding inline is right when a user creates one analysis --
@@ -158,29 +196,45 @@ def create_custom_analysis(
     index has no uniqueness constraint to catch it -- retrieval simply starts
     returning the same analysis in two of its top-k slots.
     """
-    name_conflict = find_analysis_by_name(name, exclude_id=None)
+    source = _resolve_source(connection_id)
+    connection_id = source.connection_id
+    name_conflict = find_analysis_by_name(
+        name, exclude_id=None, connection_id=connection_id
+    )
     if name_conflict is not None:
         raise CustomAnalysisNameConflict(
             f"another CustomAnalysis already uses name {name!r} "
             f"(id={name_conflict['id']!r})",
         )
 
-    sql_conflict = find_analysis_by_sql(sql, exclude_id=None)
+    sql_conflict = find_analysis_by_sql(
+        sql, exclude_id=None, connection_id=connection_id
+    )
     if sql_conflict is not None:
         raise CustomAnalysisSqlConflict(
             f"this SQL is already used by CustomAnalysis {sql_conflict['name']!r} "
             f"(id={sql_conflict['id']!r})",
         )
 
-    query_obj = validate_sql(sql, get_dialects(), get_schemas())
+    query_obj = validate_sql(
+        sql,
+        get_dialects(connection_id),
+        get_schemas(connection_id),
+        connection_id=connection_id,
+    )
     analysis_node = CatalogNode(
         name=name,
         label=Labels.CUSTOM_ANALYSIS,
-        props={"name": name, "description": description},
-        match_props={"name": name},
+        props={
+            "name": name,
+            "description": description,
+            "connection_id": connection_id,
+        },
+        match_props={"name": name, "connection_id": connection_id},
     )
 
     row = _persist_analysis_with_sql(analysis_node, sql, query_obj)
+    row["database_name"] = source.database_name
 
     if embed:
         _embed_analysis(row["id"])
@@ -188,14 +242,27 @@ def create_custom_analysis(
     return row
 
 
+def _definition_connection_id(analysis_id: str, connection_id: str | None) -> str:
+    stored_id = analysis_dal.get_custom_analysis_connection_id(analysis_id)
+    if connection_id is not None and connection_id != stored_id:
+        raise ValueError("source_conflict: definition ownership is immutable")
+    if stored_id is None:
+        raise ValueError("source_required: legacy definition has no source ownership")
+    return stored_id
+
+
 def update_custom_analysis(
     analysis_id: str,
     name: str,
     description: str,
     sql: str,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Replace name/description/sql of an existing ``CustomAnalysis`` by id.
 
+    Inherit stored source ownership; a conflicting explicit ID or unresolved
+    legacy definition is rejected before SQL validation or metadata writes.
     Returns the updated row or ``None`` when no analysis with ``analysis_id`` exists.
     Raises :class:`CustomAnalysisNameConflict`, :class:`CustomAnalysisSqlConflict`,
     or :class:`CustomAnalysisSqlError` on constraint violations.
@@ -203,14 +270,20 @@ def update_custom_analysis(
     if get_custom_analysis_by_id(analysis_id) is None:
         return None
 
-    name_conflict = find_analysis_by_name(name, exclude_id=analysis_id)
+    connection_id = _definition_connection_id(analysis_id, connection_id)
+    source = _resolve_source(connection_id)
+    name_conflict = find_analysis_by_name(
+        name, exclude_id=analysis_id, connection_id=connection_id
+    )
     if name_conflict is not None:
         raise CustomAnalysisNameConflict(
             f"another CustomAnalysis already uses name {name!r} "
             f"(id={name_conflict['id']!r})",
         )
 
-    sql_conflict = find_analysis_by_sql(sql, exclude_id=analysis_id)
+    sql_conflict = find_analysis_by_sql(
+        sql, exclude_id=analysis_id, connection_id=connection_id
+    )
     if sql_conflict is not None:
         raise CustomAnalysisSqlConflict(
             f"this SQL is already used by CustomAnalysis {sql_conflict['name']!r} "
@@ -219,24 +292,31 @@ def update_custom_analysis(
 
     # Validate BEFORE touching the graph so a parse failure can't orphan
     # the analysis from its Sql node.
-    query_obj = validate_sql(sql, get_dialects(), get_schemas())
-
-    detach_existing_sql_edges(analysis_id)
+    query_obj = validate_sql(
+        sql,
+        get_dialects(connection_id),
+        get_schemas(connection_id),
+        connection_id=connection_id,
+    )
 
     analysis_node = CatalogNode(
         name=name,
         label=Labels.CUSTOM_ANALYSIS,
-        props={"name": name, "description": description},
-        match_props={"id": analysis_id},
+        props={
+            "name": name,
+            "description": description,
+            "connection_id": connection_id,
+        },
+        match_props={"id": analysis_id, "connection_id": connection_id},
         existing_id=analysis_id,
         override_existing_props={"name": name, "description": description},
     )
 
-    row = _persist_analysis_with_sql(analysis_node, sql, query_obj)
+    with write_transaction():
+        detach_existing_sql_edges(analysis_id)
+        row = _persist_analysis_with_sql(analysis_node, sql, query_obj)
+    row["database_name"] = source.database_name
 
-    from auto_ontology.vdb import get_semantic_vdb
-
-    get_semantic_vdb().delete_by_id(analysis_id)
     _embed_analysis(analysis_id)
 
     return row
@@ -250,10 +330,16 @@ def delete_custom_analysis(analysis_id: str) -> dict[str, str] | None:
     if get_custom_analysis_by_id(analysis_id) is None:
         return None
 
+    from auto_ontology.dal.custom_analyses import get_custom_analysis_connection_id
+
+    connection_id = get_custom_analysis_connection_id(analysis_id)
     delete_custom_analysis_node(analysis_id)
 
     from auto_ontology.vdb import get_semantic_vdb
 
-    get_semantic_vdb().delete_by_id(analysis_id)
+    if connection_id:
+        get_semantic_vdb(connection_id=connection_id).delete_by_id(
+            analysis_id, connection_id=connection_id
+        )
 
     return {"id": analysis_id}

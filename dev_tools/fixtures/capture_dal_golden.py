@@ -21,6 +21,11 @@ Usage::
 
     uv run --no-sync python -m dev_tools.fixtures.seed_graph_fixture --reset
     uv run --no-sync python -m dev_tools.fixtures.capture_dal_golden
+
+Semantic projection snapshots intentionally use separate Pagila/Chinook scopes
+instead of the former global/zone modes: their contract now requires a source
+ID, and combining their text would conceal cross-source leakage. SQL query
+context snapshots use Pagila, which owns the fixture's SQL definitions.
 """
 
 from __future__ import annotations
@@ -57,7 +62,6 @@ def build_id_map() -> dict[str, str]:
     """
     from auto_ontology.dal.custom_analyses import list_custom_analyses
     from auto_ontology.dal.datasources import (
-        fetch_databases,
         fetch_schemas_by_ids,
         fetch_schemas_for_database,
     )
@@ -71,13 +75,11 @@ def build_id_map() -> dict[str, str]:
 
     id_map: dict[str, str] = {}
 
-    for database in fetch_databases():
-        id_map[database["id"]] = f"<db:{database['name']}>"
-        found = fetch_schemas_for_database(database["id"]) or {}
+    for name, database_id in _fixture_databases().items():
+        id_map[database_id] = f"<db:{name}>"
+        found = fetch_schemas_for_database(database_id) or {}
         for schema in found.get("schemas", []):
-            id_map[schema["id"]] = (
-                f"<schema:{database['name']}.{schema['schema_name']}>"
-            )
+            id_map[schema["id"]] = f"<schema:{name}.{schema['schema_name']}>"
 
     for row in fetch_schemas_by_ids():
         path = f"{row['database_name']}.{row['table_schema']}.{row['table_name']}"
@@ -265,14 +267,12 @@ class Capture:
 ZERO_ARG_READS: tuple[tuple[str, str], ...] = (
     ("attributes", "find_unlinked_fk_columns"),
     ("connections", "list_connections"),
-    ("custom_analyses", "fetch_custom_analyses"),
     ("datasources", "fetch_all_schema_ids"),
     ("datasources", "fetch_all_tables_without_term"),
     ("datasources", "fetch_join_edges"),
     ("datasources", "fetch_sorted_tables"),
     ("pql_analyses", "list_pql_analyses"),
     ("sql_attributes", "list_sql_attributes"),
-    ("terms", "fetch_terms_with_sqls"),
     ("terms", "semantic_layer_calculated"),
     ("zones", "list_zones"),
 )
@@ -288,7 +288,6 @@ ZONE_SCOPED_READS: tuple[tuple[str, str], ...] = (
     ("sql_attributes", "fetch_sql_attribute_counts"),
     ("terms", "count_terms"),
     ("terms", "fetch_all_terms"),
-    ("terms", "fetch_all_terms_and_attributes"),
     ("terms", "fetch_column_attribute_counts"),
     ("terms", "fetch_related_terms_counts"),
     ("terms", "fetch_term_table_pairs"),
@@ -306,6 +305,23 @@ def _zone_modes(ids: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
     return (("admin", None), ("scoped", [ids["zone_film"]]), ("none", []))
 
 
+def _fixture_databases() -> dict[str, str]:
+    """Resolve physical names only when catalog roots are unambiguous.
+
+    Catalog-only fixtures need no registered runtime source or connector. Reject
+    duplicate names before selection or tokenisation can erase their identity.
+    """
+    from auto_ontology.dal.datasources import fetch_databases
+
+    databases: dict[str, str] = {}
+    for row in fetch_databases():
+        name, database_id = row["name"], row["id"]
+        if name in databases and databases[name] != database_id:
+            raise ValueError(f"ambiguous fixture catalog database: {name}")
+        databases[name] = database_id
+    return databases
+
+
 def _fixture_ids() -> dict[str, Any]:
     """Resolve the fixture's entities by name, through the DAL.
 
@@ -318,7 +334,6 @@ def _fixture_ids() -> dict[str, Any]:
     """
     from auto_ontology.dal.custom_analyses import list_custom_analyses
     from auto_ontology.dal.datasources import (
-        fetch_databases,
         fetch_schemas_by_ids,
         fetch_schemas_for_database,
     )
@@ -327,7 +342,7 @@ def _fixture_ids() -> dict[str, Any]:
     from auto_ontology.dal.terms import fetch_all_terms
     from auto_ontology.dal.zones import list_zones
 
-    databases = {row["name"]: row["id"] for row in fetch_databases()}
+    databases = _fixture_databases()
     columns = fetch_schemas_by_ids()
 
     def table(database: str, schema: str, name: str) -> str | None:
@@ -372,6 +387,7 @@ def _fixture_ids() -> dict[str, Any]:
 
     ids: dict[str, Any] = {
         "db_pagila": databases.get("pagila"),
+        "db_chinook": databases.get("chinook"),
         "schema_public": schema_public,
         "attr_film_id": _column_attribute_id("film id"),
         "sqlattr_revenue": first(attributes, name="total revenue"),
@@ -450,7 +466,12 @@ def capture_arg_reads(cap: Capture, ids: dict[str, Any]) -> None:
     attr = ids["attr_film_id"]
     sqlattr = ids["sqlattr_revenue"]
     analysis = ids["analysis_top_films"]
+    connection_id = ids["db_pagila"]
     run = cap.run
+    run(
+        "terms.fetch_terms_with_sqls",
+        lambda: terms.fetch_terms_with_sqls(connection_id=connection_id),
+    )
 
     # -- datasources -------------------------------------------------------
     run(
@@ -491,7 +512,7 @@ def capture_arg_reads(cap: Capture, ids: dict[str, Any]) -> None:
     )
     run(
         "datasources.fetch_bridge_table_candidates",
-        lambda: datasources.fetch_bridge_table_candidates("pagila"),
+        lambda: datasources.fetch_bridge_table_candidates(connection_id=connection_id),
     )
     run(
         "datasources.fetch_col_table_contexts",
@@ -529,6 +550,13 @@ def capture_arg_reads(cap: Capture, ids: dict[str, Any]) -> None:
     )
 
     # -- terms -------------------------------------------------------------
+    for database in ("pagila", "chinook"):
+        run(
+            f"terms.fetch_all_terms_and_attributes[{database}]",
+            lambda cid=ids[f"db_{database}"]: terms.fetch_all_terms_and_attributes(
+                connection_id=cid
+            ),
+        )
     run("terms.get_full_term_by_id", lambda: terms.get_full_term_by_id(term_film))
     run("terms.get_slim_term_by_id", lambda: terms.get_slim_term_by_id(term_film))
     run("terms.get_term_certification", lambda: terms.get_term_certification(term_film))
@@ -553,10 +581,15 @@ def capture_arg_reads(cap: Capture, ids: dict[str, Any]) -> None:
         "terms.fetch_terms_and_attributes_for_table",
         lambda: terms.fetch_terms_and_attributes_for_table(film),
     )
-    run("terms.fetch_table_schema_map", lambda: terms.fetch_table_schema_map("pagila"))
+    run(
+        "terms.fetch_table_schema_map",
+        lambda: terms.fetch_table_schema_map(connection_id=connection_id),
+    )
     run(
         "terms.fetch_term_and_column_attributes_for_embedding",
-        lambda: terms.fetch_term_and_column_attributes_for_embedding(term_film),
+        lambda: terms.fetch_term_and_column_attributes_for_embedding(
+            term_film, connection_id=connection_id
+        ),
     )
     run("terms.fetch_term_synonyms", lambda: terms.fetch_term_synonyms([attr]))
     run(
@@ -581,7 +614,9 @@ def capture_arg_reads(cap: Capture, ids: dict[str, Any]) -> None:
     )
     run(
         "attributes.fetch_attr_column_contexts",
-        lambda: attributes.fetch_attr_column_contexts([attr], database_name="pagila"),
+        lambda: attributes.fetch_attr_column_contexts(
+            [attr], connection_id=connection_id
+        ),
     )
     run(
         "attributes.find_column_attribute_by_column_id",
@@ -631,41 +666,61 @@ def capture_arg_reads(cap: Capture, ids: dict[str, Any]) -> None:
     )
     run(
         "sql_attributes.fetch_sql_attribute_docs",
-        lambda: sql_attributes.fetch_sql_attribute_docs(sqlattr),
+        lambda: sql_attributes.fetch_sql_attribute_docs(
+            sqlattr, connection_id=connection_id
+        ),
     )
     run(
         "sql_attributes.fetch_sql_attributes_with_sql",
-        lambda: sql_attributes.fetch_sql_attributes_with_sql([sqlattr]),
+        lambda: sql_attributes.fetch_sql_attributes_with_sql(
+            [sqlattr], connection_id=connection_id
+        ),
     )
     run(
         "sql_attributes.fetch_tables_from_sql_attributes",
-        lambda: sql_attributes.fetch_tables_from_sql_attributes([sqlattr]),
+        lambda: sql_attributes.fetch_tables_from_sql_attributes(
+            [sqlattr], connection_id=connection_id
+        ),
     )
     run(
         "sql_attributes.find_attr_by_name",
-        lambda: sql_attributes.find_attr_by_name("total revenue", None),
+        lambda: sql_attributes.find_attr_by_name(
+            "total revenue", None, connection_id=connection_id
+        ),
     )
     run(
         "sql_attributes.find_attr_by_name__absent",
-        lambda: sql_attributes.find_attr_by_name("no such attribute", None),
+        lambda: sql_attributes.find_attr_by_name(
+            "no such attribute", None, connection_id=connection_id
+        ),
     )
 
     # -- custom / pql analyses --------------------------------------------
+    run(
+        "custom_analyses.fetch_custom_analyses",
+        lambda: custom_analyses.fetch_custom_analyses(connection_id=connection_id),
+    )
     run(
         "custom_analyses.get_custom_analysis_by_id",
         lambda: custom_analyses.get_custom_analysis_by_id(analysis),
     )
     run(
         "custom_analyses.fetch_custom_analyses_with_sql",
-        lambda: custom_analyses.fetch_custom_analyses_with_sql([analysis]),
+        lambda: custom_analyses.fetch_custom_analyses_with_sql(
+            [analysis], connection_id=connection_id
+        ),
     )
     run(
         "custom_analyses.fetch_tables_from_custom_analyses",
-        lambda: custom_analyses.fetch_tables_from_custom_analyses([analysis]),
+        lambda: custom_analyses.fetch_tables_from_custom_analyses(
+            [analysis], connection_id=connection_id
+        ),
     )
     run(
         "custom_analyses.find_analysis_by_name",
-        lambda: custom_analyses.find_analysis_by_name("Top rented films", None),
+        lambda: custom_analyses.find_analysis_by_name(
+            "Top rented films", None, connection_id=connection_id
+        ),
     )
     run(
         "pql_analyses.get_pql_analysis_by_id",

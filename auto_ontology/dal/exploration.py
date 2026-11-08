@@ -36,11 +36,13 @@ from auto_ontology.dal import schema as s
 # same way -- `TABLE_COUNTS_SUBQUERY`, imported across modules. A second
 # copy here is how the graph's badge and the schema tree's badge start
 # disagreeing about the same table.
-from auto_ontology.dal.datasources import _count_of, _terms_count
+from auto_ontology.dal.datasources import _count_of, _terms_count, fetch_table_by_id
 from auto_ontology.dal.session import store
+from auto_ontology.dal.source_scope import definition_source_scope, query_source_scope
 from auto_ontology.dal.sql_attributes import fetch_sql_attribute_counts
 from auto_ontology.dal.sql_fragments import table_description_expr
 from auto_ontology.dal.terms import (
+    _projection_attributes,
     build_term_table_maps,
     fetch_all_terms,
     fetch_column_attribute_counts,
@@ -284,7 +286,7 @@ def _attribute_link():
     )
 
 
-def _term_table_links():
+def _term_table_links(*, connection_id: str | None = None) -> Any:
     """``(term_id, table_id, rel_type)`` for every term↔table link.
 
     The same three paths :func:`auto_ontology.dal.terms.fetch_term_table_pairs` calls a
@@ -326,6 +328,29 @@ def _term_table_links():
         )
         .where(s.term.c.source == SEMANTIC_SOURCE)
     )
+    if connection_id is not None:
+        source_tables = (
+            select(s.catalog_table.c.id)
+            .join(s.catalog_schema)
+            .where(s.catalog_schema.c.database_id == connection_id)
+        )
+        owned_attributes = (
+            _projection_attributes(connection_id)
+            .where(s.catalog_column.c.name == s.column_attribute.c.source_column)
+            .with_only_columns(s.column_attribute.c.id)
+            .order_by(None)
+            .correlate(None)
+        )
+        represents = represents.where(s.table__term.c.table_id.in_(source_tables))
+        via_attribute = via_attribute.where(
+            s.catalog_column.c.table_id.in_(source_tables),
+            s.column_attribute.c.id.in_(owned_attributes),
+            (link.c.rel_type != REL_HAS_ATTRIBUTE)
+            | and_(
+                s.column_attribute.c.table_id == s.catalog_column.c.table_id,
+                s.column_attribute.c.source_column == s.catalog_column.c.name,
+            ),
+        )
     return represents.union(via_attribute).subquery("term_table_link")
 
 
@@ -429,7 +454,8 @@ def fetch_table_exploration_details(
     *,
     skip: int = 0,
     limit: int | None = None,
-) -> dict[str, Any]:
+    connection_id: str | None = None,
+) -> dict[str, Any] | None:
     """The statements referencing a table, and one page of its Terms.
 
     Each term carries ``relationship_types`` -- the link type(s) actually
@@ -448,6 +474,11 @@ def fetch_table_exploration_details(
     change what the panel shows — but pinned by a test so it cannot be
     "tidied" silently.
     """
+    if (
+        connection_id is not None
+        and fetch_table_by_id(table_id, connection_id=connection_id) is None
+    ):
+        return None
     resolved = resolve_accessible_catalog_ids(zone_ids)
     if resolved is not None and table_id not in resolved["table_ids"]:
         return {"queries": [], "terms": [], "terms_total": 0}
@@ -460,13 +491,20 @@ def fetch_table_exploration_details(
             )
         )
         .where(s.sql_query__table.c.table_id == table_id)
+        .where(
+            *(
+                [s.sql_query.c.connection_id == connection_id]
+                if connection_id is not None
+                else []
+            )
+        )
         .distinct()
         .order_by(s.sql_query.c.id)
     )
 
     # Every Term route the table has, from the one definition of a term-to-table
     # link -- REPRESENTS, or a column's attribute by either link.
-    links = _term_table_links()
+    links = _term_table_links(connection_id=connection_id)
     total = store().query_read(
         select(func.count(func.distinct(links.c.term_id)).label("total")).where(
             links.c.table_id == table_id
@@ -567,9 +605,43 @@ def fetch_term_exploration_details(
     }
 
 
+def _detail_source_tables(table_filter: list[str] | None, connection_id: str) -> Any:
+    """Intersect source ownership and zone visibility before traversing details."""
+    tables = (
+        select(s.catalog_table.c.id)
+        .join(s.catalog_schema)
+        .where(s.catalog_schema.c.database_id == connection_id)
+    )
+    if table_filter is not None:
+        tables = tables.where(s.catalog_table.c.id.in_(table_filter))
+    return tables
+
+
+def _detail_owned_attributes(connection_id: str) -> Any:
+    """Canonical HAS_ATTRIBUTE must match the declared table and source column."""
+    return (
+        select(s.column_attribute.c.id)
+        .select_from(
+            s.column_attribute.join(s.column__has_attribute)
+            .join(s.catalog_column)
+            .join(s.catalog_table)
+            .join(s.catalog_schema)
+        )
+        .where(
+            s.column_attribute.c.source == SEMANTIC_SOURCE,
+            s.catalog_schema.c.database_id == connection_id,
+            s.column_attribute.c.table_id == s.catalog_column.c.table_id,
+            s.column_attribute.c.source_column == s.catalog_column.c.name,
+        )
+        .correlate(None)
+    )
+
+
 def fetch_column_exploration_details(
     column_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, Any]:
     """Everything one hop off a visible Column.
 
@@ -596,6 +668,8 @@ def fetch_column_exploration_details(
     """
     resolved = resolve_accessible_catalog_ids(zone_ids)
     table_filter = None if resolved is None else list(resolved["table_ids"])
+    if connection_id is not None:
+        table_filter = _detail_source_tables(table_filter, connection_id)
 
     # Aliased, and not correlated with whatever `catalog_column` the query
     # around it is already using for the *other* end of the edge -- the plain
@@ -614,6 +688,20 @@ def fetch_column_exploration_details(
     )
 
     link = _attribute_link()
+    attribute_scope = literal(True)
+    if connection_id is not None:
+        attribute_scope = and_(
+            s.column_attribute.c.id.in_(_detail_owned_attributes(connection_id)),
+            (link.c.rel_type != REL_HAS_ATTRIBUTE)
+            | select(literal(1))
+            .select_from(owner)
+            .where(
+                owner.c.id == column_id,
+                owner.c.table_id == s.column_attribute.c.table_id,
+                owner.c.name == s.column_attribute.c.source_column,
+            )
+            .exists(),
+        )
     attr_rows = store().query_read(
         select(
             s.column_attribute.c.id,
@@ -630,7 +718,7 @@ def fetch_column_exploration_details(
                 ),
             )
         )
-        .where(link.c.column_id == column_id, owned)
+        .where(link.c.column_id == column_id, owned, attribute_scope)
         .limit(1)
     )
 
@@ -680,6 +768,9 @@ def fetch_column_exploration_details(
             s.sql_query__column.c.column_id == column_id,
             owned,
             _sql_in_scope(table_filter),
+            literal(True)
+            if connection_id is None
+            else query_source_scope(connection_id),
         )
         .distinct()
         .order_by(s.sql_query.c.id)
@@ -699,6 +790,7 @@ def fetch_column_attribute_exploration_details(
     *,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> dict[str, Any]:
     """The Term owning a ColumnAttribute, and one page of every Column carrying it.
 
@@ -712,6 +804,12 @@ def fetch_column_attribute_exploration_details(
     falls outside *zone_ids*.
     """
     resolved = resolve_accessible_catalog_ids(zone_ids)
+    if connection_id is not None and not store().query_read(
+        _detail_owned_attributes(connection_id).where(
+            s.column_attribute.c.id == attr_id
+        )
+    ):
+        return {"term": None, "columns": [], "columns_total": 0}
     term_rows = store().query_read(
         select(s.term.c.id, s.term.c.name, s.term.c.description)
         .select_from(
@@ -732,6 +830,23 @@ def fetch_column_attribute_exploration_details(
     conditions: list[Any] = [link.c.attribute_id == attr_id]
     if resolved is not None:
         conditions.append(s.catalog_column.c.table_id.in_(list(resolved["table_ids"])))
+    if connection_id is not None:
+        conditions.extend(
+            [
+                s.catalog_column.c.table_id.in_(
+                    _detail_source_tables(None, connection_id)
+                ),
+                (link.c.rel_type != REL_HAS_ATTRIBUTE)
+                | select(literal(1))
+                .select_from(s.column_attribute)
+                .where(
+                    s.column_attribute.c.id == attr_id,
+                    s.column_attribute.c.table_id == s.catalog_column.c.table_id,
+                    s.column_attribute.c.source_column == s.catalog_column.c.name,
+                )
+                .exists(),
+            ]
+        )
 
     linked_columns = _column_catalog_join().join(
         link, link.c.column_id == s.catalog_column.c.id
@@ -776,6 +891,8 @@ def fetch_column_attribute_exploration_details(
 def fetch_sql_attribute_exploration_details(
     attr_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, Any]:
     """The statement and owning Term behind a SqlAttribute.
 
@@ -787,6 +904,15 @@ def fetch_sql_attribute_exploration_details(
     """
     resolved = resolve_accessible_catalog_ids(zone_ids)
     table_filter = None if resolved is None else list(resolved["table_ids"])
+    if connection_id is not None and not store().query_read(
+        select(s.sql_attribute.c.id).where(
+            s.sql_attribute.c.id == attr_id,
+            definition_source_scope(
+                s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+            ),
+        )
+    ):
+        return {"sql": None, "term": None}
 
     sql_rows = store().query_read(
         select(s.sql_query.c.id, s.sql_query.c.sql_full_query.label("sql"))
@@ -798,6 +924,9 @@ def fetch_sql_attribute_exploration_details(
         .where(
             s.sql_attribute__sql.c.attribute_id == attr_id,
             _sql_in_scope(table_filter),
+            literal(True)
+            if connection_id is None
+            else query_source_scope(connection_id),
         )
         .order_by(s.sql_query.c.id)
         .limit(1)
@@ -1263,21 +1392,25 @@ def fetch_semantic_exploration_graph(
     """
     resolved = resolve_accessible_catalog_ids(zone_ids)
 
-    terms = fetch_all_terms(zone_ids=zone_ids, data_ids_by_zone=resolved)
+    terms = fetch_all_terms(
+        zone_ids=zone_ids, data_ids_by_zone=resolved, connection_id=database_id
+    )
     column_counts = {
         row["term_id"]: row["count"]
         for row in fetch_column_attribute_counts(
-            zone_ids=zone_ids, data_ids_by_zone=resolved
+            zone_ids=zone_ids, data_ids_by_zone=resolved, connection_id=database_id
         )
     }
     sql_counts = {
         row["term_id"]: row["count"]
         for row in fetch_sql_attribute_counts(
-            zone_ids=zone_ids, data_ids_by_zone=resolved
+            zone_ids=zone_ids, data_ids_by_zone=resolved, connection_id=database_id
         )
     }
 
-    pairs = fetch_term_table_pairs(zone_ids, data_ids_by_zone=resolved)
+    pairs = fetch_term_table_pairs(
+        zone_ids, data_ids_by_zone=resolved, connection_id=database_id
+    )
     term_tables, table_terms = build_term_table_maps(pairs)
     # Which link type connected each (term, table) pair, kept per pair rather
     # than folded into the maps above, so a term-to-term edge can report *why*

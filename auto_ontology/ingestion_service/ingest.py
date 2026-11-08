@@ -22,10 +22,11 @@ from auto_ontology.catalog import ingest_catalog
 from auto_ontology.vdb import get_data_vdb
 from auto_ontology.vdb.records import to_vdb_records
 from auto_ontology.connectors.registry import (
-    get_connectors,
+    get_connector,
     invalidate_connectors_cache,
 )
-from auto_ontology.dal.reset import delete_all_data, delete_semantic_layer
+from auto_ontology.dal import reset as reset_dal
+from auto_ontology.dal.reset import delete_semantic_layer
 from auto_ontology.infra.feature_flags import is_pii_detection_enabled
 from auto_ontology.ingestion_service.rules import replay_rules
 from auto_ontology.ingestion_service.pii import run_pii_propagation
@@ -65,7 +66,7 @@ def _row_count(frame: Any) -> int:
         return 0
 
 
-def _run_pii_detection(columns_df: Any, database_name: str) -> None:
+def _run_pii_detection(columns_df: Any, database_name: str, connection_id: str) -> None:
     """Enrich persisted columns without making catalog ingestion depend on it."""
 
     try:
@@ -76,7 +77,7 @@ def _run_pii_detection(columns_df: Any, database_name: str) -> None:
             "continue. Unprocessed columns will be retried on the next ingest",
             database_name,
         )
-    run_pii_propagation(database_name)
+    run_pii_propagation(database_name, connection_id=connection_id)
 
 
 def run_ingest(connector: SQLDatabase) -> None:
@@ -84,7 +85,9 @@ def run_ingest(connector: SQLDatabase) -> None:
 
     The connector's lifecycle is owned by the caller — ``run_ingest`` does not
     close it, since scheduled runs reuse cached connectors from
-    :func:`auto_ontology.connectors.registry.get_connectors`.
+    :func:`auto_ontology.connectors.registry.get_connector`. Its trusted,
+    nonblank ``connection_id`` scopes catalog rows and vector replacement;
+    ``database_name`` remains the physical SQL name, never a routing key.
 
     Three straight-line steps: the catalog write
     (:func:`auto_ontology.catalog.ingest_catalog`), the embedding rows
@@ -100,6 +103,10 @@ def run_ingest(connector: SQLDatabase) -> None:
     if connector is None:
         raise ValueError("Connector is not set")
 
+    connection_id = getattr(connector, "connection_id", None)
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("Connector must have a nonblank trusted connection_id")
+
     database_name = connector.database_name
     embed_params = get_embed_params()
 
@@ -110,16 +117,16 @@ def run_ingest(connector: SQLDatabase) -> None:
         tables_df, columns_df = ingest_catalog(connector)
 
     if is_pii_detection_enabled():
-        _run_pii_detection(columns_df, database_name)
+        _run_pii_detection(columns_df, database_name, connection_id)
     else:
         logger.info(
             "PII detection skipped for database %s (disabled in settings)",
             database_name,
         )
 
-    embed_rows = CatalogEmbeddingRowsOp(database_name=database_name)(
-        (tables_df, columns_df)
-    )
+    embed_rows = CatalogEmbeddingRowsOp(
+        database_name=database_name, connection_id=connection_id
+    )((tables_df, columns_df))
 
     data_vdb = None
     rows_written = 0
@@ -135,7 +142,9 @@ def run_ingest(connector: SQLDatabase) -> None:
             # spend minutes embedding, so a failed embed — a bad key, a dead
             # endpoint — would leave retrieval with nothing instead of with the
             # previous run's rows.
-            data_vdb = get_data_vdb(database_name=database_name, reset=True)
+            data_vdb = get_data_vdb(
+                connection_id=connection_id, database_name=database_name, reset=True
+            )
         rows_written += data_vdb.run(records)
 
     if rows_written:
@@ -164,9 +173,8 @@ def run_ingest(connector: SQLDatabase) -> None:
     )
 
 
-def trigger_ingest(connection: dict[str, Any]) -> None:
-    """Run ingest for a newly created connection without blocking the caller."""
-    database_name = str(connection.get("database") or "")
+def trigger_ingest(connection_id: str) -> None:
+    """Ingest only the selected active source on a background thread."""
 
     def _run() -> None:
         try:
@@ -174,21 +182,7 @@ def trigger_ingest(connection: dict[str, Any]) -> None:
             # pick it up, then ingest via the same connectors the scheduler uses
             # (schema filter included).
             invalidate_connectors_cache()
-            key = database_name.strip().casefold()
-            connector = next(
-                (
-                    c
-                    for c in get_connectors()
-                    if str(getattr(c, "database_name", "")).casefold() == key
-                ),
-                None,
-            )
-            if connector is None:
-                logger.error(
-                    "Ingest skipped: no loaded connector for database %s",
-                    database_name,
-                )
-                return
+            connector = get_connector(connection_id)
             run_ingest(connector)
             # Unconditional, unlike the ingest pass's own replay: neither
             # scheduler covers this path. It is a bare thread, and creating a
@@ -201,38 +195,42 @@ def trigger_ingest(connection: dict[str, Any]) -> None:
             replay_rules("ingest")
         except Exception:
             logger.exception(
-                "Background ingest failed for database %s",
-                database_name,
+                "Background ingest failed for connection %s",
+                connection_id,
             )
 
     threading.Thread(
         target=_run,
         daemon=True,
-        name=f"ingest-{database_name}",
+        name=f"ingest-{connection_id}",
     ).start()
 
 
-def trigger_delete_ingest(database_name: str | None = None) -> None:
-    """Delete a database's ingested graph and embeddings without blocking."""
+def trigger_delete_ingest(connection_id: str) -> None:
+    """Queue final cleanup of a retired source by its captured, immutable ID.
+
+    No active-source or credential lookup: even a missing root may have vectors
+    left by a partial failure. Acceptance is not confirmation of cleanup.
+    """
 
     def _run() -> None:
         try:
-            delete_all_data(database_name)
+            reset_dal.remove_connection_data(connection_id)
         except Exception:
-            logger.exception(
-                "Background delete-ingest failed for database %s",
-                database_name,
+            logger.error(
+                "Background delete-ingest failed for connection %s",
+                connection_id,
             )
 
     threading.Thread(
         target=_run,
         daemon=True,
-        name=f"delete-ingest-{database_name}",
+        name=f"delete-ingest-{connection_id}",
     ).start()
 
 
-# How long to wait for an in-flight compilation pass to stop before resetting
-# anyway. A pass is cut short at a database boundary and the database in flight
+# How long to wait before cancelling a reset whose compilation did not drain.
+# A pass is cut short at a database boundary and the database in flight
 # cannot be interrupted, so this has to exceed the slowest single-database
 # compile; resetting underneath one would reintroduce the race this ordering
 # exists to remove.
@@ -264,7 +262,7 @@ async def _wait_until_idle(scheduler: Any) -> bool:
 
 
 async def reset_semantic_layer_and_recompile(
-    scheduler: Any, database_name: str | None = None
+    scheduler: Any, connection_id: str | None = None
 ) -> None:
     """Delete a semantic layer and rebuild it — strictly in that order.
 
@@ -286,15 +284,16 @@ async def reset_semantic_layer_and_recompile(
     the endpoint's non-blocking contract — the wait can be minutes, since the
     database in flight cannot be interrupted.
 
-    Passing ``None`` resets the semantic layer of every database.
+    The opaque ``connection_id`` is passed unchanged to the DAL. Passing ``None``
+    explicitly resets every source, preserving global PQL vocabulary.
     """
-    label = database_name or "<all>"
+    label = connection_id if connection_id is not None else "<all>"
     async with _reset_lock:
-        await _reset_semantic_layer_and_recompile(scheduler, database_name, label)
+        await _reset_semantic_layer_and_recompile(scheduler, connection_id, label)
 
 
 async def _reset_semantic_layer_and_recompile(
-    scheduler: Any, database_name: str | None, label: str
+    scheduler: Any, connection_id: str | None, label: str
 ) -> None:
     """Body of :func:`reset_semantic_layer_and_recompile`, one caller at a time."""
     # Paused for the whole stop-and-delete window, not just aborted. abort()
@@ -309,16 +308,17 @@ async def _reset_semantic_layer_and_recompile(
         if not await _wait_until_idle(scheduler):
             logger.warning(
                 "reset-semantic %s: a compilation pass was still running after "
-                "%ds; resetting anyway",
+                "%ds; reset cancelled without deletion or rebuild",
                 label,
                 _ABORT_DRAIN_TIMEOUT_S,
             )
-        await asyncio.to_thread(delete_semantic_layer, database_name)
+            return
+        await asyncio.to_thread(delete_semantic_layer, connection_id)
     except Exception:
         # Deliberately no rebuild on failure: a pass started now would compile
         # against a half-deleted layer and the result would be neither the old
         # one nor a clean one.
-        logger.exception("Background reset-semantic failed for database %s", label)
+        logger.error("Background reset-semantic failed for connection %s", label)
         return
     finally:
         # Always, including the failure path — a paused scheduler that is never
@@ -329,14 +329,14 @@ async def _reset_semantic_layer_and_recompile(
         scheduler.trigger()
 
 
-def trigger_reset_semantic(scheduler: Any, database_name: str | None = None) -> None:
+def trigger_reset_semantic(scheduler: Any, connection_id: str | None = None) -> None:
     """Schedule :func:`reset_semantic_layer_and_recompile` without blocking.
 
     Must be called from the event loop thread — ``scheduler.start()`` and
     ``trigger()`` touch asyncio primitives owned by that loop.
     """
     task = asyncio.create_task(
-        reset_semantic_layer_and_recompile(scheduler, database_name)
+        reset_semantic_layer_and_recompile(scheduler, connection_id)
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)

@@ -27,11 +27,11 @@ _COLS = ["text", "path", "page_number", "metadata"]
 
 
 def _op(database_name: str = "db") -> CatalogEmbeddingRowsOp:
-    return CatalogEmbeddingRowsOp(database_name=database_name)
+    return CatalogEmbeddingRowsOp(database_name=database_name, connection_id="source")
 
 
 def _tables(*rows: dict) -> pd.DataFrame:
-    return pd.DataFrame(list(rows))
+    return pd.DataFrame(list(rows)).assign(connection_id="source")
 
 
 # ── Text templates ───────────────────────────────────────────────────────────
@@ -111,6 +111,7 @@ def test_row_uses_the_auto_ontology_path_prefix() -> None:
     row = build_embed_row(
         text="  t  ",
         node_id="abc",
+        connection_id="source",
         label=Labels.TABLE,
         name="n",
         schema_name="s",
@@ -127,6 +128,7 @@ def test_row_falls_back_when_node_id_is_missing() -> None:
         row = build_embed_row(
             text="t",
             node_id=missing,
+            connection_id="source",
             label=Labels.COLUMN,
             name="n",
             schema_name="s",
@@ -140,6 +142,7 @@ def test_identifiers_are_duplicated_into_content_metadata() -> None:
     row = build_embed_row(
         text="t",
         node_id="i",
+        connection_id="source",
         label=Labels.TABLE,
         name="n",
         schema_name="s",
@@ -147,7 +150,15 @@ def test_identifiers_are_duplicated_into_content_metadata() -> None:
     )
     meta = row["metadata"]
     nested = meta["content_metadata"]
-    for key in ("id", "label", "name", "source_path", "schema_name", "database_name"):
+    for key in (
+        "id",
+        "label",
+        "name",
+        "source_path",
+        "schema_name",
+        "database_name",
+        "connection_id",
+    ):
         assert meta[key] == nested[key]
     assert nested is not meta, "content_metadata must be a copy, not an alias"
 
@@ -168,6 +179,7 @@ def test_process_emits_one_table_row_and_one_row_per_column() -> None:
         [
             {
                 "id": "c1",
+                "connection_id": "source",
                 "table_name": "orders",
                 "table_schema": "public",
                 "column_name": "id",
@@ -177,6 +189,7 @@ def test_process_emits_one_table_row_and_one_row_per_column() -> None:
             },
             {
                 "id": "c2",
+                "connection_id": "source",
                 "table_name": "orders",
                 "table_schema": "public",
                 "column_name": "total",
@@ -212,6 +225,7 @@ def test_same_table_name_in_two_schemas_does_not_merge_columns() -> None:
         [
             {
                 "id": "c1",
+                "connection_id": "source",
                 "table_name": "users",
                 "table_schema": "public",
                 "column_name": "email",
@@ -221,6 +235,7 @@ def test_same_table_name_in_two_schemas_does_not_merge_columns() -> None:
             },
             {
                 "id": "c2",
+                "connection_id": "source",
                 "table_name": "users",
                 "table_schema": "other",
                 "column_name": "ssn",
@@ -253,6 +268,7 @@ def test_bucketing_is_case_insensitive() -> None:
         [
             {
                 "id": "c1",
+                "connection_id": "source",
                 "table_name": "orders",
                 "table_schema": "public",
                 "column_name": "id",
@@ -274,6 +290,7 @@ def test_sample_values_are_capped_at_five() -> None:
         [
             {
                 "id": "c1",
+                "connection_id": "source",
                 "table_name": "t",
                 "table_schema": "s",
                 "column_name": "c",
@@ -303,6 +320,7 @@ def test_nan_descriptions_do_not_leak_the_string_nan() -> None:
         [
             {
                 "id": "c1",
+                "connection_id": "source",
                 "table_name": "t",
                 "table_schema": "s",
                 "column_name": "c",

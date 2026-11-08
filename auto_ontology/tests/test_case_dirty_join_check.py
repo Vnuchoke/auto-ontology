@@ -37,17 +37,33 @@ _VERIFIED_HOP = [
 ]
 
 
-def _column_id(table_name, column_name, database_name=None):
+def _column_id(
+    table_name: str,
+    column_name: str,
+    database_name: str | None = None,
+    *,
+    connection_id: str | None = None,
+) -> str:
     return f"{table_name}.{column_name}"
 
 
-def _join_path_only_addr1_verified(col_a_id, col_b_id):
+def _join_path_only_addr1_verified(
+    col_a_id: str,
+    col_b_id: str,
+    *,
+    connection_id: str | None = None,
+) -> list[dict[str, str]]:
     if {col_a_id, col_b_id} == {"worksite.w_addr1", "case_worksite.ws_addr1"}:
         return _VERIFIED_HOP
     return []
 
 
-def _join_path_nothing_verified(col_a_id, col_b_id):
+def _join_path_nothing_verified(
+    col_a_id: str,
+    col_b_id: str,
+    *,
+    connection_id: str | None = None,
+) -> list[dict[str, str]]:
     return []
 
 

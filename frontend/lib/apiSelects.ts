@@ -19,6 +19,7 @@
 export const conversationSelect = {
 	id: true,
 	user_id: true,
+	connection_id: true,
 	title: true,
 	created_at: true,
 	updated_at: true,

@@ -5,6 +5,8 @@
 """Tests for the prewarmed chat worker's request loop."""
 
 from typing import Any
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from pytest import MonkeyPatch
 
@@ -30,15 +32,11 @@ class _FakeQueue:
 
 def _run_loop(
     monkeypatch: MonkeyPatch,
-    connector_batches: list[list[str]],
+    selected_connectors: list[str],
     *,
     evidence: str | None = None,
 ) -> dict:
-    """Drive one ASK through ``_worker_loop`` and return the agent payload it built.
-
-    ``connector_batches`` is what successive ``get_connectors()`` calls return, so a
-    worker that booted before the store was reachable can be simulated with ``[[], [...]]``.
-    """
+    """Drive one ASK; opening the unselected/unavailable neighbor is forbidden."""
     # Importing the agent module builds LLM clients at import time and lets an
     # EnvironmentError escape when no key is configured. Stub the factories before that
     # import is triggered below; the clients are never used, since stream_agent_response
@@ -52,10 +50,19 @@ def _run_loop(
         lambda *a, **k: None,
     )
 
-    remaining = list(connector_batches)
+    import sys
 
-    def fake_get_connectors() -> list[str]:
-        return remaining.pop(0) if remaining else []
+    gate = Mock(return_value=SimpleNamespace(connection_id="a"))
+    monkeypatch.setitem(
+        sys.modules,
+        "auto_ontology.retrieval.source_context",
+        SimpleNamespace(resolve_query_source=gate),
+    )
+
+    def fake_get_connectors(token: str | None, *, connection_id: str) -> list[str]:
+        assert gate.called
+        assert connection_id == "a"
+        return selected_connectors
 
     captured: dict = {}
 
@@ -63,7 +70,14 @@ def _run_loop(
         captured.update(payload)
         return iter(())
 
-    monkeypatch.setattr("auto_ontology.connectors.get_connectors", fake_get_connectors)
+    monkeypatch.setattr(
+        "auto_ontology.connectors.get_connectors",
+        Mock(side_effect=AssertionError("must not open all sources")),
+    )
+    monkeypatch.setattr(
+        "auto_ontology.connectors.registry.get_connectors_for_subject_token",
+        fake_get_connectors,
+    )
     monkeypatch.setattr(
         "auto_ontology.utils.get_data_objects_retriever", lambda: "data"
     )
@@ -80,32 +94,28 @@ def _run_loop(
         "auto_ontology.retrieval.text_to_sql.main.stream_agent_response", fake_stream
     )
 
-    in_q = _FakeQueue([(worker_module._MSG_ASK, ("q", None, None, None, [], evidence))])
+    in_q = _FakeQueue(
+        [(worker_module._MSG_ASK, ("q", None, None, None, [], evidence, "a"))]
+    )
     worker_module._worker_loop(in_q, _FakeQueue())
     return captured
 
 
-def test_worker_reresolves_connectors_before_building_the_payload(
+def test_worker_resolves_selected_connector_before_building_the_payload(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """A worker that booted with no connections must heal on the next question.
+    payload = _run_loop(monkeypatch, selected_connectors=["selected-connector"])
 
-    Regression: the payload was built from a reference captured *before* the lazy
-    re-resolve, so rebinding the local did not reach it and every question kept
-    failing with "missing required 'connectors'" until the pod restarted.
-    """
-    payload = _run_loop(monkeypatch, connector_batches=[[], ["healed-connector"]])
-
-    assert payload["connectors"] == ["healed-connector"]
+    assert payload["connectors"] == ["selected-connector"]
+    assert payload["connection_id"] == "a"
 
 
-def test_worker_reuses_the_boot_connectors_when_they_are_present(
+def test_worker_builds_selected_source_payload(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """The healthy path must not re-resolve — that would query the store per question."""
-    payload = _run_loop(monkeypatch, connector_batches=[["boot-connector"]])
+    payload = _run_loop(monkeypatch, selected_connectors=["selected-connector"])
 
-    assert payload["connectors"] == ["boot-connector"]
+    assert payload["connectors"] == ["selected-connector"]
     assert payload["question"] == "q"
     assert payload["evidence"] == ""
 
@@ -115,10 +125,69 @@ def test_worker_forwards_evidence_without_changing_question(
 ) -> None:
     payload = _run_loop(
         monkeypatch,
-        connector_batches=[["boot-connector"]],
+        selected_connectors=["selected-connector"],
         evidence="status means accounts.status",
     )
 
     assert payload["question"] == "q"
     assert payload["processing_question"] == "q"
     assert payload["evidence"] == "status means accounts.status"
+
+
+def test_worker_startup_does_not_open_sources_or_vectors(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    import sys
+
+    gate = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "auto_ontology.retrieval.source_context",
+        SimpleNamespace(resolve_query_source=gate),
+    )
+    connectors = Mock(side_effect=AssertionError("unexpected connector"))
+    vectors = Mock(side_effect=AssertionError("unexpected VDB"))
+    monkeypatch.setattr("auto_ontology.connectors.get_connectors", connectors)
+    monkeypatch.setattr(
+        "auto_ontology.connectors.registry.get_connectors_for_subject_token", connectors
+    )
+    monkeypatch.setattr("auto_ontology.utils.get_data_objects_retriever", vectors)
+    monkeypatch.setattr("auto_ontology.utils.get_semantic_objects_retriever", vectors)
+    output = _FakeQueue()
+    worker_module._worker_loop(_FakeQueue(), output)
+    assert output.puts == [(worker_module._TAG_READY, None)]
+    connectors.assert_not_called()
+    vectors.assert_not_called()
+    gate.assert_not_called()
+
+
+def test_source_rejection_precedes_followup_connectors_and_vectors(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    import sys
+    from auto_ontology.connectors.sources import SourceSelectionError
+
+    gate = Mock(side_effect=SourceSelectionError(422, "source_required"))
+    monkeypatch.setitem(
+        sys.modules,
+        "auto_ontology.retrieval.source_context",
+        SimpleNamespace(resolve_query_source=gate),
+    )
+    effects = Mock(side_effect=AssertionError("must reject before model/driver/VDB"))
+    monkeypatch.setattr(
+        "auto_ontology.retrieval.text_to_sql.follow_up.resolve_follow_up", effects
+    )
+    monkeypatch.setattr(
+        "auto_ontology.connectors.registry.get_connectors_for_subject_token", effects
+    )
+    monkeypatch.setattr("auto_ontology.utils.get_data_objects_retriever", effects)
+    monkeypatch.setattr("auto_ontology.utils.get_semantic_objects_retriever", effects)
+    output = _FakeQueue()
+    worker_module._worker_loop(
+        _FakeQueue(
+            [(worker_module._MSG_ASK, ("q", None, None, "token", [], None, None))]
+        ),
+        output,
+    )
+    assert (worker_module._TAG_ERROR, "source_required") in output.puts
+    effects.assert_not_called()

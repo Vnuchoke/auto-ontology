@@ -17,15 +17,62 @@ indistinguishable in the store.
 
 from __future__ import annotations
 
+import json
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Iterable
+from uuid import NAMESPACE_URL, uuid5
 
 if TYPE_CHECKING:
     import pandas as pd
 
     from auto_ontology.vdb.postgres import PostgresVDB
 
-__all__ = ["to_vdb_records", "write_embedded_rows"]
+__all__ = [
+    "projection_id",
+    "global_pql_projection_id",
+    "to_vdb_records",
+    "write_embedded_rows",
+]
+
+
+def projection_id(collection_name: str, connection_id: str, node_id: str) -> str:
+    """Stable vector identity; JSON preserves tuple boundaries without ambiguity."""
+    if any(
+        not isinstance(v, str) or not v.strip()
+        for v in (collection_name, connection_id, node_id)
+    ):
+        raise ValueError(
+            "source_required: collection, connection_id and node id are required"
+        )
+    return str(
+        uuid5(
+            NAMESPACE_URL,
+            json.dumps(
+                [collection_name, connection_id, node_id],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    )
+
+
+def global_pql_projection_id(collection_name: str, node_id: str) -> str:
+    """Canonical global PQL identity shared by runtime and explicit migration."""
+    return projection_id(collection_name, "global:PqlAnalysis", node_id)
+
+
+def validate_global_pql_metadata(metadata: dict[str, Any]) -> None:
+    """Only explicitly global, correctly identified PQL rows bypass source identity."""
+    if (
+        metadata.get("label") != "PqlAnalysis"
+        or metadata.get("connection_id") is not None
+        or (metadata.get("content_metadata") or {}).get("connection_id") is not None
+        or not isinstance(metadata.get("id"), str)
+        or not metadata["id"].strip()
+    ):
+        raise ValueError(
+            "invalid_global_pql: PqlAnalysis requires node id and no connection_id"
+        )
 
 
 def _text(row: dict[str, Any], metadata: dict[str, Any]) -> str:
@@ -46,7 +93,7 @@ def _page_number(row: dict[str, Any], content_metadata: dict[str, Any]) -> int |
     return max(pages) if pages else None
 
 
-def _record(row: dict[str, Any]) -> dict[str, Any] | None:
+def _record(row: dict[str, Any], *, global_pql: bool = False) -> dict[str, Any] | None:
     metadata = dict(row.get("metadata") or {})
     # An empty list is what a failed request leaves behind, so it is as absent
     # as a missing key: writing it would store a row no search can reach.
@@ -56,7 +103,14 @@ def _record(row: dict[str, Any]) -> dict[str, Any] | None:
     if not text:
         return None
 
+    if global_pql:
+        validate_global_pql_metadata(metadata)
+    for key in ("id",) if global_pql else ("id", "connection_id"):
+        if not isinstance(metadata.get(key), str) or not metadata[key].strip():
+            raise ValueError(f"source_required: embedded row requires {key}")
+
     content_metadata = dict(metadata.get("content_metadata") or {})
+    content_metadata["connection_id"] = metadata.get("connection_id")
     page = _page_number(row, content_metadata)
     if page is not None:
         content_metadata["page_number"] = page
@@ -85,6 +139,8 @@ def _record(row: dict[str, Any]) -> dict[str, Any] | None:
 
 def to_vdb_records(
     rows: "Iterable[dict[str, Any]] | pd.DataFrame",
+    *,
+    global_pql: bool = False,
 ) -> list[list[dict[str, Any]]]:
     """Records for the *rows* that carry an embedding and some text.
 
@@ -96,7 +152,8 @@ def to_vdb_records(
     records = [
         record
         for row in rows or []
-        if isinstance(row, dict) and (record := _record(row)) is not None
+        if isinstance(row, dict)
+        and (record := _record(row, global_pql=global_pql)) is not None
     ]
     return [records] if records else []
 
@@ -105,5 +162,5 @@ def write_embedded_rows(
     vdb: "PostgresVDB", rows: "Iterable[dict[str, Any]] | pd.DataFrame"
 ) -> int:
     """Write the embedded *rows* to *vdb*; returns the number of rows written."""
-    records = to_vdb_records(rows)
+    records = to_vdb_records(rows, global_pql=getattr(vdb, "global_pql", False))
     return vdb.run(records) if records else 0

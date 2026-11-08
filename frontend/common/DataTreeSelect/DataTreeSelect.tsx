@@ -273,13 +273,18 @@ export const DataTreeSelect = ({
 	};
 
 	const getCompactDatabaseLabel = (db: Database): string => {
-		const shouldCompactSchema = db.num_of_schemas === 1 && db.schemas.length === 1;
-		if (!shouldCompactSchema) return db.name;
+		const label =
+			db.display_label && db.display_label !== db.name
+				? `${db.display_label} (${db.name})`
+				: db.name;
+		const shouldCompactSchema =
+			showTableRows && db.num_of_schemas === 1 && db.schemas.length === 1;
+		if (!shouldCompactSchema) return label;
 		const [schema] = db.schemas;
 		if (schema.tables_count === 1 && schema.tables.length === 1) {
-			return `${db.name}/${schema.schema_name}/${schema.tables[0].name}`;
+			return `${label}/${schema.schema_name}/${schema.tables[0].name}`;
 		}
-		return `${db.name}/${schema.schema_name}`;
+		return `${label}/${schema.schema_name}`;
 	};
 
 	const hasCompactDatabaseChildren = (db: Database): boolean => {
@@ -414,7 +419,7 @@ export const DataTreeSelect = ({
 							{row({
 								depth: 0,
 								id: db.id,
-								label: isCompactDb ? getCompactDatabaseLabel(db) : db.name,
+								label: getCompactDatabaseLabel(db),
 								// A folded row names a path but is still the
 								// database's row, and the database is the part
 								// of that path the icon can speak for.

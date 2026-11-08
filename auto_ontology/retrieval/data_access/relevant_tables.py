@@ -102,6 +102,8 @@ def _normalize_table_to_relevant_shape(table: dict) -> dict:
         **parsed,
     }
     database_name = table.get("database_name")
+    if table.get("connection_id") is not None:
+        entry["connection_id"] = table["connection_id"]
     if database_name and not entry.get("database_name"):
         entry["database_name"] = str(database_name).strip()
     if table.get("schema_name") and not entry.get("schema_name"):
@@ -214,6 +216,8 @@ def dedupe_merge_relevant_tables(tables: list[dict]) -> list[dict]:
 
 def get_relevant_tables_from_candidates(
     candidates: list[dict],
+    *,
+    connection_id: str | None = None,
 ) -> list[dict]:
     """Extract relevant tables from flat candidate dicts.
 
@@ -249,6 +253,22 @@ def get_relevant_tables_from_candidates(
     if not table_by_id:
         return []
 
+    if connection_id is not None:
+        from auto_ontology.dal.datasources import fetch_tables_by_ids
+
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            return []
+        tables = fetch_tables_by_ids(list(table_by_id), connection_id=connection_id)
+        owned = {
+            str(table["id"]): table
+            for table in tables
+            if table.get("connection_id") == connection_id
+        }
+        return [
+            _normalize_table_to_relevant_shape(owned[tid])
+            for tid in table_by_id
+            if tid in owned
+        ]
     return [_normalize_table_to_relevant_shape(table_by_id[tid]) for tid in table_by_id]
 
 
@@ -258,6 +278,8 @@ def get_relevant_tables(
     k: int = 1,
     database_name: str | None = None,
     schema_name: str | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict]:
     """Semantic search over the same vector index as candidate retrieval, label ``table`` only."""
     try:
@@ -268,6 +290,7 @@ def get_relevant_tables(
             per_label_k=k,
             database_name=database_name,
             schema_name=schema_name,
+            connection_id=connection_id,
         )
     except Exception:
         logger.exception("get_relevant_tables: vector search failed")
@@ -292,6 +315,7 @@ def get_relevant_tables(
                 "pk": row.get("pk"),
                 "database_name": row.get("database_name"),
                 "schema_name": row.get("schema_name"),
+                "connection_id": row.get("connection_id"),
             }
         )
         relevant_tables_list.append(entry)

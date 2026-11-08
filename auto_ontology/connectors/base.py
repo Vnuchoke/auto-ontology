@@ -122,6 +122,8 @@ class SQLDatabase(ABC):
     #: statement, which during ingestion costs far more than the cap saves.
     supports_statement_timeout: bool = False
 
+    connection_id: str | None = None
+
     #: Optional regex allow/deny filter over relation names, set from the
     #: connection by :func:`auto_ontology.connectors.registry.create_connector`.
     #: Connectors do not read it themselves — it is enforced centrally in

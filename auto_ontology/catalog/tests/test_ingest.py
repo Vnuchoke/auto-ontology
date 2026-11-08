@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from auto_ontology.catalog.ingest import ingest_catalog
+from auto_ontology.catalog.write import populate_tabular_data
 
 
 def _schema(
@@ -83,7 +84,9 @@ def test_concatenates_every_schema_and_keeps_them_distinguishable() -> None:
             ),
         ),
     }
-    connector = SimpleNamespace(dialect="postgres", database_name="pagila")
+    connector = SimpleNamespace(
+        dialect="postgres", database_name="pagila", connection_id="source"
+    )
     with (
         patch(
             "auto_ontology.catalog.ingest.extract_tabular_db_data",
@@ -98,6 +101,8 @@ def test_concatenates_every_schema_and_keeps_them_distinguishable() -> None:
     assert write.call_args.kwargs == {"num_workers": 4, "dialect": "postgres"}
     assert list(tables_df["id"]) == ["t1", "t2"]
     assert list(columns_df["id"]) == ["c1", "c2"]
+    assert tables_df["connection_id"].tolist() == ["source", "source"]
+    assert columns_df["connection_id"].tolist() == ["source", "source"]
     assert sorted(tables_df["table_schema"]) == ["analytics", "public"]
 
 
@@ -110,7 +115,9 @@ def test_skips_schemas_that_produced_no_frames() -> None:
         ),
         "empty": _schema(None, None),
     }
-    connector = SimpleNamespace(dialect="postgres", database_name="pagila")
+    connector = SimpleNamespace(
+        dialect="postgres", database_name="pagila", connection_id="source"
+    )
     with (
         patch(
             "auto_ontology.catalog.ingest.extract_tabular_db_data",
@@ -124,3 +131,22 @@ def test_skips_schemas_that_produced_no_frames() -> None:
 
     assert list(tables_df["id"]) == ["t1"]
     assert columns_df.empty
+
+
+def test_nonempty_query_history_reaches_only_source_scoped_matching() -> None:
+    data = {
+        "database_name": "sales",
+        "connection_id": "11111111-1111-4111-8111-111111111111",
+        "tables": pd.DataFrame([{"table_name": "orders", "table_schema": "public"}]),
+        "columns": pd.DataFrame(),
+        "queries": pd.DataFrame([{"query_text": "SELECT * FROM public.orders"}]),
+    }
+    with (
+        patch("auto_ontology.catalog.write.populate_db", return_value={}) as write,
+        patch("auto_ontology.catalog.write.populate_queries") as match,
+    ):
+        populate_tabular_data(data, num_workers=1, dialect="postgres")
+    assert write.call_args.kwargs["connection_id"] == data["connection_id"]
+    match.assert_called_once()
+    assert match.call_args.kwargs == {"connection_id": data["connection_id"]}
+    assert match.call_args.args[1] is data["queries"]

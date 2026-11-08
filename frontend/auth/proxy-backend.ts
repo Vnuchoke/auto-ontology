@@ -37,13 +37,19 @@ export const PROXY_CACHE_CONTROL = 'private, no-store';
  * something (a tag's `created_by`, for instance). Opt-in rather than always
  * forwarded, so a route that has no use for an identity does not imply one.
  *
- * It comes from `withPermission`'s already-resolved user, and the header set is
+ * `source` optionally carries the caller channel for conversation routes.
+ * `subjectToken` is opt-in: only query routes pass the resolved caller SSO token.
+ * Identity comes from `withPermission`'s already-resolved user, and the header set is
  * rebuilt from scratch below — so a client cannot smuggle in an identity of its
  * own choosing by sending the header itself.
  */
 export async function proxyToBackend(
 	req: Request,
-	{ userId }: { userId?: string } = {},
+	{
+		userId,
+		source,
+		subjectToken,
+	}: { userId?: string; source?: string; subjectToken?: string | null } = {},
 ): Promise<Response> {
 	const incoming = new URL(req.url);
 	const target = `${PYTHON_API_URL}${incoming.pathname}${incoming.search}`;
@@ -52,6 +58,8 @@ export async function proxyToBackend(
 	const contentType = req.headers.get('content-type');
 	if (contentType) headers['Content-Type'] = contentType;
 	if (userId) Object.assign(headers, buildInternalIdentityHeaders(userId));
+	if (source) headers['x-auto-ontology-source'] = source;
+	if (subjectToken) headers.Authorization = `Bearer ${subjectToken}`;
 
 	const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
 	const body = hasBody ? await req.text() : undefined;

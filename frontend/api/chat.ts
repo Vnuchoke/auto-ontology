@@ -10,21 +10,69 @@ import type {
 	ResultEvent,
 	ChartsEvent,
 	ErrorEvent,
+	SourceDescriptor,
+	SourceEvent,
 } from '@/types/chat';
 
-const getResponseErrorMessage = async (res: Response): Promise<string> => {
-	const fallback = `Server responded with ${res.status}`;
+const getResponseError = async (res: Response): Promise<ErrorEvent> => {
+	const error: ErrorEvent = {
+		type: 'error',
+		message: `Server responded with ${res.status}`,
+		status: res.status,
+	};
 	const text = await res.text().catch(() => '');
-	if (!text) return fallback;
+	if (!text) return error;
 
 	try {
 		const { detail } = JSON.parse(text) as { detail?: unknown };
-		if (typeof detail === 'string' && detail.trim()) return detail;
+		if (typeof detail === 'string' && detail.trim()) error.message = detail;
+		if (
+			typeof detail === 'string' &&
+			[
+				'source_required',
+				'invalid_source_selector',
+				'ambiguous_source',
+				'source_not_found',
+				'source_unavailable',
+				'source_not_ready',
+				'source_conflict',
+				'legacy_conversation_read_only',
+			].includes(detail)
+		)
+			error.code = detail;
+		if (
+			detail &&
+			typeof detail === 'object' &&
+			'code' in detail &&
+			typeof detail.code === 'string' &&
+			detail.code.trim()
+		) {
+			error.code = detail.code;
+			error.message =
+				'The requested source is unavailable. Check the conversation source and try again.';
+		}
 	} catch {}
-	return text;
+	return error;
+};
+
+const readSource = (value: unknown): SourceDescriptor | null => {
+	if (!value || typeof value !== 'object') return null;
+	const { connection_id, display_label, database_name } = value as Partial<SourceDescriptor>;
+	if (
+		typeof connection_id !== 'string' ||
+		!connection_id.trim() ||
+		typeof display_label !== 'string' ||
+		!display_label.trim() ||
+		typeof database_name !== 'string' ||
+		!database_name.trim()
+	)
+		return null;
+	return { connection_id, display_label, database_name };
 };
 
 export type ChatEventCallbacks = {
+	expectedConnectionId?: string | null;
+	onSource?: (event: SourceEvent) => void;
 	onStep: (event: StepEvent) => void;
 	/** The SQL the agent is about to run (or has just rewritten). */
 	onSql?: (event: SqlEvent) => void;
@@ -65,6 +113,21 @@ const consumeSseStream = async (res: Response, callbacks: ChatEventCallbacks): P
 	const decoder = new TextDecoder();
 	let buffer = '';
 	let streamCompleted = false;
+	let connectionId = callbacks.expectedConnectionId ?? null;
+	const acceptSource = (value: unknown): SourceDescriptor | null => {
+		const source = readSource(value);
+		if (!source || (connectionId !== null && source.connection_id !== connectionId)) {
+			streamCompleted = true;
+			callbacks.onError({
+				type: 'error',
+				code: 'source_mismatch',
+				message: 'The response source could not be verified.',
+			});
+			return null;
+		}
+		connectionId = source.connection_id;
+		return source;
+	};
 
 	while (true) {
 		const { done, value } = await reader.read();
@@ -84,29 +147,43 @@ const consumeSseStream = async (res: Response, callbacks: ChatEventCallbacks): P
 				break;
 			}
 
+			let event: ChatStreamEvent;
 			try {
-				const event: ChatStreamEvent = JSON.parse(data);
-				switch (event.type) {
-					case 'step':
-						callbacks.onStep(event);
-						break;
-					case 'sql':
-						callbacks.onSql?.(event);
-						break;
-					case 'result':
-						callbacks.onResult(event);
-						break;
-					case 'charts':
-						callbacks.onCharts?.(event);
-						break;
-					case 'error':
-						streamCompleted = true;
-						callbacks.onError(event);
-						break;
-				}
+				event = JSON.parse(data);
 			} catch {
-				// skip malformed lines
+				// Keep tolerating malformed progress lines, not callback/validation errors.
+				continue;
 			}
+			if (!event || typeof event !== 'object') continue;
+			switch (event.type) {
+				case 'source': {
+					const source = acceptSource(event.source);
+					if (source) callbacks.onSource?.({ type: 'source', source });
+					break;
+				}
+				case 'step':
+					callbacks.onStep(event);
+					break;
+				case 'sql':
+					callbacks.onSql?.(event);
+					break;
+				case 'result':
+					if (event.answer && Object.hasOwn(event.answer, 'source')) {
+						const source = acceptSource(event.answer.source);
+						if (!source) break;
+						event = { ...event, answer: { ...event.answer, source } };
+					}
+					callbacks.onResult(event);
+					break;
+				case 'charts':
+					callbacks.onCharts?.(event);
+					break;
+				case 'error':
+					streamCompleted = true;
+					callbacks.onError(event);
+					break;
+			}
+			if (streamCompleted) break;
 		}
 		if (streamCompleted) break;
 	}
@@ -141,11 +218,33 @@ export const streamChat = (
 	const body = JSON.stringify({
 		question: payload.question,
 		conversation_id: payload.conversationId ?? undefined,
+		connection_id: payload.connection_id ?? undefined,
+		connection_label: payload.connection_label ?? undefined,
 		target_db: payload.target_db ?? undefined,
 	});
 
 	(async () => {
 		try {
+			const selectors = [
+				payload.connection_id,
+				payload.connection_label,
+				payload.target_db,
+			].filter((value) => value != null);
+			if (
+				selectors.length > 1 ||
+				selectors.some((value) => typeof value !== 'string' || !value.trim())
+			) {
+				// Defer so hook callers have installed their controller before callbacks fire.
+				await Promise.resolve();
+				if (!controller.signal.aborted)
+					callbacks.onError({
+						type: 'error',
+						code: 'invalid_source_selector',
+						status: 422,
+						message: 'Choose exactly one valid source selector.',
+					});
+				return;
+			}
 			const res = await fetch('/api/chat/completions', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json', 'x-auto-ontology-source': 'app' },
@@ -154,15 +253,15 @@ export const streamChat = (
 			});
 
 			if (!res.ok || !res.body) {
-				callbacks.onError({
-					type: 'error',
-					message: await getResponseErrorMessage(res),
-				});
+				callbacks.onError(await getResponseError(res));
 				return;
 			}
 
 			callbacks.onStart?.();
-			await consumeSseStream(res, callbacks);
+			await consumeSseStream(res, {
+				...callbacks,
+				expectedConnectionId: payload.connection_id ?? callbacks.expectedConnectionId,
+			});
 		} catch (err: unknown) {
 			if (err instanceof DOMException && err.name === 'AbortError') return;
 			callbacks.onError({
@@ -199,7 +298,9 @@ export const watchChat = (
 			);
 
 			if (!res.ok || !res.body) {
-				callbacks.onDone?.();
+				const error = await getResponseError(res);
+				if (error.code) callbacks.onError(error);
+				else callbacks.onDone?.();
 				return;
 			}
 

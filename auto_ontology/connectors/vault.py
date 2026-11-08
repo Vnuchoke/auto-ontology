@@ -4,9 +4,8 @@
 
 """HashiCorp Vault access for UI-managed database connection secrets.
 
-Connection credentials are stored in Vault keyed by catalog database name. This
-module is the single place that reads/writes those secrets; callers should treat
-a missing or unreachable Vault as "no secret" rather than an error.
+Callers supply an exact credential reference, never a physical-name fallback.
+Missing configuration or an unavailable selected secret fails closed.
 
 This module performs no import-time side effects (it does not load ``.env``);
 entrypoints are responsible for loading the environment before use.
@@ -17,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 import hvac
 
 logger = logging.getLogger(__name__)
@@ -59,15 +59,19 @@ def get_client() -> hvac.Client:
             mount_point=auth_mount,
         )
     except Exception:
-        logger.exception(
-            "Failed to authenticate to Vault at %s (auth_mount=%s)", addr, auth_mount
-        )
-        raise
-    logger.debug("Authenticated to Vault at %s (auth_mount=%s)", addr, auth_mount)
+        raise ValueError("source_unavailable: Vault authentication failed") from None
     return client
 
 
-def write_secret(database_name: str, secret: dict[str, str]) -> None:
+def _require_reference(reference: str) -> None:
+    if not isinstance(reference, str) or not reference.strip():
+        raise ValueError("invalid_credential_reference")
+    if not is_vault_configured():
+        raise ValueError("source_unavailable: Vault is not configured")
+
+
+def write_secret(database_name: str, secret: dict[str, Any]) -> None:
+    _require_reference(database_name)
     mount_point = os.environ.get("VAULT_KV_MOUNT", "auto-ontology")
     try:
         client = get_client()
@@ -77,20 +81,11 @@ def write_secret(database_name: str, secret: dict[str, str]) -> None:
             mount_point=mount_point,
         )
     except Exception:
-        logger.exception(
-            "Failed to write Vault secret for database %r (mount=%s)",
-            database_name,
-            mount_point,
-        )
-        raise
-    logger.info(
-        "Wrote Vault secret for database %r (mount=%s)", database_name, mount_point
-    )
+        raise ValueError("source_unavailable: Vault write failed") from None
 
 
-def read_secret(database_name: str) -> dict[str, str] | str:
-    if not is_vault_configured():
-        return ""
+def read_secret(database_name: str) -> dict[str, Any]:
+    _require_reference(database_name)
     mount_point = os.environ.get("VAULT_KV_MOUNT", "auto-ontology")
     try:
         client = get_client()
@@ -98,56 +93,21 @@ def read_secret(database_name: str) -> dict[str, str] | str:
             path=database_name,
             mount_point=mount_point,
         )
-        return json.loads(response["data"]["connection"])
+        payload = json.loads(response["data"]["connection"])
+        if not isinstance(payload, dict):
+            raise ValueError
+        return payload
     except Exception:
-        logger.warning(
-            "Could not read Vault secret for database %r (mount=%s); "
-            "treating as no secret",
-            database_name,
-            mount_point,
-            exc_info=True,
-        )
-        return ""
+        raise ValueError("source_unavailable: Vault read failed") from None
 
 
-def delete_secrets(database_name: str | None = None) -> None:
-    """Delete a single secret if database_name is given, otherwise delete all."""
-    if not is_vault_configured():
-        return
-
-    client = get_client()
+def delete_secrets(database_name: str) -> None:
+    """Delete exactly one reference; blank or omitted paths never mean delete all."""
+    _require_reference(database_name)
     mount_point = os.environ.get("VAULT_KV_MOUNT", "auto-ontology")
-
-    def delete(path: str) -> None:
-        try:
-            client.secrets.kv.v1.delete_secret(path=path, mount_point=mount_point)
-        except Exception:
-            logger.exception(
-                "Failed to delete Vault secret %r (mount=%s)", path, mount_point
-            )
-            raise
-        logger.info("Deleted Vault secret %r (mount=%s)", path, mount_point)
-
-    if database_name:
-        delete(database_name)
-        return
-
     try:
-        # Use GET with ?list=true instead of the LIST HTTP verb, which the
-        # Vault endpoint/proxy rejects ("Unsupported HTTP method").
-        response = client.adapter.get(
-            f"v1/{mount_point}",
-            params={"list": "true"},
+        get_client().secrets.kv.v1.delete_secret(
+            path=database_name, mount_point=mount_point
         )
-        keys = response["data"]["keys"]
-    except hvac.exceptions.InvalidPath:
-        # Nothing stored under this mount.
-        logger.info("No secrets found under mount %r.", mount_point)
-        return
     except Exception:
-        logger.exception("Failed to list Vault secrets under mount %r", mount_point)
-        raise
-
-    logger.info("Deleting %d Vault secret(s) under mount %r", len(keys), mount_point)
-    for key in keys:
-        delete(key)
+        raise ValueError("source_unavailable: Vault delete failed") from None

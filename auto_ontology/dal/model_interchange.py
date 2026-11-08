@@ -6,10 +6,9 @@
 
 CRUD over the catalog and semantic entities, driven by a YAML document.
 
-``imported_id`` is the mechanism the whole import turns on: entities are matched
-by the YAML ``id`` against ``imported_id`` *or* the live ``id``, so re-importing
-a document is a no-op and importing onto an existing catalog adopts it rather
-than duplicating it.
+Database IDs are explicit target identities. Child and SQL definition IDs match
+``imported_id`` or live ``id`` only within their declared parent/source; a
+foreign-source match is rejected. Common Terms remain global vocabulary.
 
 The whole import is **one transaction**, so a failure part-way leaves nothing
 behind rather than a catalog with half its semantics on top.
@@ -21,7 +20,7 @@ import logging
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from sqlalchemy import func, literal, select, update
+from sqlalchemy import and_, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from auto_ontology.catalog.constants import Props
@@ -157,6 +156,8 @@ def _export_catalog(database_ids: list[str]) -> list[dict[str, Any]]:
             select(
                 s.catalog_database.c.id.label("db_id"),
                 s.catalog_database.c.name.label("db_name"),
+                s.catalog_database.c.display_label,
+                s.catalog_database.c.dialect.label("db_dialect"),
                 s.catalog_schema.c.id.label("schema_id"),
                 s.catalog_schema.c.name.label("schema_name"),
                 s.catalog_table.c.id.label("table_id"),
@@ -253,12 +254,15 @@ def _export_joins(database_ids: list[str]) -> list[dict[str, Any]]:
 
 
 def _export_terms(database_ids: list[str]) -> list[dict[str, Any]]:
-    """Terms represented by an in-scope table, with **all** their represents.
-
-    A term reached through one scoped table exports every table representing
-    it, scoped or not, which keeps a partial export honest about a term it only
-    partly owns.
-    """
+    """Common vocabulary with only the selected sources' catalog projections."""
+    scoped_tables = (
+        select(s.catalog_table.c.id)
+        .select_from(s.catalog_table.join(s.catalog_schema).join(s.catalog_database))
+        .where(_database_scope(database_ids))
+    )
+    scoped_columns = select(s.catalog_column.c.id).where(
+        s.catalog_column.c.table_id.in_(scoped_tables)
+    )
     in_scope = (
         select(s.table__term.c.term_id)
         .select_from(
@@ -288,7 +292,10 @@ def _export_terms(database_ids: list[str]) -> list[dict[str, Any]]:
     represents: dict[str, list[str]] = {}
     for row in store().query_read(
         select(s.table__term.c.term_id, s.table__term.c.table_id)
-        .where(s.table__term.c.term_id.in_(term_ids))
+        .where(
+            s.table__term.c.term_id.in_(term_ids),
+            s.table__term.c.table_id.in_(scoped_tables),
+        )
         .order_by(s.table__term.c.table_id)
     ):
         represents.setdefault(row["term_id"], []).append(row["table_id"])
@@ -311,7 +318,10 @@ def _export_terms(database_ids: list[str]) -> list[dict[str, Any]]:
                 s.column__has_attribute.c.attribute_id == s.column_attribute.c.id,
             )
         )
-        .where(s.column_attribute__term.c.term_id.in_(term_ids))
+        .where(
+            s.column_attribute__term.c.term_id.in_(term_ids),
+            s.column__has_attribute.c.column_id.in_(scoped_columns),
+        )
         .distinct()
         .order_by(s.column_attribute.c.id)
     ):
@@ -359,11 +369,49 @@ def _export_semantic_fks(database_ids: list[str]) -> list[dict[str, Any]]:
 
 def _export_sql_owners(database_ids: list[str], link_table, owner_table, owner_column):
     """The statement and database behind each SqlAttribute/CustomAnalysis."""
+    table_sources = (
+        select(s.catalog_schema.c.database_id)
+        .select_from(s.catalog_table.join(s.catalog_schema))
+        .where(s.catalog_table.c.id == s.sql_query__table.c.table_id)
+        .scalar_subquery()
+    )
+    foreign_tables = (
+        select(s.sql_query__table.c.sql_query_id)
+        .where(table_sources != owner_table.c.connection_id)
+        .correlate(owner_table)
+    )
+    column_sources = (
+        select(s.catalog_schema.c.database_id)
+        .select_from(s.catalog_column.join(s.catalog_table).join(s.catalog_schema))
+        .where(s.catalog_column.c.id == s.sql_query__column.c.column_id)
+        .scalar_subquery()
+    )
+    foreign_columns = (
+        select(s.sql_query__column.c.sql_query_id)
+        .where(column_sources != owner_table.c.connection_id)
+        .correlate(owner_table)
+    )
+    unsafe_owners = (
+        select(owner_column)
+        .select_from(
+            link_table.join(s.sql_query, s.sql_query.c.id == link_table.c.sql_query_id)
+        )
+        .where(
+            or_(
+                s.sql_query.c.connection_id.is_(None),
+                s.sql_query.c.connection_id != owner_table.c.connection_id,
+                s.sql_query.c.id.in_(foreign_tables),
+                s.sql_query.c.id.in_(foreign_columns),
+            )
+        )
+        .correlate(owner_table)
+    )
     return (
         select(
             owner_table.c.id,
             owner_table.c.name,
             owner_table.c.description,
+            owner_table.c.connection_id,
             s.sql_query.c.sql_full_query.label("sql"),
             s.catalog_database.c.name.label("database_name"),
         )
@@ -381,7 +429,12 @@ def _export_sql_owners(database_ids: list[str], link_table, owner_table, owner_c
             .join(link_table, link_table.c.sql_query_id == s.sql_query.c.id)
             .join(owner_table, owner_table.c.id == owner_column)
         )
-        .where(_database_scope(database_ids))
+        .where(
+            _database_scope(database_ids),
+            owner_table.c.connection_id == s.catalog_database.c.id,
+            s.sql_query.c.connection_id == owner_table.c.connection_id,
+            owner_table.c.id.notin_(unsafe_owners),
+        )
         .distinct()
     )
 
@@ -465,9 +518,7 @@ def _scoped_ids(values: Iterable[Any], known: set[str]) -> list[str]:
     database, say -- makes the document unimportable anywhere, because the
     importer has nothing to resolve it against.
 
-    The importer is *also* tolerant of unresolvable references (see
-    ``_remap_optional``), so this is belt and braces: the document stays
-    self-contained, and a document produced elsewhere still imports.
+    The importer rejects explicit references outside its document scope.
     """
     return [str(value) for value in values if str(value) in known]
 
@@ -478,7 +529,10 @@ def assemble_export_document(
     dialect_by_db_name: dict[str, str],
     sql_column_resolver: Any,
 ) -> AutoOntologyModelDocument:
-    """Build a validated document from raw export rows."""
+    """Build a document; the legacy dialect-map keyword now takes database IDs.
+
+    Stored root dialects take precedence. Physical names never select a source.
+    """
     databases = _assemble_databases(rows["catalog"], dialect_by_db_name)
     table_ids, column_ids = _catalog_ids(databases)
     live_to_catalog_column_id = _column_live_id_map(rows["catalog"])
@@ -543,11 +597,12 @@ def assemble_export_document(
     custom_analyses = [
         ModelCustomAnalysis(
             id=str(row["id"]),
+            connection_id=row["connection_id"],
             name=row.get("name") or "",
             description=row.get("description") or "",
             sql=row.get("sql") or "",
             sql_column_is=_scoped_column_ids(
-                sql_column_resolver(row.get("sql") or "", row.get("database_name")),
+                sql_column_resolver(row.get("sql") or "", row["connection_id"]),
                 live_to_catalog_column_id,
                 column_ids,
             ),
@@ -615,7 +670,8 @@ def _assemble_databases(
             db_id,
             {
                 "id": db_id,
-                "dialect": dialect_by_db_name.get(row.get("db_name") or "", ""),
+                "display_label": row.get("display_label") or "",
+                "dialect": row.get("db_dialect") or dialect_by_db_name.get(db_id, ""),
                 "schemas": {},
             },
         )
@@ -673,7 +729,10 @@ def _assemble_databases(
         ]
         databases.append(
             ModelDatabase(
-                id=db_entry["id"], dialect=db_entry["dialect"], schemas=schemas
+                id=db_entry["id"],
+                display_label=db_entry["display_label"],
+                dialect=db_entry["dialect"],
+                schemas=schemas,
             )
         )
     databases.sort(key=lambda db: db.id)
@@ -699,11 +758,12 @@ def _assemble_sql_attributes(
         grouped[yaml_key].append(
             ModelSqlAttribute(
                 id=str(row["id"]),
+                connection_id=row["connection_id"],
                 name=row.get("name") or "",
                 description=row.get("description") or "",
                 sql=sql_text,
                 sql_column_is=_scoped_column_ids(
-                    sql_column_resolver(sql_text, row.get("database_name")),
+                    sql_column_resolver(sql_text, row["connection_id"]),
                     live_to_catalog_column_id,
                     column_ids,
                 ),
@@ -714,41 +774,41 @@ def _assemble_sql_attributes(
 
 
 def _column_ids_from_sql(
-    sql: str, dialects: list[str], schemas: dict[str, Any]
+    sql: str, dialects: list[str], schemas: dict[str, Any], connection_id: str
 ) -> list[str]:
     try:
-        query_obj = validate_sql(sql, dialects, schemas)
+        query_obj = validate_sql(sql, dialects, schemas, connection_id=connection_id)
     except Exception:
         logger.debug("Could not resolve sql_column_is for SQL snippet", exc_info=True)
         return []
     return [str(col_id) for col_id in query_obj.get_column_ids() if col_id]
 
 
-def resolve_sql_column_ids(sql: str, database_name: str | None) -> list[str]:
+def resolve_sql_column_ids(sql: str, connection_id: str) -> list[str]:
     """Parse SQL against the scoped catalog and return referenced column ids.
 
     ``sql_column_is`` is a best-effort enrichment: a broken connector or a
-    transient catalog-lookup failure for *database_name* must not raise out
+    transient catalog-lookup failure for *connection_id* must not raise out
     of here, or callers assembling an export/import document would fail
     entirely over what is, at worst, a missing cross-reference.
     """
     if not sql.strip():
         return []
     try:
-        dialects = get_dialects(database_name)
-        schemas = get_schemas(database_name)
+        dialects = get_dialects(connection_id)
+        schemas = get_schemas(connection_id)
     except Exception:
         logger.debug(
             "Could not build dialects/schemas for database %r; skipping "
             "sql_column_is for this SQL snippet",
-            database_name,
+            connection_id,
             exc_info=True,
         )
         return []
-    return _column_ids_from_sql(sql, dialects, schemas)
+    return _column_ids_from_sql(sql, dialects, schemas, connection_id)
 
 
-def make_cached_sql_column_resolver() -> Callable[[str, str | None], list[str]]:
+def make_cached_sql_column_resolver() -> Callable[[str, str], list[str]]:
     """Build a ``sql_column_resolver`` that reuses ``(dialects, schemas)`` per database.
 
     A single export calls this once per sql_attribute/custom_analysis, and
@@ -759,11 +819,11 @@ def make_cached_sql_column_resolver() -> Callable[[str, str | None], list[str]]:
     """
     cache: dict[str | None, tuple[list[str], dict[str, Any]]] = {}
 
-    def _resolve(sql: str, database_name: str | None) -> list[str]:
+    def _resolve(sql: str, connection_id: str) -> list[str]:
         if not sql.strip():
             return []
-        dialects, schemas = _safe_cached_dialects_and_schemas(cache, database_name)
-        return _column_ids_from_sql(sql, dialects, schemas)
+        dialects, schemas = _safe_cached_dialects_and_schemas(cache, connection_id)
+        return _column_ids_from_sql(sql, dialects, schemas, connection_id)
 
     return _resolve
 
@@ -790,19 +850,57 @@ def _resolve_entities_batch(
     if not items:
         return {}
 
-    # Duplicate YAML ids within one batch: keep the first create_props, which is
-    # what repeated sequential calls did -- the first creates, the rest find.
+    if table is s.catalog_database:
+        from auto_ontology.dal.connections import (
+            assert_connection_id_available,
+            lock_source_registration,
+        )
+
+        lock_source_registration()
+        try:
+            for imported_id, props in items:
+                assert_connection_id_available(imported_id)
+                if props.get("id"):
+                    assert_connection_id_available(props["id"])
+        except ValueError as exc:
+            raise ModelImportValidationError(str(exc)) from None
+
+    scope_key = next(
+        (
+            key
+            for key in ("database_id", "schema_id", "table_id", "connection_id")
+            if key in items[0][1]
+        ),
+        None,
+    )
     deduped: dict[str, dict[str, Any]] = {}
     for imported_id, create_props in items:
+        if (
+            imported_id in deduped
+            and scope_key
+            and deduped[imported_id][scope_key] != create_props[scope_key]
+        ):
+            raise ModelImportValidationError(
+                f"Conflicting parent/source scope for {table.name} id {imported_id!r}"
+            )
         deduped.setdefault(imported_id, create_props)
     imported_ids = list(deduped)
 
     existing: dict[str, str] = {}
     for row in store().query_read(
-        select(table.c.id, table.c.imported_id).where(
+        select(table).where(
             table.c.imported_id.in_(imported_ids) | table.c.id.in_(imported_ids)
         )
     ):
+        matching = [key for key in (row["id"], row["imported_id"]) if key in deduped]
+        for key in matching:
+            props = deduped[key]
+            if (table is s.catalog_database and row["id"] != key) or (
+                scope_key and row[scope_key] != props[scope_key]
+            ):
+                raise ModelImportValidationError(
+                    f"Foreign-source or parent scope for {table.name} id {key!r}"
+                )
         # A row can match by either column. Its own id wins only when nothing
         # already claimed that payload id by imported_id, so a row explicitly
         # stamped by a previous import is never shadowed by an id collision.
@@ -816,6 +914,17 @@ def _resolve_entities_batch(
     for imported_id, create_props in deduped.items():
         live_id = existing.get(imported_id)
         if live_id is None:
+            if (
+                table is s.catalog_database
+                and not create_props.get("display_label", "").strip()
+            ):
+                raise ModelImportValidationError(
+                    "A new database requires an explicit display_label"
+                )
+            if table is s.catalog_database and not create_props.get("name"):
+                raise ModelImportValidationError(
+                    "A new database requires an explicit physical database_name"
+                )
             to_create.append((imported_id, dict(create_props or {})))
             continue
         result[imported_id] = (live_id, False)
@@ -851,15 +960,12 @@ def _link(table, rows: list[dict[str, Any]]) -> None:
     store().query_write(insert(table).values(rows).on_conflict_do_nothing())
 
 
-def _payload_identity(table):
-    """``coalesce(imported_id, id)`` — the identity an import payload names.
-
-    A row created by an earlier import is named by its ``imported_id``; a row
-    that predates any import is named by its own id. Matching on the coalesce
-    covers both, which is what lets ``replace`` recognise an entity it wrote
-    last time and one it merely adopted.
-    """
-    return func.coalesce(table.c.imported_id, table.c.id)
+def _not_in_payload(table, keep: list[str]):
+    """Delete only when neither the live nor the imported identity is kept."""
+    return and_(
+        table.c.id.notin_(keep),
+        or_(table.c.imported_id.is_(None), table.c.imported_id.notin_(keep)),
+    )
 
 
 def _remap(id_map: dict[str, str], yaml_id: str, *, kind: str) -> str:
@@ -871,76 +977,16 @@ def _remap(id_map: dict[str, str], yaml_id: str, *, kind: str) -> str:
     return live_id
 
 
-def _remap_optional(id_map: dict[str, str], yaml_id: str) -> str | None:
-    """Resolve an id that a scoped export may legitimately not carry.
-
-    A scoped export is deliberately honest about the parts of a term it does not
-    own: ``_export_terms`` emits *every* table representing a term, in scope or
-    not, and ``_export_semantic_fks`` every pair touching an in-scope column.
-    Those ids point outside the document by design, so requiring them -- as
-    :func:`_remap` does -- made any such document abort the whole import.
-
-    Structural references still use :func:`_remap`. The difference is what a
-    missing id means: for a foreign key's endpoints it is a corrupt document,
-    for these it is the expected shape of a partial export.
-    """
-    return id_map.get(yaml_id)
-
-
-def _database_names_for_terms(term_ids: list[str]) -> dict[str, str]:
-    if not term_ids:
-        return {}
-    names: dict[str, str] = {}
-    for row in store().query_read(
-        select(
-            s.table__term.c.term_id,
-            s.catalog_database.c.name.label("database_name"),
-        )
-        .select_from(
-            s.table__term.join(
-                s.catalog_table, s.catalog_table.c.id == s.table__term.c.table_id
-            )
-            .join(
-                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
-            )
-            .join(
-                s.catalog_database,
-                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+def _database_names_for_ids(connection_ids: Iterable[str]) -> dict[str, str]:
+    """Physical names are presentation metadata, never source selectors."""
+    return {
+        row["id"]: row["name"]
+        for row in store().query_read(
+            select(s.catalog_database.c.id, s.catalog_database.c.name).where(
+                s.catalog_database.c.id.in_(list(connection_ids))
             )
         )
-        .where(s.table__term.c.term_id.in_(term_ids))
-        .order_by(s.catalog_database.c.id)
-    ):
-        names.setdefault(row["term_id"], row["database_name"])
-    return names
-
-
-def _database_names_for_columns(column_ids: list[str]) -> dict[str, str]:
-    if not column_ids:
-        return {}
-    names: dict[str, str] = {}
-    for row in store().query_read(
-        select(
-            s.catalog_column.c.id.label("column_id"),
-            s.catalog_database.c.name.label("database_name"),
-        )
-        .select_from(
-            s.catalog_column.join(
-                s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id
-            )
-            .join(
-                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
-            )
-            .join(
-                s.catalog_database,
-                s.catalog_database.c.id == s.catalog_schema.c.database_id,
-            )
-        )
-        .where(s.catalog_column.c.id.in_(column_ids))
-        .order_by(s.catalog_database.c.id)
-    ):
-        names.setdefault(row["column_id"], row["database_name"])
-    return names
+    }
 
 
 def apply_import_model(
@@ -980,6 +1026,17 @@ def apply_import_model(
         live_db_ids = _import_catalog(
             document, id_map, created, skipped, embed_buffer, column_meta
         )
+        definition_owners: dict[str, str] = {}
+        for definition in [
+            attr
+            for key in _YAML_SOURCE_KEYS
+            for attr in getattr(document.semantic_layer.sql_attributes, key)
+        ] + document.semantic_layer.custom_analyses:
+            owner = _sql_owner_context(document, definition, id_map)
+            if definition_owners.setdefault(definition.id, owner) != owner:
+                raise ModelImportValidationError(
+                    "Conflicting SQL definition source scope"
+                )
         if replace:
             _delete_scoped_semantics_not_in_payload(document, live_db_ids)
         _import_foreign_keys(document, id_map)
@@ -1035,17 +1092,30 @@ def _import_catalog(
     """
     databases = document.data_layer.databases
 
-    db_names = {
-        db.id: (
-            db.schemas[0].database_name or db.schemas[0].name or ""
-            if db.schemas
-            else ""
-        )
-        for db in databases
-    }
+    db_names: dict[str, str] = {}
+    for db in databases:
+        if not db.id.strip():
+            raise ModelImportValidationError("A database requires an explicit id")
+        names = {schema.database_name for schema in db.schemas if schema.database_name}
+        if len(names) > 1:
+            raise ModelImportValidationError(
+                "Conflicting physical names within one database source"
+            )
+        db_names[db.id] = next(iter(names), "")
     db_results = _resolve_entities_batch(
         s.catalog_database,
-        [(db.id, {"name": db_names[db.id] or db.id}) for db in databases],
+        [
+            (
+                db.id,
+                {
+                    "id": db.id,
+                    "name": db_names[db.id],
+                    "display_label": db.display_label.strip(),
+                    "dialect": db.dialect,
+                },
+            )
+            for db in databases
+        ],
     )
     live_db_ids: list[str] = []
     for db in databases:
@@ -1053,6 +1123,8 @@ def _import_catalog(
         id_map[db.id] = live_db_id
         live_db_ids.append(live_db_id)
         (created if was_created else skipped)["databases"] += 1
+    actual_names = _database_names_for_ids(live_db_ids)
+    db_names = {db.id: actual_names[id_map[db.id]] for db in databases}
 
     schema_db_names: dict[str, str] = {}
     schema_items: list[tuple[str, dict[str, Any]]] = []
@@ -1095,6 +1167,7 @@ def _import_catalog(
             for table in schema.tables:
                 for ordinal, column in enumerate(table.columns, start=1):
                     column_meta[column.id] = ColumnCatalogMeta(
+                        connection_id=id_map[db.id],
                         name=column.name,
                         description=column.description,
                         data_type=column.type,
@@ -1142,6 +1215,7 @@ def _import_catalog(
                         if col_created:
                             embed_buffer.data_rows.append(
                                 build_column_data_row(
+                                    connection_id=id_map[db.id],
                                     live_id=live_col_id,
                                     column_name=column.name,
                                     column_description=column.description,
@@ -1162,6 +1236,7 @@ def _import_catalog(
                     if tbl_created:
                         embed_buffer.data_rows.append(
                             build_table_data_row(
+                                connection_id=id_map[db.id],
                                 live_id=live_table_id,
                                 table_name=table.name,
                                 table_description=table.description,
@@ -1230,9 +1305,8 @@ def _delete_scoped_semantics_not_in_payload(
     entity created by an earlier import and unchanged since is recognised
     either way.
 
-    A Term is only deleted when **every** table representing it is inside the
-    imported databases — the same all-or-nothing rule the reads use. A term
-    shared with a database outside this import is that database's too.
+    A Term is only deleted when no out-of-scope table or remaining semantic/tag
+    relation needs it. Source-scoped replacement cannot retire shared vocabulary.
     """
     keep_terms = [term.id for term in document.semantic_layer.terms]
     keep_attrs = [
@@ -1285,7 +1359,8 @@ def _delete_scoped_semantics_not_in_payload(
         store().query_write(
             owner_table.delete().where(
                 owner_table.c.id.in_(in_scope),
-                _payload_identity(owner_table).notin_(keep or [""]),
+                owner_table.c.connection_id.in_(live_db_ids),
+                _not_in_payload(owner_table, keep),
             )
         )
 
@@ -1297,15 +1372,19 @@ def _delete_scoped_semantics_not_in_payload(
     store().query_write(
         s.column_attribute.delete().where(
             s.column_attribute.c.id.in_(attribute_in_scope),
-            _payload_identity(s.column_attribute).notin_(keep_attrs or [""]),
+            _not_in_payload(s.column_attribute, keep_attrs),
         )
     )
 
-    # Only terms whose every representing table is inside this import.
+    # Scoped owners were removed above; every remaining dependency must survive.
     outside = (
         select(s.table__term.c.term_id)
         .where(s.table__term.c.table_id.notin_(scoped_tables))
-        .distinct()
+        .union(
+            select(s.sql_attribute__term.c.term_id),
+            select(s.column_attribute__term.c.term_id),
+            select(s.tag_target.c.term_id).where(s.tag_target.c.term_id.is_not(None)),
+        )
     )
     inside = (
         select(s.table__term.c.term_id)
@@ -1317,7 +1396,7 @@ def _delete_scoped_semantics_not_in_payload(
             s.term.c.id.in_(inside),
             s.term.c.id.notin_(outside),
             s.term.c.source == SEMANTIC_SOURCE,
-            _payload_identity(s.term).notin_(keep_terms or [""]),
+            _not_in_payload(s.term, keep_terms),
         )
     )
 
@@ -1346,13 +1425,11 @@ def _import_terms(
     )
 
     represents_rows: list[dict[str, Any]] = []
-    newly_created: list[str] = []
     for term in terms:
         live_term_id, was_created = term_results[term.id]
         id_map[term.id] = live_term_id
         if was_created:
             created["terms"] += 1
-            newly_created.append(live_term_id)
         else:
             skipped["terms"] += 1
         # The payload is authoritative about which tables represent a term --
@@ -1372,33 +1449,56 @@ def _import_terms(
             )
         )
         for table_id in term.represents:
-            live_table_id = _remap_optional(id_map, table_id)
-            if live_table_id is None:
-                # A table from another database this term also represents. The
-                # export records it on purpose; this document cannot create it.
-                logger.debug(
-                    "import: term %s represents out-of-scope table %s; skipping",
-                    term.id,
-                    table_id,
-                )
-                continue
+            live_table_id = _remap(id_map, table_id, kind="represented table")
             represents_rows.append({"term_id": live_term_id, "table_id": live_table_id})
     _link(s.table__term, represents_rows)
 
-    if embed_buffer is not None and newly_created:
-        db_names = _database_names_for_terms(newly_created)
+    if embed_buffer is not None:
+        database_names = _database_names_for_ids(
+            id_map[database.id] for database in document.data_layer.databases
+        )
+        table_sources = {
+            table.id: id_map[database.id]
+            for database in document.data_layer.databases
+            for schema in database.schemas
+            for table in schema.tables
+        }
+        column_sources = {
+            column.id: table_sources[table.id]
+            for database in document.data_layer.databases
+            for schema in database.schemas
+            for table in schema.tables
+            for column in table.columns
+        }
         for term in terms:
-            live_term_id, was_created = term_results[term.id]
-            if not was_created:
-                continue
-            embed_buffer.semantic_rows.extend(
-                build_term_semantic_rows(
-                    database_name=db_names.get(live_term_id, ""),
-                    live_id=live_term_id,
-                    name=term.name,
-                    description=term.description,
-                ),
+            connection_ids = (
+                {
+                    table_sources[table_id]
+                    for table_id in term.represents
+                    if table_id in table_sources
+                }
+                | {
+                    column_sources[attr.column_id]
+                    for attr in term.columns_attributes
+                    if attr.column_id in column_sources
+                }
+                | {
+                    id_map[attr.connection_id]
+                    for key in _YAML_SOURCE_KEYS
+                    for attr in getattr(document.semantic_layer.sql_attributes, key)
+                    if attr.term_id == term.id and attr.connection_id in id_map
+                }
             )
+            for connection_id in sorted(connection_ids):
+                embed_buffer.semantic_rows.extend(
+                    build_term_semantic_rows(
+                        connection_id=connection_id,
+                        database_name=database_names[connection_id],
+                        live_id=term_results[term.id][0],
+                        name=term.name,
+                        description=term.description,
+                    ),
+                )
 
 
 def _import_column_attributes(
@@ -1470,6 +1570,7 @@ def _import_column_attributes(
         if was_created and embed_buffer is not None and col_ctx is not None:
             embed_buffer.semantic_rows.extend(
                 build_column_attribute_semantic_rows(
+                    connection_id=col_ctx.connection_id,
                     database_name=col_ctx.database_name,
                     live_id=live_attr_id,
                     name=attr.name,
@@ -1493,16 +1594,10 @@ def _import_semantic_fks(
 ) -> None:
     rows = []
     for fk in document.semantic_layer.semantic_fks:
-        column_id = _remap_optional(id_map, fk.column_id)
-        attribute_id = _remap_optional(id_map, fk.column_attribute_id)
-        if column_id is None or attribute_id is None:
-            # The pair reaches an attribute whose term fell outside this export.
-            logger.debug(
-                "import: semantic fk %s -> %s is out of scope; skipping",
-                fk.column_id,
-                fk.column_attribute_id,
-            )
-            continue
+        column_id = _remap(id_map, fk.column_id, kind="semantic FK column")
+        attribute_id = _remap(
+            id_map, fk.column_attribute_id, kind="semantic FK attribute"
+        )
         rows.append(
             {
                 "column_id": column_id,
@@ -1527,7 +1622,7 @@ def _import_semantic_fks(
 
 def _cached_dialects_and_schemas(
     cache: dict[str | None, tuple[list[str], dict[str, Any]]],
-    database_name: str | None,
+    connection_id: str,
 ) -> tuple[list[str], dict[str, Any]]:
     """Memoised ``(dialects, schemas)`` for the life of one import.
 
@@ -1536,14 +1631,14 @@ def _cached_dialects_and_schemas(
     handful of database names. Scoped to one call, so it cannot serve stale data
     across imports.
     """
-    if database_name not in cache:
-        cache[database_name] = (get_dialects(database_name), get_schemas(database_name))
-    return cache[database_name]
+    if connection_id not in cache:
+        cache[connection_id] = (get_dialects(connection_id), get_schemas(connection_id))
+    return cache[connection_id]
 
 
 def _safe_cached_dialects_and_schemas(
     cache: dict[str | None, tuple[list[str], dict[str, Any]]],
-    database_name: str | None,
+    connection_id: str,
 ) -> tuple[list[str], dict[str, Any]]:
     """Like :func:`_cached_dialects_and_schemas`, but never raises.
 
@@ -1554,21 +1649,21 @@ def _safe_cached_dialects_and_schemas(
     a persistently broken *database_name* doesn't re-raise on every
     sql_attribute/custom_analysis that references it.
     """
-    if database_name not in cache:
+    if connection_id not in cache:
         try:
-            cache[database_name] = (
-                get_dialects(database_name),
-                get_schemas(database_name),
+            cache[connection_id] = (
+                get_dialects(connection_id),
+                get_schemas(connection_id),
             )
         except Exception:
             logger.debug(
                 "Could not build dialects/schemas for database %r; "
                 "sql_column_is will be empty for SQL referencing it",
-                database_name,
+                connection_id,
                 exc_info=True,
             )
-            cache[database_name] = ([], {})
-    return cache[database_name]
+            cache[connection_id] = ([], {})
+    return cache[connection_id]
 
 
 def _persist_sql_object(
@@ -1578,7 +1673,7 @@ def _persist_sql_object(
     name: str,
     description: str,
     sql: str,
-    database_name: str | None,
+    connection_id: str,
     schema_cache: dict[str | None, tuple[list[str], dict[str, Any]]],
     extra_props: dict[str, Any] | None = None,
 ) -> None:
@@ -1589,9 +1684,13 @@ def _persist_sql_object(
     which is what makes the SQL attribute show up in the exploration graph and
     the zone checks afterwards.
     """
-    dialects, schemas = _cached_dialects_and_schemas(schema_cache, database_name)
-    query_obj = validate_sql(sql, dialects, schemas)
-    props: dict[str, Any] = {"name": name, "description": description}
+    dialects, schemas = _cached_dialects_and_schemas(schema_cache, connection_id)
+    query_obj = validate_sql(sql, dialects, schemas, connection_id=connection_id)
+    props: dict[str, Any] = {
+        "name": name,
+        "description": description,
+        "connection_id": connection_id,
+    }
     if extra_props:
         props.update(extra_props)
     node = CatalogNode(
@@ -1599,11 +1698,42 @@ def _persist_sql_object(
         label=node_label,
         props=props,
         existing_id=node_id,
-        match_props={"id": node_id},
+        match_props={"id": node_id, "connection_id": connection_id},
     )
-    query_obj.sql_node.match_props = {"sql_full_query": sql}
+    query_obj.sql_node.match_props = {
+        "sql_full_query": sql,
+        "connection_id": connection_id,
+    }
     query_obj.edges.append((node, query_obj.sql_node, {Props.ANALYSIS_ID: node_id}))
-    add_query(query_obj.get_edges())
+    add_query(query_obj.get_edges(), connection_id=connection_id)
+
+
+def _sql_owner_context(
+    document: AutoOntologyModelDocument, definition, id_map: dict[str, str]
+) -> str:
+    """Resolve explicit document ownership; never infer it from parsed SQL."""
+    databases = {db.id for db in document.data_layer.databases}
+    owner = definition.connection_id
+    if not owner and len(databases) == 1:
+        owner = next(iter(databases))
+    if owner not in databases:
+        raise ModelImportValidationError(
+            "SQL definition requires an explicit document connection_id"
+        )
+    column_sources = {
+        column.id: db.id
+        for db in document.data_layer.databases
+        for schema in db.schemas
+        for table in schema.tables
+        for column in table.columns
+    }
+    if any(
+        column_sources.get(column_id) != owner for column_id in definition.sql_column_is
+    ):
+        raise ModelImportValidationError(
+            "SQL definition references a foreign-source or missing column"
+        )
+    return _remap(id_map, owner, kind="SQL source")
 
 
 def _import_sql_attributes(
@@ -1620,6 +1750,9 @@ def _import_sql_attributes(
         for key in _YAML_SOURCE_KEYS
         for attr in getattr(document.semantic_layer.sql_attributes, key)
     ]
+    owners = {
+        attr.id: _sql_owner_context(document, attr, id_map) for _, attr in grouped
+    }
     attr_results = _resolve_entities_batch(
         s.sql_attribute,
         [
@@ -1630,6 +1763,7 @@ def _import_sql_attributes(
                     "description": attr.description,
                     "expression": attr.sql,
                     "source": source,
+                    "connection_id": owners[attr.id],
                 },
             )
             for source, attr in grouped
@@ -1640,14 +1774,7 @@ def _import_sql_attributes(
 
     # SQL parsing is inherently per-item, but the resolve and the database-name
     # lookups it needs are batched up front.
-    newly_created_terms = list(
-        {
-            _remap(id_map, attr.term_id, kind="sql attribute term")
-            for _source, attr in grouped
-            if attr_results[attr.id][1]
-        }
-    )
-    db_names = _database_names_for_terms(newly_created_terms)
+    db_names = _database_names_for_ids(owners.values())
 
     for source, attr in grouped:
         live_attr_id, was_created = attr_results[attr.id]
@@ -1656,7 +1783,7 @@ def _import_sql_attributes(
             continue
         created["sql_attributes"] += 1
         live_term_id = _remap(id_map, attr.term_id, kind="sql attribute term")
-        database_name = db_names.get(live_term_id)
+        database_name = db_names[owners[attr.id]]
         detach_existing_sql_edges(live_attr_id)
         _persist_sql_object(
             node_label="SqlAttribute",
@@ -1664,7 +1791,7 @@ def _import_sql_attributes(
             name=attr.name,
             description=attr.description,
             sql=attr.sql,
-            database_name=database_name,
+            connection_id=owners[attr.id],
             schema_cache=schema_cache,
             extra_props={"expression": attr.sql, "source": source},
         )
@@ -1672,6 +1799,7 @@ def _import_sql_attributes(
         if embed_buffer is not None:
             embed_buffer.semantic_rows.append(
                 build_sql_attribute_semantic_row(
+                    connection_id=owners[attr.id],
                     live_id=live_attr_id,
                     name=attr.name,
                     description=attr.description,
@@ -1691,33 +1819,28 @@ def _import_custom_analyses(
     schema_cache: dict[str | None, tuple[list[str], dict[str, Any]]],
 ) -> None:
     analyses = document.semantic_layer.custom_analyses
+    owners = {
+        analysis.id: _sql_owner_context(document, analysis, id_map)
+        for analysis in analyses
+    }
     results = _resolve_entities_batch(
         s.custom_analysis,
         [
-            (analysis.id, {"name": analysis.name, "description": analysis.description})
+            (
+                analysis.id,
+                {
+                    "name": analysis.name,
+                    "description": analysis.description,
+                    "connection_id": owners[analysis.id],
+                },
+            )
             for analysis in analyses
         ],
     )
     for analysis in analyses:
         id_map[analysis.id] = results[analysis.id][0]
 
-    live_column: dict[str, str | None] = {}
-    lookup_ids: list[str] = []
-    for analysis in analyses:
-        _live_id, was_created = results[analysis.id]
-        column_id: str | None = None
-        if was_created and analysis.sql_column_is:
-            try:
-                column_id = _remap(
-                    id_map, analysis.sql_column_is[0], kind="custom analysis column"
-                )
-            except ModelImportValidationError:
-                column_id = None
-        live_column[analysis.id] = column_id
-        if column_id:
-            lookup_ids.append(column_id)
-
-    db_names = _database_names_for_columns(lookup_ids)
+    db_names = _database_names_for_ids(owners.values())
 
     for analysis in analyses:
         live_ca_id, was_created = results[analysis.id]
@@ -1725,8 +1848,7 @@ def _import_custom_analyses(
             skipped["custom_analyses"] += 1
             continue
         created["custom_analyses"] += 1
-        column_id = live_column.get(analysis.id)
-        database_name = db_names.get(column_id) if column_id else None
+        database_name = db_names[owners[analysis.id]]
         detach_ca_sql_edges(live_ca_id)
         _persist_sql_object(
             node_label="CustomAnalysis",
@@ -1734,12 +1856,13 @@ def _import_custom_analyses(
             name=analysis.name,
             description=analysis.description,
             sql=analysis.sql,
-            database_name=database_name,
+            connection_id=owners[analysis.id],
             schema_cache=schema_cache,
         )
         if embed_buffer is not None:
             embed_buffer.semantic_rows.append(
                 build_custom_analysis_semantic_row(
+                    connection_id=owners[analysis.id],
                     live_id=live_ca_id,
                     name=analysis.name,
                     description=analysis.description,

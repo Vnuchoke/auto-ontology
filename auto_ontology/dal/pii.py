@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import IN_QUERY_BATCH, store, write_transaction
+from auto_ontology.dal.source_scope import definition_source_scope
 from auto_ontology.dal.tags import (
     PII_TAG_NAME,
     TARGET_COLUMN,
@@ -50,7 +51,9 @@ def mark_columns_pii_processed(column_ids: list[str]) -> int:
     return marked
 
 
-def _column_attributes_of_tagged_columns(tag_id: str) -> Select:
+def _column_attributes_of_tagged_columns(
+    tag_id: str, connection_id: str | None = None
+) -> Select:
     """Ids of unprocessed ColumnAttributes whose column carries *tag_id*.
 
     ``column__has_attribute`` only: that edge says the column *is* an instance of
@@ -64,7 +67,7 @@ def _column_attributes_of_tagged_columns(tag_id: str) -> Select:
     ``pii_processed`` is filtered here, so an attribute handled once is never a
     candidate again -- which is what lets a person remove its tag for good.
     """
-    return (
+    statement = (
         select(s.column__has_attribute.c.attribute_id.label("id"))
         .select_from(
             s.tag_target.join(
@@ -87,9 +90,27 @@ def _column_attributes_of_tagged_columns(tag_id: str) -> Select:
         )
         .distinct()
     )
+    if connection_id is not None:
+        statement = (
+            statement.join(
+                s.catalog_column,
+                s.catalog_column.c.id == s.column__has_attribute.c.column_id,
+            )
+            .join(s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+            .where(
+                s.catalog_schema.c.database_id == connection_id,
+                s.column_attribute.c.table_id == s.catalog_table.c.id,
+            )
+        )
+    return statement
 
 
-def _sql_attributes_of_tagged_columns(tag_id: str) -> Select:
+def _sql_attributes_of_tagged_columns(
+    tag_id: str, connection_id: str | None = None
+) -> Select:
     """Ids of unprocessed SqlAttributes whose SQL reads a column with *tag_id*.
 
     Reached through the statement the attribute is computed by:
@@ -97,7 +118,7 @@ def _sql_attributes_of_tagged_columns(tag_id: str) -> Select:
     and unprocessed only, for the reasons on
     :func:`_column_attributes_of_tagged_columns`.
     """
-    return (
+    statement = (
         select(s.sql_attribute__sql.c.attribute_id.label("id"))
         .select_from(
             s.tag_target.join(
@@ -125,9 +146,18 @@ def _sql_attributes_of_tagged_columns(tag_id: str) -> Select:
         )
         .distinct()
     )
+    if connection_id is not None:
+        statement = statement.where(
+            definition_source_scope(
+                s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+            )
+        )
+    return statement
 
 
-def tag_attributes_of_tagged_columns(tag_id: str) -> tuple[int, int]:
+def tag_attributes_of_tagged_columns(
+    tag_id: str, *, connection_id: str | None = None
+) -> tuple[int, int]:
     """Copy *tag_id* from tagged columns onto the attributes built from them.
 
     Returns ``(column_attributes, sql_attributes)`` newly labelled.
@@ -154,8 +184,13 @@ def tag_attributes_of_tagged_columns(tag_id: str) -> tuple[int, int]:
 
     Labels carry no ``tagged_by`` and no ``rule_id``, which the UI reads as
     "Auto Generated". A label already on the attribute keeps its source.
+
+    Runtime passes connection_id: catalog ancestry and every SQL dependency
+    must belong to it. Omitting it retains the explicit administrative sweep.
     """
     applied: list[int] = []
+    if connection_id is not None and not connection_id.strip():
+        raise ValueError("connection_id must not be blank")
     stored = s.tag_target.alias("stored")
     with write_transaction():
         for column, attribute, candidates in (
@@ -170,7 +205,7 @@ def tag_attributes_of_tagged_columns(tag_id: str) -> tuple[int, int]:
                 _sql_attributes_of_tagged_columns,
             ),
         ):
-            found = candidates(tag_id).subquery()
+            found = candidates(tag_id, connection_id).subquery()
             rows = store().query_write(
                 insert(s.tag_target)
                 .from_select(

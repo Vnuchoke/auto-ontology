@@ -16,8 +16,8 @@ import type { Connection } from '@/types/connection';
 export type ConnectionInfoCardProps = {
 	connection: Connection;
 	onEdit?: (connection: Connection) => void;
-	onDelete?: (databaseName: string) => void;
-	onSsoFederationChange?: (databaseName: string, enabled: boolean) => void;
+	onDelete?: (connectionId: string) => void;
+	onSsoFederationChange?: (connectionId: string, enabled: boolean) => void;
 	/** Disables the toggle while its request is in flight. */
 	ssoFederationPending?: boolean;
 	disabled?: boolean;
@@ -47,7 +47,7 @@ export const ConnectionInfoCard = ({
 					{
 						label: 'Remove',
 						icon: <Icon name={IconName.Trash} className="h-3.5 w-3.5" />,
-						onClick: () => onDelete(connection.database_name),
+						onClick: () => onDelete(connection.connection_id),
 						danger: true,
 					},
 				]),
@@ -67,11 +67,16 @@ export const ConnectionInfoCard = ({
 						name={IconName.Database}
 						className="h-5 w-5 shrink-0 text-body dark:text-zinc-300"
 					/>
-					<Text
-						as="h3"
-						text={connection.database_name}
-						variant={TextVariant.Subheading}
-					/>
+					<div className="min-w-0">
+						<Text
+							as="h3"
+							text={connection.display_label}
+							variant={TextVariant.Subheading}
+						/>
+						<p className="text-xs text-secondary dark:text-zinc-400">
+							{connection.database_name}
+						</p>
+					</div>
 				</div>
 				<div className="relative shrink-0">
 					{menuDisabled ? (
@@ -90,7 +95,7 @@ export const ConnectionInfoCard = ({
 									iconOnly
 									type="button"
 									onClick={toggle}
-									aria-label={`Actions for ${connection.database_name}`}
+									aria-label={`Actions for ${connection.display_label}`}
 								>
 									<Icon name={IconName.DotsVertical} className="h-4 w-4" />
 								</Button>
@@ -107,9 +112,9 @@ export const ConnectionInfoCard = ({
 							checked={ssoFederationOn}
 							disabled={disabled || ssoFederationPending}
 							onChange={({ target }) =>
-								onSsoFederationChange(connection.database_name, target.checked)
+								onSsoFederationChange(connection.connection_id, target.checked)
 							}
-							data-testid={`sso-federation-${connection.database_name}`}
+							data-testid={`sso-federation-${connection.connection_id}`}
 							className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer rounded border-zinc-300 accent-[#76b900] disabled:cursor-default dark:border-zinc-600"
 						/>
 						<span className="min-w-0">

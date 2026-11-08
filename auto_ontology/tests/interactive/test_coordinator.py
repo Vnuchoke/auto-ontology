@@ -21,6 +21,27 @@ from auto_ontology.retrieval.interactive.types import (
     TurnType,
 )
 from auto_ontology.retrieval.interactive.state import InteractiveSessionState
+from auto_ontology.connectors.sources import SourceDescriptor
+
+CONNECTION_ID = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.fixture(autouse=True)
+def ready_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "auto_ontology.connectors.sources.list_active_sources",
+        lambda: [
+            SourceDescriptor(CONNECTION_ID, "Alien", "alien", "postgres", "managed")
+        ],
+    )
+    monkeypatch.setattr(
+        "auto_ontology.retrieval.source_context.semantic_layer_calculated",
+        lambda **_: True,
+    )
+    monkeypatch.setattr(
+        "auto_ontology.retrieval.source_context.require_source_vectors_ready",
+        lambda _: None,
+    )
 
 
 def _make_session(**kwargs):
@@ -28,6 +49,7 @@ def _make_session(**kwargs):
         session_id="s1",
         task_id="t1",
         db_name="alien",
+        connection_id=CONNECTION_ID,
         db_schema="TABLE aliens ...",
         external_kb="[]",
         original_question="test question",
@@ -121,6 +143,10 @@ def test_follow_up_seed_clears_sql_keys():
 def test_step_initial_sets_question():
     sess = _make_session(original_question="", working_question="")
     with (
+        patch(
+            "auto_ontology.retrieval.interactive.coordinator._get_llm",
+            return_value=MagicMock(),
+        ),
         patch(
             "auto_ontology.retrieval.interactive.coordinator._run_sql_generation",
             return_value="SELECT 1",
@@ -250,6 +276,7 @@ def test_sql_generation_includes_raw_clarifications_in_evidence():
 class _Connector:
     dialect = "postgres"
     database_name = "alien"
+    connection_id = CONNECTION_ID
 
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail

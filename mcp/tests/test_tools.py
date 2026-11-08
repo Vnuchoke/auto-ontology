@@ -37,6 +37,28 @@ def test_every_curated_operation_exists_in_the_spec() -> None:
     assert missing_from_spec(SPEC) == []
 
 
+def test_source_discovery_is_curated_and_chat_authorized_with_safe_schema() -> None:
+    tool = next(spec for spec in CURATED if spec.name == "list_sources")
+    assert (tool.method, tool.path) == ("GET", "/api/connections/sources")
+    assert "connection_id" in tool.description
+    assert "connection_label" in tool.description
+    assert "semantic" in tool.description
+
+    operation = SPEC["paths"][tool.path]["get"]
+    assert operation["x-auto-ontology-permissions"] == {"chat": ["use"]}
+    assert operation["security"] == [{"ApiToken": []}]
+    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    descriptor = schema["properties"]["data"]["items"]
+    assert set(descriptor["properties"]) == {
+        "connection_id",
+        "display_label",
+        "database_name",
+        "dialect",
+    }
+    assert set(descriptor["required"]) == set(descriptor["properties"])
+    assert descriptor["additionalProperties"] is False
+
+
 def test_nothing_walks_the_physical_catalog() -> None:
     # Consumers are meant to reach the data through the semantic layer. A tool
     # that lists databases, schemas, or raw columns invites an agent to reason

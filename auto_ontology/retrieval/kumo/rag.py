@@ -20,6 +20,8 @@ from typing import Any
 from auto_ontology.dal.pql_analyses import fetch_pql_analyses_by_ids
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
 from auto_ontology.semantic.constants import LABEL_PQL_ANALYSIS
+from auto_ontology.utils.retriever import Retriever
+from auto_ontology.vdb import get_global_pql_vdb
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +42,16 @@ def fetch_pql_examples(
         return []
 
     try:
-        rows = search_semantic_index(
-            semantic_retriever,
-            question,
-            label_filter=[LABEL_PQL_ANALYSIS],
-            per_label_k={LABEL_PQL_ANALYSIS: k},
-        )
+        vdb = get_global_pql_vdb()
+        try:
+            rows = search_semantic_index(
+                Retriever(vdb, semantic_retriever.embed_params),
+                question,
+                label_filter=[LABEL_PQL_ANALYSIS],
+                per_label_k={LABEL_PQL_ANALYSIS: k},
+            )
+        finally:
+            vdb.close()
     except Exception:
         logger.warning("fetch_pql_examples: semantic search failed", exc_info=True)
         return []

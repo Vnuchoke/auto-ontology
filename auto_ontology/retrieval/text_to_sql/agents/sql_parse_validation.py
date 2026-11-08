@@ -338,7 +338,11 @@ def quote_known_mixed_case_identifiers(
 
 
 def detect_vacuous_group_by(
-    sql: str, dialect: str | None, database_name: str | None
+    sql: str,
+    dialect: str | None,
+    database_name: str | None,
+    *,
+    connection_id: str | None = None,
 ) -> str:
     """Return a human-readable reason when *sql* groups/partitions by a column
     that's already unique per row — e.g. ``GROUP BY`` (or a window function's
@@ -402,13 +406,17 @@ def detect_vacuous_group_by(
         return ""
 
     for select in parsed.find_all(exp.Select):
-        reason = _check_select_block_vacuous(select, database_name)
+        reason = _check_select_block_vacuous(
+            select, database_name, connection_id=connection_id
+        )
         if reason:
             return reason
     return ""
 
 
-def _check_select_block_vacuous(select: exp.Select, database_name: str | None) -> str:
+def _check_select_block_vacuous(
+    select: exp.Select, database_name: str | None, *, connection_id: str | None = None
+) -> str:
     """Single-SELECT-block half of :func:`detect_vacuous_group_by` — see there
     for the full rationale. Returns ``""`` when this block looks fine."""
     # Only the single-table, no-JOIN case — see docstring.
@@ -426,7 +434,9 @@ def _check_select_block_vacuous(select: exp.Select, database_name: str | None) -
     table_name = table_expr.name
     table_alias = table_expr.alias_or_name
 
-    keys = find_table_key_columns(table_name, database_name)
+    keys = find_table_key_columns(
+        table_name, database_name, connection_id=connection_id
+    )
     # ``unique`` entries are each independently unique per row, so any single
     # one of them appearing in the grouping/filter set is already vacuous.
     # ``pk`` is not: a multi-column (composite) primary key is only unique
@@ -594,6 +604,8 @@ def _many_side_tables(
     select: exp.Select,
     by_key: dict[str, exp.Table],
     database_name: str | None,
+    *,
+    connection_id: str | None = None,
 ) -> set[str]:
     """Lowercased names of tables that are the FK/"many" side of some
     ``JOIN ... ON`` equality in *select*, determined from PK/unique key
@@ -618,8 +630,12 @@ def _many_side_tables(
                 continue
             if table_left.name.lower() == table_right.name.lower():
                 continue  # self-join — not this check's job
-            keys_left = find_table_key_columns(table_left.name, database_name)
-            keys_right = find_table_key_columns(table_right.name, database_name)
+            keys_left = find_table_key_columns(
+                table_left.name, database_name, connection_id=connection_id
+            )
+            keys_right = find_table_key_columns(
+                table_right.name, database_name, connection_id=connection_id
+            )
             unique_left = left.name.lower() in (keys_left["pk"] + keys_left["unique"])
             unique_right = right.name.lower() in (
                 keys_right["pk"] + keys_right["unique"]
@@ -632,7 +648,11 @@ def _many_side_tables(
 
 
 def detect_missing_aggregation(
-    sql: str, dialect: str | None, database_name: str | None
+    sql: str,
+    dialect: str | None,
+    database_name: str | None,
+    *,
+    connection_id: str | None = None,
 ) -> str:
     """Return a human-readable reason when *sql* groups by one table's key
     but also selects a *different*, many-side-joined table's column raw,
@@ -676,7 +696,9 @@ def detect_missing_aggregation(
         return ""
 
     for select in parsed.find_all(exp.Select):
-        reason = _check_select_block_missing_agg(select, database_name)
+        reason = _check_select_block_missing_agg(
+            select, database_name, connection_id=connection_id
+        )
         if reason:
             return reason
     return ""
@@ -707,7 +729,7 @@ def _group_expr_covers(col: exp.Column, group_exprs: list[exp.Expression]) -> bo
 
 
 def _check_select_block_missing_agg(
-    select: exp.Select, database_name: str | None
+    select: exp.Select, database_name: str | None, *, connection_id: str | None = None
 ) -> str:
     """Single-SELECT-block half of :func:`detect_missing_aggregation`."""
     group = select.args.get("group")
@@ -736,7 +758,10 @@ def _check_select_block_missing_agg(
         # safely establish an anchor, so nothing to check against.
         return ""
 
-    many_tables = _many_side_tables(select, by_key, database_name) - grouping_tables
+    many_tables = (
+        _many_side_tables(select, by_key, database_name, connection_id=connection_id)
+        - grouping_tables
+    )
     if not many_tables:
         return ""
 
@@ -796,8 +821,8 @@ class SQLValidationAgent(BaseAgent):
         connector = resolve_connector_from_tables(
             path_state.get("relevant_tables"), connectors
         )
-        schemas_ids = fetch_all_schema_ids()
-        schemas = get_schemas_by_ids(schemas_ids)
+        schemas_ids = fetch_all_schema_ids(connection_id=state["connection_id"])
+        schemas = get_schemas_by_ids(schemas_ids, connection_id=state["connection_id"])
         degenerate_dialect = getattr(connector, "dialect", None)
 
         # Every constructed/reconstructed SQL passes through this node before
@@ -861,7 +886,10 @@ class SQLValidationAgent(BaseAgent):
                 }
 
         validation_result = self._sql_parse_validation(
-            schemas, response.sql_code, dialects
+            schemas,
+            response.sql_code,
+            dialects,
+            connection_id=state.get("connection_id"),
         )
 
         if validation_result.get("error"):
@@ -890,7 +918,10 @@ class SQLValidationAgent(BaseAgent):
             }
 
         vacuous_reason = detect_vacuous_group_by(
-            response.sql_code, degenerate_dialect, path_state.get("target_db")
+            response.sql_code,
+            degenerate_dialect,
+            path_state.get("target_db"),
+            connection_id=state["connection_id"],
         )
         if vacuous_reason:
             self.logger.info(
@@ -911,7 +942,10 @@ class SQLValidationAgent(BaseAgent):
             }
 
         missing_agg_reason = detect_missing_aggregation(
-            response.sql_code, degenerate_dialect, path_state.get("target_db")
+            response.sql_code,
+            degenerate_dialect,
+            path_state.get("target_db"),
+            connection_id=state["connection_id"],
         )
         if missing_agg_reason:
             self.logger.info("Missing aggregation rejected: %s", missing_agg_reason)
@@ -958,13 +992,21 @@ class SQLValidationAgent(BaseAgent):
         )
 
     @staticmethod
-    def _sql_parse_validation(schemas, sql: str, dialects: list[str]) -> dict:
+    def _sql_parse_validation(
+        schemas, sql: str, dialects: list[str], *, connection_id: str | None = None
+    ) -> dict:
         result: dict = {}
+        if not connection_id:
+            return {
+                "error": "source_required: select a connection ID",
+                "another_try": 1,
+            }
         try:
             query_obj = parse_query_single(
                 sql=sql,
                 schemas=schemas,
                 dialects=dialects,
+                connection_id=connection_id,
             )
             if query_obj is None:
                 raise ValueError(

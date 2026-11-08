@@ -20,6 +20,100 @@ from auto_ontology.retrieval.text_to_sql.prompts import SQL_GEN_MAX_ENTITIES
 from auto_ontology.retrieval.text_to_sql.state import AgentState
 
 
+@pytest.fixture(autouse=True)
+def empty_catalog_bridges(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        candidates_preparation,
+        "find_kept_table_bridges",
+        lambda ids, allowed=None, *, connection_id: ([], [], 0),
+    )
+    # These fixtures contain only the selected source; ownership regressions use the real guard below.
+    monkeypatch.setattr(
+        candidates_preparation,
+        "source_owned_hits",
+        lambda hits, label, *, connection_id: [
+            hit for hit in hits if hit.get("connection_id") == connection_id
+        ],
+    )
+
+
+def test_preparation_revalidates_forged_candidate_ids_before_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from auto_ontology.retrieval.text_to_sql import source_hits
+
+    calls: list[str] = []
+
+    def analyses(ids: list[str], *, connection_id: str) -> list[dict]:
+        assert connection_id == "test-source"
+        calls.append(connection_id)
+        return (
+            [{"id": "local", "connection_id": connection_id, "sql": "SELECT local"}]
+            if "local" in ids
+            else []
+        )
+
+    def no_tables(*args: object, connection_id: str, **kwargs: object) -> list[dict]:
+        assert connection_id == "test-source"
+        return []
+
+    def filter_tables(
+        self: object,
+        state: dict,
+        question: str,
+        tables: list[dict],
+        custom: list[dict],
+        paths: list[dict],
+    ) -> tuple[list[dict], str]:
+        assert [item["id"] for item in custom] == ["local"]
+        assert "FOREIGN B" not in str(custom)
+        return tables, ""
+
+    monkeypatch.setattr(
+        candidates_preparation, "source_owned_hits", source_hits.source_owned_hits
+    )
+    monkeypatch.setattr(source_hits, "fetch_custom_analyses_with_sql", analyses)
+    monkeypatch.setattr(
+        candidates_preparation, "fetch_custom_analyses_with_sql", analyses
+    )
+    monkeypatch.setattr(
+        candidates_preparation, "fetch_tables_from_custom_analyses", no_tables
+    )
+    monkeypatch.setattr(
+        candidates_preparation, "get_relevant_tables_from_candidates", no_tables
+    )
+    monkeypatch.setattr(
+        candidates_preparation,
+        "find_connected_junction_tables",
+        lambda ids, *, connection_id: ([], []),
+    )
+    monkeypatch.setattr(
+        CandidatePreparationAgent, "_retrieve_additional_tables", no_tables
+    )
+    monkeypatch.setattr(
+        CandidatePreparationAgent, "_filter_tables_by_relevance", filter_tables
+    )
+    result = CandidatePreparationAgent().execute(
+        {
+            "connection_id": "test-source",
+            "initial_question": "q",
+            "path_state": {
+                "target_db": "sales",
+                "retrieved_custom_analyses": [
+                    {"id": "local", "connection_id": "test-source"},
+                    {
+                        "id": "foreign",
+                        "connection_id": "test-source",
+                        "text": "FOREIGN B",
+                    },
+                ],
+            },
+        }
+    )
+    assert calls == ["test-source", "test-source"]
+    assert [item["id"] for item in result["path_state"]["custom_analyses"]] == ["local"]
+
+
 def test_anchor_maps_evidence_to_schema_table_column(
     monkeypatch,
 ) -> None:
@@ -128,6 +222,7 @@ def test_linked_tables_are_backfilled_before_relevance_filter(
 ) -> None:
     captured_tables: list[dict] = []
     linked_table = {
+        "connection_id": "test-source",
         "id": "linked",
         "name": "orders",
         "database_name": "db",
@@ -153,7 +248,7 @@ def test_linked_tables_are_backfilled_before_relevance_filter(
     monkeypatch.setattr(
         CandidatePreparationAgent,
         "_retrieve_additional_tables",
-        lambda self, retriever, question, entities, target_db: [],
+        lambda self, retriever, question, entities, target_db, **kwargs: [],
     )
 
     def capture_filter(
@@ -173,48 +268,53 @@ def test_linked_tables_are_backfilled_before_relevance_filter(
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_custom_analyses_with_sql",
-        lambda ids: [{"id": "analysis"}] if source == "custom_analysis" else [],
+        lambda ids, **kwargs: (
+            [{"id": "analysis"}] if source == "custom_analysis" else []
+        ),
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_tables_from_custom_analyses",
-        lambda ids: [linked_table] if source == "custom_analysis" else [],
+        lambda ids, **kwargs: [linked_table] if source == "custom_analysis" else [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_sql_attributes_with_sql",
-        lambda ids: [{"id": "attribute"}] if source == "sql_attribute" else [],
+        lambda ids, **kwargs: (
+            [{"id": "attribute"}] if source == "sql_attribute" else []
+        ),
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_tables_from_sql_attributes",
-        lambda ids: [linked_table] if source == "sql_attribute" else [],
+        lambda ids, **kwargs: [linked_table] if source == "sql_attribute" else [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "get_relevant_tables_from_candidates",
-        lambda candidates: [],
+        lambda candidates, **kwargs: [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_tables_by_ids",
-        lambda ids: [enriched_table] if ids == ["linked"] else [],
+        lambda ids, **kwargs: [enriched_table] if ids == ["linked"] else [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "find_connected_junction_tables",
-        lambda ids: ([], []),
+        lambda ids, **kwargs: ([], []),
     )
     monkeypatch.setattr(
         candidates_preparation,
         "find_kept_table_bridges",
-        lambda kept_ids, candidate_ids: ([], [], 0),
+        lambda kept_ids, candidate_ids, **kwargs: ([], [], 0),
     )
 
     state = cast(
         AgentState,
         {
             "initial_question": "Count orders",
+            "connection_id": "test-source",
             "data_retriever": object(),
             "path_state": {
                 "target_db": "db",
@@ -223,7 +323,12 @@ def test_linked_tables_are_backfilled_before_relevance_filter(
                     if source == "custom_analysis"
                     else "retrieved_sql_attributes"
                 ): [
-                    {"id": ("analysis" if source == "custom_analysis" else "attribute")}
+                    {
+                        "id": (
+                            "analysis" if source == "custom_analysis" else "attribute"
+                        ),
+                        "connection_id": "test-source",
+                    }
                 ],
             },
         },
@@ -253,7 +358,7 @@ def test_retrieve_additional_tables_searches_question_and_entities(
     )
 
     out = CandidatePreparationAgent()._retrieve_additional_tables(
-        object(), "q", ["e1", "e2"], "db"
+        object(), "q", ["e1", "e2"], "db", connection_id="test-source"
     )
 
     # The searches run on a thread pool, so the order they are called in is the
@@ -296,7 +401,7 @@ def test_a_table_two_searches_return_merges_the_same_way_whichever_finishes_firs
     )
 
     out = CandidatePreparationAgent()._retrieve_additional_tables(
-        object(), "q", ["e1"], "db"
+        object(), "q", ["e1"], "db", connection_id="test-source"
     )
 
     assert [t["id"] for t in out] == ["t1"]
@@ -307,11 +412,24 @@ def test_additional_table_retrieve_starts_before_anchor_returns(monkeypatch) -> 
     retrieve_started = threading.Event()
     release_retrieve = threading.Event()
     retrieve_was_running = []
+    persisted_extra = {
+        "id": "extra",
+        "name": "extra",
+        "database_name": "db",
+        "connection_id": "test-source",
+    }
 
-    def fake_retrieve(self, retriever, question, entities, target_db):
+    def fake_retrieve(self, retriever, question, entities, target_db, **kwargs):
         retrieve_started.set()
         assert release_retrieve.wait(timeout=2)
-        return [{"id": "extra", "name": "extra", "database_name": "db"}]
+        return [
+            {
+                "id": "extra",
+                "name": "extra",
+                "database_name": "db",
+                "connection_id": "test-source",
+            }
+        ]
 
     def fake_anchor(self, state, question, contexts):
         retrieve_was_running.append(retrieve_started.wait(timeout=2))
@@ -331,12 +449,14 @@ def test_additional_table_retrieve_starts_before_anchor_returns(monkeypatch) -> 
         ),
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_custom_analyses_with_sql", lambda ids: []
+        candidates_preparation,
+        "fetch_custom_analyses_with_sql",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_attr_column_contexts",
-        lambda ids, database_name=None: {
+        lambda ids, database_name=None, **kwargs: {
             "a1": {
                 "attr_name": "Revenue",
                 "col_name": "rev",
@@ -348,30 +468,39 @@ def test_additional_table_retrieve_starts_before_anchor_returns(monkeypatch) -> 
             }
         },
     )
-    monkeypatch.setattr(candidates_preparation, "fetch_term_synonyms", lambda ids: {})
+    monkeypatch.setattr(
+        candidates_preparation, "fetch_term_synonyms", lambda ids, **kwargs: {}
+    )
     monkeypatch.setattr(
         candidates_preparation,
         "get_relevant_tables_from_candidates",
-        lambda candidates: [],
+        lambda candidates, **kwargs: [],
     )
-    monkeypatch.setattr(candidates_preparation, "fetch_tables_by_ids", lambda ids: [])
+    monkeypatch.setattr(
+        candidates_preparation,
+        "fetch_tables_by_ids",
+        lambda ids, **kwargs: [persisted_extra] if "extra" in ids else [],
+    )
     monkeypatch.setattr(candidates_preparation, "find_join_path", lambda *a, **k: [])
     monkeypatch.setattr(
         candidates_preparation,
         "find_connected_junction_tables",
-        lambda ids: ([], []),
+        lambda ids, **kwargs: ([], []),
     )
 
     state = cast(
         AgentState,
         {
             "initial_question": "question",
+            "connection_id": "test-source",
             "llm": object(),
             "data_retriever": object(),
             "path_state": {
                 "entities": ["revenue"],
                 "target_db": "db",
-                "retrieved_column_attributes": [{"id": "a1"}],
+                "retrieved_column_attributes": [
+                    {"id": "a1", "connection_id": "test-source"}
+                ],
             },
         },
     )
@@ -385,6 +514,7 @@ def test_additional_table_retrieve_starts_before_anchor_returns(monkeypatch) -> 
 
 def test_connected_junctions_are_forced_in_with_their_join_hops(monkeypatch) -> None:
     base = {
+        "connection_id": "test-source",
         "id": "base",
         "name": "orders",
         "schema_name": "public",
@@ -392,6 +522,7 @@ def test_connected_junctions_are_forced_in_with_their_join_hops(monkeypatch) -> 
         "columns": [{"name": "id", "sample_values": [1]}],
     }
     junction = {
+        "connection_id": "test-source",
         "id": "junction",
         "name": "order_tag",
         "schema_name": "public",
@@ -410,7 +541,7 @@ def test_connected_junctions_are_forced_in_with_their_join_hops(monkeypatch) -> 
     monkeypatch.setattr(
         CandidatePreparationAgent,
         "_retrieve_additional_tables",
-        lambda self, retriever, question, entities, target_db: [],
+        lambda self, retriever, question, entities, target_db, **kwargs: [],
     )
     monkeypatch.setattr(
         CandidatePreparationAgent,
@@ -421,31 +552,36 @@ def test_connected_junctions_are_forced_in_with_their_join_hops(monkeypatch) -> 
         ),
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_custom_analyses_with_sql", lambda ids: []
+        candidates_preparation,
+        "fetch_custom_analyses_with_sql",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_tables_from_custom_analyses", lambda ids: []
+        candidates_preparation,
+        "fetch_tables_from_custom_analyses",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "get_relevant_tables_from_candidates",
-        lambda candidates: [base],
+        lambda candidates, **kwargs: [base],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_tables_by_ids",
-        lambda ids: [junction] if ids == ["junction"] else [],
+        lambda ids, **kwargs: [junction] if ids == ["junction"] else [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "find_connected_junction_tables",
-        lambda ids: ([{"id": "junction", "name": "order_tag"}], [[hop]]),
+        lambda ids, **kwargs: ([{"id": "junction", "name": "order_tag"}], [[hop]]),
     )
 
     state = cast(
         AgentState,
         {
             "initial_question": "orders and their tags",
+            "connection_id": "test-source",
             "data_retriever": object(),
             "path_state": {
                 "target_db": "db",
@@ -465,6 +601,7 @@ def test_connected_junctions_are_forced_in_with_their_join_hops(monkeypatch) -> 
 
 def test_anchors_naming_a_column_in_scope_are_dropped(monkeypatch) -> None:
     enrollment = {
+        "connection_id": "test-source",
         "id": "enrollment",
         "name": "enrollment",
         "schema_name": "public",
@@ -489,7 +626,7 @@ def test_anchors_naming_a_column_in_scope_are_dropped(monkeypatch) -> None:
     monkeypatch.setattr(
         CandidatePreparationAgent,
         "_retrieve_additional_tables",
-        lambda self, retriever, question, entities, target_db: [],
+        lambda self, retriever, question, entities, target_db, **kwargs: [],
     )
     monkeypatch.setattr(
         CandidatePreparationAgent,
@@ -500,27 +637,38 @@ def test_anchors_naming_a_column_in_scope_are_dropped(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_custom_analyses_with_sql", lambda ids: []
+        candidates_preparation,
+        "fetch_custom_analyses_with_sql",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_tables_from_custom_analyses", lambda ids: []
+        candidates_preparation,
+        "fetch_tables_from_custom_analyses",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "get_relevant_tables_from_candidates",
-        lambda candidates: [enrollment],
-    )
-    monkeypatch.setattr(candidates_preparation, "fetch_tables_by_ids", lambda ids: [])
-    monkeypatch.setattr(
-        candidates_preparation, "find_table_id_by_name", lambda name, db=None: None
+        lambda candidates, **kwargs: [enrollment],
     )
     monkeypatch.setattr(
-        candidates_preparation, "find_connected_junction_tables", lambda ids: ([], [])
+        candidates_preparation, "fetch_tables_by_ids", lambda ids, **kwargs: []
+    )
+    monkeypatch.setattr(
+        candidates_preparation,
+        "find_table_id_by_name",
+        lambda name, db=None, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        candidates_preparation,
+        "find_connected_junction_tables",
+        lambda ids, **kwargs: ([], []),
     )
 
     state = cast(
         AgentState,
         {
+            "connection_id": "test-source",
             "initial_question": (
                 "Which region has the highest full-time headcount in Northside?"
             ),
@@ -541,6 +689,7 @@ def test_the_table_an_anchor_points_at_reaches_the_relevance_filter(
 ) -> None:
     """q758's shape: the anchor found 'Human' in a table retrieval never saw."""
     superhero = {
+        "connection_id": "test-source",
         "id": "superhero",
         "name": "superhero",
         "schema_name": "main",
@@ -548,6 +697,7 @@ def test_the_table_an_anchor_points_at_reaches_the_relevance_filter(
         "columns": [{"name": "race_id"}, {"name": "height_cm"}],
     }
     race = {
+        "connection_id": "test-source",
         "id": "race",
         "name": "race",
         "schema_name": "main",
@@ -566,7 +716,7 @@ def test_the_table_an_anchor_points_at_reaches_the_relevance_filter(
     monkeypatch.setattr(
         CandidatePreparationAgent,
         "_retrieve_additional_tables",
-        lambda self, retriever, question, entities, target_db: [],
+        lambda self, retriever, question, entities, target_db, **kwargs: [],
     )
 
     def record_and_keep(
@@ -584,32 +734,38 @@ def test_the_table_an_anchor_points_at_reaches_the_relevance_filter(
         CandidatePreparationAgent, "_filter_tables_by_relevance", record_and_keep
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_custom_analyses_with_sql", lambda ids: []
+        candidates_preparation,
+        "fetch_custom_analyses_with_sql",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
-        candidates_preparation, "fetch_tables_from_custom_analyses", lambda ids: []
+        candidates_preparation,
+        "fetch_tables_from_custom_analyses",
+        lambda ids, **kwargs: [],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "get_relevant_tables_from_candidates",
-        lambda candidates: [superhero],
+        lambda candidates, **kwargs: [superhero],
     )
     monkeypatch.setattr(
         candidates_preparation,
         "find_table_id_by_name",
-        lambda name, db=None: "race" if name == "race" else None,
+        lambda name, db=None, **kwargs: "race" if name == "race" else None,
     )
     monkeypatch.setattr(
         candidates_preparation,
         "fetch_tables_by_ids",
-        lambda ids: [race] if list(ids) == ["race"] else [],
+        lambda ids, **kwargs: [race] if list(ids) == ["race"] else [],
     )
     monkeypatch.setattr(
-        candidates_preparation, "find_connected_junction_tables", lambda ids: ([], [])
+        candidates_preparation,
+        "find_connected_junction_tables",
+        lambda ids, **kwargs: ([], []),
     )
     bridge_calls: list[list[str]] = []
 
-    def fake_bridges(ids, allowed=None):
+    def fake_bridges(ids, allowed=None, **kwargs):
         bridge_calls.append(list(ids))
         return [], [], 0
 
@@ -619,6 +775,7 @@ def test_the_table_an_anchor_points_at_reaches_the_relevance_filter(
         AgentState,
         {
             "initial_question": "hair colour of the human superhero 185 cm tall",
+            "connection_id": "test-source",
             "data_retriever": object(),
             "value_anchors": [human],
             "path_state": {

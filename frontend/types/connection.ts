@@ -99,6 +99,8 @@ export type ConnectionParams = (
 
 /** A stored connection returned by the API. */
 export type Connection = {
+	connection_id: string;
+	display_label: string;
 	database_name: string;
 	connection: ConnectionParams;
 };

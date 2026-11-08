@@ -49,7 +49,11 @@ def db_name() -> Iterator[str]:
 
 
 def _tables(db_name: str, schema: str, *names: str) -> dict[str, str]:
-    db = upsert_row("Database", {"name": db_name}, {"name": db_name})
+    db = upsert_row(
+        "Database",
+        {"id": f"root-{db_name}"},
+        {"id": f"root-{db_name}", "name": db_name, "display_label": db_name},
+    )
     schema_id = upsert_row("Schema", {"name": schema}, {"name": schema}, parent_id=db)
     return {
         name: upsert_row("Table", {"name": name}, {"name": name}, parent_id=schema_id)
@@ -82,7 +86,7 @@ def test_a_key_listed_alphabetically_is_stored_in_key_order(db_name: str) -> Non
         columns=_PK_COLUMNS,
     )
 
-    populate_pks(pks, db_name)
+    populate_pks(pks, f"root-{db_name}")
 
     assert _stored_pk(ids["LINEITEM"]) == ["L_ORDERKEY", "L_LINENUMBER"]
     assert _stored_pk(ids["PARTSUPP"]) == ["PS_PARTKEY", "PS_SUPPKEY"]
@@ -102,7 +106,7 @@ def test_a_sqlite_key_declared_out_of_column_order_is_stored_in_key_order(
     conn.close()
     ids = _tables(db_name, "main", "line")
 
-    populate_pks(SQLiteDatabase(f"sqlite:///{path}").get_pks(), db_name)
+    populate_pks(SQLiteDatabase(f"sqlite:///{path}").get_pks(), f"root-{db_name}")
 
     assert _stored_pk(ids["line"]) == ["order_id", "item_id"]
 
@@ -114,6 +118,6 @@ def test_rows_without_a_position_keep_the_order_they_arrived_in(db_name: str) ->
         columns=_PK_COLUMNS[:3],
     )
 
-    populate_pks(pks, db_name)
+    populate_pks(pks, f"root-{db_name}")
 
     assert _stored_pk(ids["orders"]) == ["region", "id"]

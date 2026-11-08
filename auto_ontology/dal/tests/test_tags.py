@@ -481,7 +481,7 @@ class Tagged:
         self.prefix = prefix
         self.tag = create_tag(name=f"{prefix}-pii")["id"]
 
-        self.database = _add(s.catalog_database, name=prefix)
+        self.database = _add(s.catalog_database, name=prefix, display_label=prefix)
         self.schema = _add(s.catalog_schema, database_id=self.database, name="shop")
         self.table = _add(s.catalog_table, schema_id=self.schema, name="orders")
         self.column = _add(s.catalog_column, table_id=self.table, name="total")

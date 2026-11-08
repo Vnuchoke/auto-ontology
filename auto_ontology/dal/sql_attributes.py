@@ -27,7 +27,8 @@ from sqlalchemy.dialects.postgresql import insert
 
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import store, write_transaction
-from auto_ontology.dal.sql_fragments import column_description_expr
+from auto_ontology.dal.source_scope import definition_source_scope
+from auto_ontology.dal.datasources import query_column_description_expr
 from auto_ontology.dal.tags import TARGET_SQL_ATTRIBUTE, fetch_tags_map
 from auto_ontology.dal.users import resolve_accessible_catalog_ids
 from auto_ontology.server.sql_utils import SqlParseError
@@ -106,7 +107,12 @@ _SQL_TEXT = (
             s.sql_query, s.sql_query.c.id == s.sql_attribute__sql.c.sql_query_id
         )
     )
-    .where(s.sql_attribute__sql.c.attribute_id == s.sql_attribute.c.id)
+    .where(
+        s.sql_attribute__sql.c.attribute_id == s.sql_attribute.c.id,
+        s.sql_query.c.connection_id.is_not_distinct_from(
+            s.sql_attribute.c.connection_id
+        ),
+    )
     .order_by(s.sql_query.c.id)
     .limit(1)
     .correlate(s.sql_attribute)
@@ -134,6 +140,7 @@ def _attribute_select():
     return (
         select(
             s.sql_attribute.c.id,
+            s.sql_attribute.c.connection_id,
             s.sql_attribute.c.name,
             s.sql_attribute.c.description,
             s.sql_attribute.c.description_suggestion,
@@ -167,8 +174,9 @@ def _query_sql_attributes(
     order_by: Any = None,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Every SqlAttribute read goes through here.
+    """Every SqlAttribute inspection read goes through here.
 
     Anchor on *attr_id* or *term_id* — mutually exclusive — or neither for all
     of them. *skip* and *limit* page *order_by*; only pass them with an
@@ -176,6 +184,8 @@ def _query_sql_attributes(
     between requests.
     """
     statement = _attribute_select()
+    if connection_id is not None:
+        statement = statement.where(_source_scope(connection_id))
     if attr_id is not None:
         statement = statement.where(s.sql_attribute.c.id == attr_id)
     if term_id is not None:
@@ -199,15 +209,25 @@ def _query_sql_attributes(
 # ---------------------------------------------------------------------------
 
 
-def list_sql_attributes() -> list[dict[str, Any]]:
-    """Every SqlAttribute, with its Term and SQL text."""
-    return _query_sql_attributes(order_by=(s.sql_attribute.c.name,))
+def _source_scope(connection_id: str) -> Any:
+    return definition_source_scope(
+        s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+    )
+
+
+def list_sql_attributes(*, connection_id: str | None = None) -> list[dict[str, Any]]:
+    """Inspect attributes, optionally source-scoped; unscoped reads retain legacy."""
+    return _query_sql_attributes(
+        order_by=(s.sql_attribute.c.name,), connection_id=connection_id
+    )
 
 
 def fetch_sql_attribute_counts(
     zone_ids: list[str] | None = None,
     data_ids_by_zone: dict[str, set[str]] | None = None,
     term_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """``[{term_id, count}]``, under the same zone scoping as every read.
 
@@ -233,6 +253,8 @@ def fetch_sql_attribute_counts(
         .where(_has_sql())
         .group_by(s.term.c.id)
     )
+    if connection_id is not None:
+        statement = statement.where(_source_scope(connection_id))
     scope = _zone_scope(zone_ids, data_ids_by_zone)
     if scope is not None:
         statement = statement.where(scope)
@@ -248,6 +270,8 @@ def fetch_sql_attribute_counts(
 def get_full_sql_attribute_by_id(
     attr_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> dict[str, Any] | None:
     """One SqlAttribute with its Term, SQL text, and the zones covering it.
 
@@ -261,7 +285,9 @@ def get_full_sql_attribute_by_id(
     is how an admin sees a disabled zone at all — with ``enabled: False`` so the
     UI can render it as retired rather than active.
     """
-    rows = _query_sql_attributes(attr_id=attr_id, zone_ids=zone_ids)
+    rows = _query_sql_attributes(
+        attr_id=attr_id, zone_ids=zone_ids, connection_id=connection_id
+    )
     if not rows:
         return None
     result = rows[0]
@@ -316,6 +342,7 @@ def fetch_sql_attributes_by_term_id(
     *,
     skip: int = 0,
     limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """One Term's SqlAttributes, each scoped independently.
 
@@ -332,6 +359,7 @@ def fetch_sql_attributes_by_term_id(
         order_by=(s.sql_attribute.c.name, s.sql_attribute.c.id),
         skip=skip,
         limit=limit,
+        connection_id=connection_id,
     )
     tags = fetch_tags_map(TARGET_SQL_ATTRIBUTE, [row["id"] for row in rows])
     return [{**row, "tags": tags.get(row["id"], [])} for row in rows]
@@ -340,6 +368,8 @@ def fetch_sql_attributes_by_term_id(
 def count_sql_attributes_by_term_id(
     term_id: str,
     zone_ids: list[str] | None = None,
+    *,
+    connection_id: str | None = None,
 ) -> int:
     """The unpaged size of :func:`fetch_sql_attributes_by_term_id`.
 
@@ -356,6 +386,8 @@ def count_sql_attributes_by_term_id(
         )
         .where(s.sql_attribute__term.c.term_id == term_id, _has_sql())
     )
+    if connection_id is not None:
+        statement = statement.where(_source_scope(connection_id))
     scope = _zone_scope(zone_ids)
     if scope is not None:
         statement = statement.where(scope)
@@ -364,14 +396,16 @@ def count_sql_attributes_by_term_id(
     return int(rows[0]["total"]) if rows else 0
 
 
-def find_attr_by_name(name: str, exclude_id: str | None) -> dict[str, str] | None:
+def find_attr_by_name(
+    name: str, exclude_id: str | None, *, connection_id: str
+) -> dict[str, str] | None:
     """Another SqlAttribute already using *name*, or ``None``.
 
     *exclude_id* is the attribute being edited — without it, renaming an
     attribute to its own name reports a conflict with itself.
     """
     statement = select(s.sql_attribute.c.id, s.sql_attribute.c.name).where(
-        s.sql_attribute.c.name == name
+        s.sql_attribute.c.name == name, s.sql_attribute.c.connection_id == connection_id
     )
     if exclude_id is not None:
         statement = statement.where(s.sql_attribute.c.id != exclude_id)
@@ -384,6 +418,7 @@ def find_attr_by_expression(
     term_id: str,
     expression: str,
     exclude_id: str | None,
+    connection_id: str,
 ) -> dict[str, str] | None:
     """A same-term SqlAttribute with equivalent SQL, or ``None``.
 
@@ -408,7 +443,10 @@ def find_attr_by_expression(
                 s.sql_attribute__term.c.attribute_id == s.sql_attribute.c.id,
             )
         )
-        .where(s.sql_attribute__term.c.term_id == term_id)
+        .where(
+            s.sql_attribute__term.c.term_id == term_id,
+            s.sql_attribute.c.connection_id == connection_id,
+        )
     )
     if exclude_id is not None:
         statement = statement.where(s.sql_attribute.c.id != exclude_id)
@@ -563,16 +601,21 @@ def delete_sql_attribute_node(attr_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
+def fetch_sql_attributes_with_sql(
+    attr_ids: list[str], *, connection_id: str | None = None
+) -> list[dict[str, str]]:
     """``id, name, description, expression, sql, term_name`` per attribute.
 
     One row per attribute even when several statements or terms match — the
     first of each id wins, ordered so "first" is reproducible.
 
+    Query context requires connection_id; without it nothing is returned.
+    NULL-owned legacy or partially foreign definitions are excluded as a whole.
+
     Returns ``[]`` on failure — this feeds retrieval context, where losing the
     context beats losing the answer.
     """
-    if not attr_ids:
+    if not attr_ids or not connection_id:
         return []
     try:
         rows = store().query_read(
@@ -590,7 +633,11 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
                     s.sql_attribute__term.c.attribute_id == s.sql_attribute.c.id,
                 ).join(s.term, s.term.c.id == s.sql_attribute__term.c.term_id)
             )
-            .where(s.sql_attribute.c.id.in_(list(attr_ids)), _has_sql())
+            .where(
+                s.sql_attribute.c.id.in_(list(attr_ids)),
+                _has_sql(),
+                _source_scope(connection_id),
+            )
             .order_by(s.sql_attribute.c.id, s.term.c.id)
         )
     except Exception:
@@ -607,6 +654,7 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
         result.append(
             {
                 "id": attr_id,
+                "connection_id": connection_id,
                 "name": row["name"] or "",
                 "description": row["description"] or "",
                 "expression": row["expression"] or "",
@@ -619,13 +667,16 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
 
 def fetch_tables_from_sql_attributes(
     attr_ids: list[str],
+    *,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """The tables these attributes' SQL actually references, with column summaries.
 
     Deduplicated by table id, since several attributes commonly reference the
     same table. Returns ``[]`` on failure, as above.
+    A connection_id is mandatory for query context; names never select a source.
     """
-    if not attr_ids:
+    if not attr_ids or not connection_id:
         return []
     try:
         rows = store().query_read(
@@ -635,6 +686,7 @@ def fetch_tables_from_sql_attributes(
                 s.catalog_table.c.description,
                 s.catalog_table.c.pk,
                 s.catalog_database.c.name.label("database_name"),
+                s.catalog_database.c.id.label("connection_id"),
                 s.catalog_schema.c.name.label("schema_name"),
                 s.catalog_column.c.name.label("column_name"),
                 s.catalog_column.c.data_type,
@@ -642,7 +694,9 @@ def fetch_tables_from_sql_attributes(
                 # ORDER BY key to be there. Dropped again when the rows are
                 # folded into nested column lists below.
                 s.catalog_column.c.ordinal_position,
-                column_description_expr().label("column_description"),
+                query_column_description_expr(connection_id).label(
+                    "column_description"
+                ),
             )
             .select_from(
                 s.sql_attribute__sql.join(
@@ -667,7 +721,13 @@ def fetch_tables_from_sql_attributes(
                     s.catalog_column.c.table_id == s.catalog_table.c.id,
                 )
             )
-            .where(s.sql_attribute__sql.c.attribute_id.in_(list(attr_ids)))
+            .where(
+                s.sql_attribute__sql.c.attribute_id.in_(list(attr_ids)),
+                s.sql_attribute__sql.c.attribute_id.in_(
+                    select(s.sql_attribute.c.id).where(_source_scope(connection_id))
+                ),
+                s.catalog_database.c.id == connection_id,
+            )
             .distinct()
             .order_by(s.catalog_table.c.id, s.catalog_column.c.ordinal_position)
         )
@@ -684,6 +744,7 @@ def fetch_tables_from_sql_attributes(
                 "name": row["name"] or "",
                 "description": row["description"] or "",
                 "database_name": row["database_name"] or "",
+                "connection_id": row["connection_id"],
                 "schema_name": row["schema_name"] or "",
                 "label": "Table",
                 # The prediction graph keys its entities on this: a table
@@ -710,7 +771,9 @@ def fetch_tables_from_sql_attributes(
 # ---------------------------------------------------------------------------
 
 
-def fetch_sql_attribute_docs(attr_id: str) -> list[dict[str, Any]]:
+def fetch_sql_attribute_docs(
+    attr_id: str, *, connection_id: str
+) -> list[dict[str, Any]]:
     """One attribute as embedding-ready docs, or ``[]`` if it has no statement.
 
     The text format is load-bearing — it is what gets embedded, so changing the
@@ -718,6 +781,8 @@ def fetch_sql_attribute_docs(attr_id: str) -> list[dict[str, Any]]:
     vector for these attributes. Reproduced literally, including the blank
     description being omitted rather than rendered as an empty clause.
     """
+    if not connection_id:
+        raise ValueError("connection_id is required for SQL attribute embeddings")
     rows = store().query_read(
         select(
             s.sql_attribute.c.id,
@@ -733,7 +798,9 @@ def fetch_sql_attribute_docs(attr_id: str) -> list[dict[str, Any]]:
                 s.sql_attribute__term.c.attribute_id == s.sql_attribute.c.id,
             ).join(s.term, s.term.c.id == s.sql_attribute__term.c.term_id)
         )
-        .where(s.sql_attribute.c.id == attr_id, _has_sql())
+        .where(
+            s.sql_attribute.c.id == attr_id, _has_sql(), _source_scope(connection_id)
+        )
         .order_by(s.term.c.id)
     )
     docs: list[dict[str, Any]] = []
@@ -752,6 +819,7 @@ def fetch_sql_attribute_docs(attr_id: str) -> list[dict[str, Any]]:
                 "label": "SqlAttribute",
                 "id": row["id"],
                 "source": row["source"] or "",
+                "connection_id": connection_id,
             }
         )
     return docs

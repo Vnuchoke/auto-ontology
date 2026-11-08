@@ -213,12 +213,15 @@ def _generate_bridge_sql_attribute(
     return result
 
 
-def build_bridge_tables_sql_attributes(database_name: str) -> int:
+def build_bridge_tables_sql_attributes(connection_id: str) -> int:
     """Discover bridge tables and persist join-pattern SqlAttributes.
 
     Returns the number of newly created SqlAttribute nodes.
     """
-    candidates = fetch_bridge_table_candidates(database_name)
+    from auto_ontology.semantic.domain import selected_source
+
+    database_name = selected_source(connection_id).database_name
+    candidates = fetch_bridge_table_candidates(connection_id)
     if not candidates:
         logger.info("No eligible bridge tables found for database %r.", database_name)
         return 0
@@ -267,7 +270,7 @@ def build_bridge_tables_sql_attributes(database_name: str) -> int:
                 description=proposal.description,
                 expression=proposal.expression,
                 term_id=term_id,
-                connector=database_name,
+                connection_id=connection_id,
                 source=SQL_ATTR_SOURCE_BRIDGE,
             )
         except SqlAttributeNameConflict:

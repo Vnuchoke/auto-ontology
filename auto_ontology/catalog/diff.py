@@ -88,9 +88,9 @@ def update_diff_from_existing_schema(new_schema, latest_timestamp):
     try:
         # load existing schema
         schema_name = new_schema.get_schema_name()
-        database_name = new_schema.get_database_name()
-
-        existing_schema = load_schema_from_graph(database_name, schema_name)
+        existing_schema = load_schema_from_graph(
+            new_schema.get_connection_id(), schema_name, new_schema.get_db_node()
+        )
         if existing_schema is None:
             return
 
