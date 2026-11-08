@@ -5,10 +5,10 @@
 services:
   postgres:
     image: pgvector/pgvector:pg17
-    container_name: postgres
+    container_name: auto-ontology-postgres
     restart: unless-stopped
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - "127.0.0.1:${POSTGRES_PORT}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -23,10 +23,10 @@ services:
 
   pgadmin:
     image: dpage/pgadmin4:latest
-    container_name: pgadmin
+    container_name: auto-ontology-pgadmin
     restart: unless-stopped
     ports:
-      - "5050:80"
+      - "127.0.0.1:18350:80"
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
@@ -43,8 +43,8 @@ services:
     image: auto-ontology:latest
     container_name: auto-ontology
     restart: unless-stopped
-    ports:
-      - "3001:3001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
@@ -72,8 +72,8 @@ services:
     container_name: auto-ontology-ingestion-service
     restart: unless-stopped
     command: ["ingestion_service"]
-    ports:
-      - "3002:3002"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # The image healthcheck targets the backend (:3001/api/health/live); the
     # ingestion service serves its own on :3002. Liveness, not /health — that
     # one probes Postgres, and a container healthcheck gated on a dependency
@@ -157,7 +157,7 @@ services:
     container_name: auto-ontology-frontend
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:18300:3000"
     env_file:
       - .env
     environment:
@@ -171,6 +171,22 @@ services:
         condition: service_healthy
       frontend-migrate:
         condition: service_completed_successfully
+
+  auto-ontology-mcp:
+    build:
+      context: ./mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18303:3003"
+    environment:
+      AUTO_ONTOLOGY_API_URL: http://auto-ontology-frontend:3000
+      AUTO_ONTOLOGY_AUTH_URL: ${APP_URL}
+      AUTO_ONTOLOGY_MCP_PUBLIC_URL: ${AUTO_ONTOLOGY_MCP_PUBLIC_URL}
+      AUTO_ONTOLOGY_MCP_HOST: "0.0.0.0"
+      AUTO_ONTOLOGY_MCP_PORT: "3003"
+    depends_on:
+      auto-ontology-frontend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

@@ -67,6 +67,8 @@ class Settings:
     # the server names for itself is the one they dialled — so a bind address
     # that is not how anyone addresses it needs this set explicitly.
     public_url: str = ""
+    # Browser-reachable authorization server when the API uses an internal URL.
+    auth_url: str = ""
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -126,13 +128,14 @@ def load_settings() -> Settings:
             "use the copy shipped with auto-ontology-mcp, or reinstall the package."
         )
 
-    api_url = (os.environ.get("AUTO_ONTOLOGY_API_URL") or DEFAULT_API_URL).strip()
+    api_url = (
+        (os.environ.get("AUTO_ONTOLOGY_API_URL") or DEFAULT_API_URL).strip().rstrip("/")
+    )
     host = (os.environ.get("AUTO_ONTOLOGY_MCP_HOST") or DEFAULT_HOST).strip()
     port = _port("AUTO_ONTOLOGY_MCP_PORT", DEFAULT_PORT)
 
     return Settings(
-        # Trailing slashes make httpx base_url joins produce doubled separators.
-        api_url=api_url.rstrip("/"),
+        api_url=api_url,
         spec_path=spec_path,
         host=host,
         port=port,
@@ -141,6 +144,8 @@ def load_settings() -> Settings:
             "AUTO_ONTOLOGY_MCP_CHAT_TIMEOUT_S", DEFAULT_CHAT_TIMEOUT_S
         ),
         public_url=_public_url(host, port),
+        auth_url=(os.environ.get("AUTO_ONTOLOGY_AUTH_URL") or "").strip().rstrip("/")
+        or api_url,
     )
 
 

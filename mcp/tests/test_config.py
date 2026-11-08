@@ -21,6 +21,7 @@ from auto_ontology_mcp.config import (
 
 _VARS = (
     "AUTO_ONTOLOGY_API_URL",
+    "AUTO_ONTOLOGY_AUTH_URL",
     "AUTO_ONTOLOGY_API_TOKEN",
     "AUTO_ONTOLOGY_OPENAPI_SPEC",
     "AUTO_ONTOLOGY_MCP_HOST",
@@ -44,6 +45,7 @@ def test_starts_with_nothing_configured() -> None:
     settings = load_settings()
 
     assert settings.api_url == "http://localhost:3000"
+    assert settings.auth_url == settings.api_url
     assert settings.port == DEFAULT_PORT
     assert settings.timeout_s == DEFAULT_TIMEOUT_S
     assert settings.chat_timeout_s == DEFAULT_CHAT_TIMEOUT_S
@@ -71,6 +73,47 @@ def test_strips_trailing_slash_from_api_url(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("AUTO_ONTOLOGY_API_URL", "https://auto_ontology.example.com/")
 
     assert load_settings().api_url == "https://auto_ontology.example.com"
+
+
+@pytest.mark.parametrize("value", [None, "", "  \t  "])
+def test_auth_url_defaults_to_normalized_api_url(
+    monkeypatch: MonkeyPatch, value: str | None
+) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_API_URL", "  http://frontend:3000///  ")
+    if value is not None:
+        monkeypatch.setenv("AUTO_ONTOLOGY_AUTH_URL", value)
+
+    settings = load_settings()
+
+    assert settings.auth_url == settings.api_url == "http://frontend:3000"
+
+
+@pytest.mark.parametrize(
+    "value", ["https://ontology.example", "  https://ontology.example///  "]
+)
+def test_auth_url_override_is_normalized(monkeypatch: MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_API_URL", "http://frontend:3000")
+    monkeypatch.setenv("AUTO_ONTOLOGY_AUTH_URL", value)
+
+    settings = load_settings()
+
+    assert settings.auth_url == "https://ontology.example"
+    assert settings.api_url == "http://frontend:3000"
+
+
+def test_existing_settings_constructor_keeps_auth_url_optional() -> None:
+    settings = Settings(
+        "http://frontend:3000",
+        DEFAULT_SPEC_PATH,
+        "127.0.0.1",
+        3003,
+        30.0,
+        900.0,
+        "https://mcp.example",
+    )
+
+    assert settings.public_url == "https://mcp.example"
+    assert settings.auth_url == ""
 
 
 def test_rejects_missing_spec(monkeypatch: MonkeyPatch, tmp_path) -> None:

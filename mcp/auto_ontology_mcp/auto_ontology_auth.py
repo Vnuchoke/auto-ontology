@@ -122,7 +122,11 @@ def build_auto_ontology_auth(settings: Settings) -> RemoteAuthProvider:
         token_verifier=AutoOntologyTokenVerifier(
             settings.api_url, timeout_s=settings.timeout_s
         ),
-        authorization_servers=[AnyHttpUrl(settings.api_url)],
+        authorization_servers=[
+            AnyHttpUrl(
+                f"{(settings.auth_url or settings.api_url).rstrip('/')}/api/auth"
+            )
+        ],
         base_url=settings.public_url,
         resource_name="Auto Ontology",
     )

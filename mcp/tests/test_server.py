@@ -20,7 +20,12 @@ from fastmcp.server.http import set_http_request
 from starlette.requests import Request
 
 from auto_ontology_mcp import server
-from auto_ontology_mcp.config import DEFAULT_SPEC_PATH, ConfigError, Settings
+from auto_ontology_mcp.config import (
+    DEFAULT_SPEC_PATH,
+    ConfigError,
+    Settings,
+    load_settings,
+)
 from auto_ontology_mcp.server import (
     ICON_PATH,
     INSTRUCTIONS,
@@ -57,6 +62,91 @@ def _tools() -> list[Any]:
             await client.aclose()
 
     return asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("auth_url", "expected_issuer"),
+    [
+        ("https://ontology.example", "https://ontology.example/api/auth"),
+        ("https://ontology.example/", "https://ontology.example/api/auth"),
+        ("https://ontology.example///", "https://ontology.example/api/auth"),
+        (None, "http://frontend:3000/api/auth"),
+    ],
+)
+def test_metadata_advertises_auth_issuer(
+    monkeypatch: pytest.MonkeyPatch, auth_url: str | None, expected_issuer: str
+) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_API_URL", "http://frontend:3000")
+    if auth_url is None:
+        monkeypatch.delenv("AUTO_ONTOLOGY_AUTH_URL", raising=False)
+    else:
+        monkeypatch.setenv("AUTO_ONTOLOGY_AUTH_URL", auth_url)
+    monkeypatch.setenv("AUTO_ONTOLOGY_MCP_PUBLIC_URL", "https://mcp.example")
+    monkeypatch.delenv("AUTO_ONTOLOGY_OPENAPI_SPEC", raising=False)
+    mcp, client = build_server(load_settings())
+
+    async def run() -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp.http_app()),
+                base_url="https://mcp.example",
+            ) as session:
+                response = await session.get(
+                    "/.well-known/oauth-protected-resource/mcp"
+                )
+                assert response.status_code == 200
+                return response.json()
+        finally:
+            await client.aclose()
+
+    metadata = asyncio.run(run())
+
+    assert metadata["authorization_servers"] == [expected_issuer]
+    assert metadata["resource"] == "https://mcp.example/mcp"
+
+
+def test_public_auth_url_does_not_redirect_tool_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_API_URL", "http://frontend:3000")
+    monkeypatch.setenv("AUTO_ONTOLOGY_AUTH_URL", "https://ontology.example")
+    monkeypatch.setenv("AUTO_ONTOLOGY_MCP_PUBLIC_URL", "https://mcp.example")
+    monkeypatch.delenv("AUTO_ONTOLOGY_OPENAPI_SPEC", raising=False)
+    monkeypatch.setattr(server, "auto_ontology_access_token", lambda: "test-token")
+    requests: list[httpx.Request] = []
+
+    async def handle(
+        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "terms": [],
+                "total": 0,
+                "column_attribute_counts": [],
+                "sql_attribute_counts": [],
+                "related_counts": [],
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    mcp, client = build_server(load_settings())
+
+    async def run() -> None:
+        try:
+            async with Client(mcp) as session:
+                await session.call_tool("search_terms", {})
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+    assert len(requests) == 1
+    assert requests[0].url.host == "frontend"
+    assert requests[0].url.port == 3000
+    assert requests[0].url.path == "/api/terms"
+    assert requests[0].headers["Authorization"] == "Bearer test-token"
 
 
 def test_publishes_exactly_the_curated_tools_plus_the_handwritten_ones() -> None:

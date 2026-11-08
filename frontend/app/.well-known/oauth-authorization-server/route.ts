@@ -8,10 +8,7 @@ import { auth } from '@/auth/auth';
 // Publishes Auto Ontology's OAuth authorization-server metadata (RFC 8414) so an MCP
 // client can discover how to sign a user in.
 //
-// Better Auth already serves this under /api/auth, but a client only knows the
-// issuer — which is Auto Ontology's origin — and looks for the document at the origin
-// root. Without this route the client finds the page auth gate instead and is
-// redirected to /login, so discovery fails before it starts. `/.well-known` is
-// exempted from that gate in proxy.ts; the document is public by design and
-// contains no secrets.
+// Keep the origin-level discovery alias; the /api/auth issuer's RFC 8414 route
+// reuses this handler at /.well-known/oauth-authorization-server/api/auth.
+// `/.well-known` is exempted from the page auth gate in proxy.ts.
 export const GET = oauthProviderAuthServerMetadata(auth);
