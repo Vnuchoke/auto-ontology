@@ -264,6 +264,15 @@ Rarely needed: `AUTO_ONTOLOGY_MCP_HOST` and `AUTO_ONTOLOGY_MCP_PORT` (bind addre
 timeouts, `30` and `900`), and `AUTO_ONTOLOGY_OPENAPI_SPEC` (override the spec tools are
 generated from).
 
+`AUTO_ONTOLOGY_MCP_COVERAGE_TIMEOUT_S` sets a positive read timeout in seconds for
+`check_answerable` (`POST /api/question-entity-coverage`), default `180`. Only that
+request's read budget changes; connect, write and pool timeouts retain the general
+default `30`, other generated tools retain `30`, and streaming chat retains `900`.
+The coverage limit provides operational headroom over a backend per-call `120`s
+limit plus orchestration, not a latency SLA or protection against an unlimited
+queue. Unset or blank values use the default; nonnumeric, nonfinite or nonpositive values
+are rejected at startup.
+
 ## Extending the tool surface
 
 The tool set is an explicit allow-list in

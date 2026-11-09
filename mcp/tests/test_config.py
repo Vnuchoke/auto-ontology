@@ -28,6 +28,7 @@ _VARS = (
     "AUTO_ONTOLOGY_MCP_PORT",
     "AUTO_ONTOLOGY_MCP_TIMEOUT_S",
     "AUTO_ONTOLOGY_MCP_CHAT_TIMEOUT_S",
+    "AUTO_ONTOLOGY_MCP_COVERAGE_TIMEOUT_S",
     "AUTO_ONTOLOGY_MCP_PUBLIC_URL",
 )
 
@@ -49,6 +50,7 @@ def test_starts_with_nothing_configured() -> None:
     assert settings.port == DEFAULT_PORT
     assert settings.timeout_s == DEFAULT_TIMEOUT_S
     assert settings.chat_timeout_s == DEFAULT_CHAT_TIMEOUT_S
+    assert settings.coverage_timeout_s == 180.0
     assert settings.spec_path == DEFAULT_SPEC_PATH
 
 
@@ -114,6 +116,20 @@ def test_existing_settings_constructor_keeps_auth_url_optional() -> None:
 
     assert settings.public_url == "https://mcp.example"
     assert settings.auth_url == ""
+    assert settings.coverage_timeout_s == 180.0
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "not-a-number", "nan", "inf", "-inf"])
+def test_rejects_invalid_coverage_timeout(monkeypatch: MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_MCP_COVERAGE_TIMEOUT_S", value)
+    with pytest.raises(ConfigError, match="AUTO_ONTOLOGY_MCP_COVERAGE_TIMEOUT_S"):
+        load_settings()
+
+
+@pytest.mark.parametrize("value", ["", "  ", "240.5"])
+def test_coverage_timeout_configuration(monkeypatch: MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_MCP_COVERAGE_TIMEOUT_S", value)
+    assert load_settings().coverage_timeout_s == (240.5 if value.strip() else 180.0)
 
 
 def test_rejects_missing_spec(monkeypatch: MonkeyPatch, tmp_path) -> None:

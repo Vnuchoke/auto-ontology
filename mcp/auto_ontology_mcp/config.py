@@ -22,6 +22,7 @@ at a laptop's stack or at a production instance differs only in that value.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,10 @@ DEFAULT_HOST = "0.0.0.0"
 
 # Catalog and glossary reads are ordinary API calls.
 DEFAULT_TIMEOUT_S = 30.0
+
+# Coverage may orchestrate a backend LLM call capped at 120s; allow headroom,
+# not an SLA or protection against an unbounded server queue.
+DEFAULT_COVERAGE_TIMEOUT_S = 180.0
 
 # One chat turn is many sequential LLM calls. The backend caps individual SQL
 # statements at 30s but puts no ceiling on a whole run, so this is a client-side
@@ -69,6 +74,7 @@ class Settings:
     public_url: str = ""
     # Browser-reachable authorization server when the API uses an internal URL.
     auth_url: str = ""
+    coverage_timeout_s: float = DEFAULT_COVERAGE_TIMEOUT_S
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -79,8 +85,8 @@ def _positive_float(name: str, default: float) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
-    if value <= 0:
-        raise ConfigError(f"{name} must be greater than zero, got {value}")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{name} must be finite and greater than zero, got {value}")
     return value
 
 
@@ -146,6 +152,9 @@ def load_settings() -> Settings:
         public_url=_public_url(host, port),
         auth_url=(os.environ.get("AUTO_ONTOLOGY_AUTH_URL") or "").strip().rstrip("/")
         or api_url,
+        coverage_timeout_s=_positive_float(
+            "AUTO_ONTOLOGY_MCP_COVERAGE_TIMEOUT_S", DEFAULT_COVERAGE_TIMEOUT_S
+        ),
     )
 
 

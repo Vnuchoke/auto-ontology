@@ -186,10 +186,24 @@ def build_client(settings: Settings) -> httpx.AsyncClient:
     The credential is not set here: :class:`CallerAuth` resolves one per
     request, so a single client can serve callers with different identities.
     """
+    coverage_path = (
+        httpx.URL(settings.api_url).path.rstrip("/") + "/api/question-entity-coverage"
+    )
+
+    async def coverage_timeout(request: httpx.Request) -> None:
+        if request.method == "POST" and request.url.path == coverage_path:
+            # HTTPX fills per-request timeouts before hooks; never mutate the
+            # shared client or the connect/write/pool budgets.
+            request.extensions["timeout"] = {
+                **request.extensions["timeout"],
+                "read": settings.coverage_timeout_s,
+            }
+
     return httpx.AsyncClient(
         base_url=settings.api_url,
         auth=CallerAuth(),
         timeout=settings.timeout_s,
+        event_hooks={"request": [coverage_timeout]},
         # An agent harness may fan out across several tools at once.
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
     )
