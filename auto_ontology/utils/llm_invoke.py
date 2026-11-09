@@ -16,6 +16,7 @@ from typing import Iterator, Type, TypeVar
 import requests as _requests
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableBinding
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from auto_ontology.utils.model_config import resolve
@@ -221,11 +222,11 @@ def _build_client(
 ) -> BaseChatModel:
     """Build a chat client for the given model/endpoint.
 
-    OpenAI-family models (``openai/``, ``azure/``, ``aws/`` prefixes) go through
+    OpenAI-family models (``openai/``, ``azure/``, ``aws/``, ``cx/gpt-`` prefixes) go through
     ``ChatOpenAI``, which supports structured output. Everything else uses
     ``ChatNVIDIA``.
     """
-    if model.startswith(("openai/", "azure/", "aws/")):
+    if model.startswith(("openai/", "azure/", "aws/", "cx/gpt-")):
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
@@ -385,14 +386,12 @@ def _log_non_reasoning_fallback(exc: Exception, schema_name: str | None = None) 
     detail = (type(exc).__name__, str(exc)[:120])
     if schema_name is None:
         logger.warning(
-            "Non-reasoning LLM exhausted %d retries (%s: %s) — falling back to reasoning LLM",
-            RETRY_MAX_ATTEMPTS,
+            "Non-reasoning LLM failed (%s: %s) — falling back to reasoning LLM",
             *detail,
         )
         return
     logger.warning(
-        "Non-reasoning LLM exhausted %d retries for %s (%s: %s) — falling back to reasoning LLM",
-        RETRY_MAX_ATTEMPTS,
+        "Non-reasoning LLM failed for %s (%s: %s) — falling back to reasoning LLM",
         schema_name,
         *detail,
     )
@@ -456,8 +455,9 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     ``aws/anthropic/bedrock-claude-opus-4-8``) reject the default json_schema /
     ``response_format`` path ("output_config.format: Extra inputs are not
     permitted"), but they support tool calling — so force ``function_calling``
-    for them. Everything else keeps langchain's default (json_schema for
-    OpenAI), which is preferred where supported.
+    for them. OpenAI clients use strict json_schema so the SDK normalizes
+    Pydantic defaults and nested objects for the provider's strict schema rules.
+    Other clients keep langchain's default.
 
     ``tool_choice=None`` suppresses the tool-choice langchain would otherwise set.
     Bedrock behind LiteLLM rejects the request when one is present, because the gateway
@@ -474,6 +474,13 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     """
     if _is_claude(llm):
         return {"method": "function_calling", "tool_choice": None}
+    from langchain_openai import ChatOpenAI
+
+    current = llm
+    while isinstance(current, RunnableBinding):
+        current = current.bound
+    if isinstance(current, ChatOpenAI):
+        return {"method": "json_schema", "strict": True}
     return {}
 
 
@@ -677,7 +684,7 @@ def invoke_with_structured_output(
                 )
                 return None
         logger.error(
-            f"invoke_with_structured_output failed for {schema_name} after {RETRY_MAX_ATTEMPTS} attempts: "
+            f"invoke_with_structured_output failed for {schema_name}: "
             f"{type(e).__name__}: {e}",
             exc_info=True,
         )

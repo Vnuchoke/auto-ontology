@@ -5,13 +5,16 @@
 """Tests for LLM invocation helpers."""
 
 import contextlib
+import json
 import threading
 import time
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import httpx
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from auto_ontology.utils import llm_invoke
@@ -19,6 +22,246 @@ from auto_ontology.utils.llm_invoke import (
     _structured_output_kwargs,
     _system_messages_first,
 )
+from auto_ontology.retrieval.text_to_sql.models import TableRelevanceModel
+from auto_ontology.retrieval.text_to_sql.agents.sql_reconstruction import ErrorAnalysis
+from auto_ontology.retrieval.text_to_sql.agents.sql_parse_validation import (
+    IntentValidationModel,
+)
+
+
+@pytest.mark.parametrize(
+    "model", ["cx/gpt-6.1-sol-medium", "openai/gpt-4o", "azure/gpt-5", "aws/gpt-5"]
+)
+def test_openai_routes_preserve_gateway_identity(model: str) -> None:
+    client = llm_invoke._build_client(
+        model=model,
+        api_key="sk-test",
+        base_url="https://gateway.invalid/v1",
+        temperature=0,
+        max_tokens=64,
+    )
+    assert isinstance(client, ChatOpenAI)
+    assert client.model_name == model
+    assert str(client.openai_api_base) == "https://gateway.invalid/v1"
+    assert client.openai_api_key.get_secret_value() == "sk-test"
+    assert client.max_retries == 0
+
+
+@pytest.mark.parametrize(
+    "model", ["cx/nemotron", "nvidia/nemotron-3.5-lightning-30b-a3b"]
+)
+def test_other_routes_keep_nvidia(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import langchain_nvidia_ai_endpoints
+
+    constructor = MagicMock()
+    monkeypatch.setattr(langchain_nvidia_ai_endpoints, "ChatNVIDIA", constructor)
+    assert (
+        llm_invoke._build_client(
+            model=model,
+            api_key="sk-test",
+            base_url="https://gateway.invalid/v1",
+            temperature=0,
+            max_tokens=64,
+        )
+        is constructor.return_value
+    )
+    assert constructor.call_args.kwargs["model"] == model
+    assert _structured_output_kwargs(_Model(model)) == {}
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_real_openai_claude_keeps_function_calling_override(bound: bool) -> None:
+    client = llm_invoke._build_client(
+        model="aws/anthropic/bedrock-claude-opus-4-8",
+        api_key="sk-test",
+        base_url="https://gateway.invalid/v1",
+        temperature=0,
+        max_tokens=64,
+    )
+    llm = client.bind() if bound else client
+    assert isinstance(client, ChatOpenAI)
+    assert _structured_output_kwargs(llm) == {
+        "method": "function_calling",
+        "tool_choice": None,
+    }
+
+
+def _assert_strict_objects(value: Any) -> None:
+    if isinstance(value, dict):
+        if value.get("type") == "object":
+            assert value.get("additionalProperties") is False
+            assert set(value.get("required", [])) == set(value.get("properties", {}))
+        for child in value.values():
+            _assert_strict_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_strict_objects(child)
+
+
+@pytest.fixture
+def openai_transport() -> Any:
+    """Use the real SDK serializer/parser, never a real gateway."""
+    clients: list[httpx.Client] = []
+
+    def build(payload: dict, status: int = 200) -> tuple[ChatOpenAI, list[dict]]:
+        sent: list[dict] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content))
+            assert request.url == "https://gateway.invalid/v1/chat/completions"
+            assert request.headers["authorization"] == "Bearer sk-test"
+            if status != 200:
+                return httpx.Response(
+                    status,
+                    json={
+                        "error": {
+                            "message": "invalid schema",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "cx/gpt-6.1-sol-medium",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(payload),
+                            },
+                        }
+                    ],
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(respond))
+        clients.append(http_client)
+        return ChatOpenAI(
+            model="cx/gpt-6.1-sol-medium",
+            api_key="sk-test",
+            base_url="https://gateway.invalid/v1",
+            http_client=http_client,
+            max_retries=0,
+        ), sent
+
+    yield build
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize(
+    ("schema", "payload"),
+    [
+        (TableRelevanceModel, {"reasoning": "keep tables", "tables_to_remove": []}),
+        (
+            ErrorAnalysis,
+            {"error_type": "fixable", "search_queries": [], "explanation": "syntax"},
+        ),
+        (
+            IntentValidationModel,
+            {
+                "reasoning": "valid",
+                "is_valid": True,
+                "join_issues": [],
+                "aggregation_issues": [],
+                "projection_issues": [],
+                "evidence_issues": [],
+            },
+        ),
+    ],
+)
+def test_real_openai_serializes_strict_production_schemas(
+    openai_transport: Any,
+    schema: type[BaseModel],
+    payload: dict,
+    bound: bool,
+) -> None:
+    client, sent = openai_transport(payload)
+    llm = client.bind(max_tokens=64) if bound else client
+    assert _structured_output_kwargs(llm) == {"method": "json_schema", "strict": True}
+    result = llm_invoke.safe_invoke_with_structured_output(
+        llm,
+        [HumanMessage(content="check")],
+        schema,
+    )
+    assert type(result) is schema
+    assert result == schema.model_validate(payload)
+    assert len(sent) == 1
+    response_format = sent[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    _assert_strict_objects(response_format["json_schema"]["schema"])
+
+
+@pytest.mark.parametrize(
+    ("schema", "payload"),
+    [
+        (TableRelevanceModel, {"reasoning": "bad", "tables_to_remove": "not a list"}),
+        (ErrorAnalysis, {"error_type": "unknown"}),
+        (IntentValidationModel, {"is_valid": "not a boolean"}),
+    ],
+)
+def test_real_openai_rejects_malformed_output(
+    openai_transport: Any,
+    schema: type[BaseModel],
+    payload: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, sent = openai_transport(payload)
+    fallback = MagicMock(side_effect=AssertionError("reasoning must not fall back"))
+    monkeypatch.setattr(llm_invoke, "get_llm_client", fallback)
+    assert (
+        llm_invoke.invoke_with_structured_output(
+            client, [HumanMessage(content="check")], schema
+        )
+        is None
+    )
+    assert len(sent) == llm_invoke.RETRY_MAX_ATTEMPTS
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_nonretryable_400_is_not_repeated_or_reported_as_exhausted(
+    openai_transport: Any,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: bool,
+) -> None:
+    client, sent = openai_transport({}, 400)
+    reasoning, fallback_sent = openai_transport({}, 400)
+    if fallback:
+        llm_invoke._remember_non_reasoning(client)
+    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda: reasoning)
+    assert (
+        llm_invoke.invoke_with_structured_output(
+            client, [HumanMessage(content="check")], TableRelevanceModel
+        )
+        is None
+    )
+    assert len(sent) == 1
+    assert len(fallback_sent) == int(fallback)
+    assert "exhausted" not in caplog.text
+    assert "after 3 attempts" not in caplog.text
+
+
+def test_client_build_failure_does_not_claim_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def unavailable() -> None:
+        raise ValueError("client unavailable")
+
+    monkeypatch.setattr(llm_invoke, "get_non_reasoning_llm_client", unavailable)
+    monkeypatch.setattr(llm_invoke, "get_llm_client", unavailable)
+    assert llm_invoke.safe_invoke_structured_nr([], TableRelevanceModel) is None
+    assert "exhausted" not in caplog.text
 
 
 @pytest.fixture(autouse=True)
