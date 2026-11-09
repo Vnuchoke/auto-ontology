@@ -175,6 +175,7 @@ services:
   auto-ontology-mcp:
     build:
       context: ./mcp
+    container_name: auto-ontology-mcp
     restart: unless-stopped
     ports:
       - "127.0.0.1:18303:3003"
