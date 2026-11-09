@@ -35,7 +35,7 @@ from auto_ontology_mcp.config import Settings
 logger = logging.getLogger(__name__)
 
 STATUS_PATH = "/api/semantic-compilation/status"
-CONNECTIONS_PATH = "/api/connections"
+CONNECTIONS_PATH = "/api/connections/sources"
 DATABASES_PATH = "/api/datasources/dbs"
 
 
@@ -68,8 +68,8 @@ class Readiness(BaseModel):
         default=False,
         description=(
             "Whether a live database connection exists to run SQL against. "
-            "Null when the caller is not permitted to see it, which is normal "
-            "for non-admins: reading connections is often admin-only."
+            "Includes environment-configured and managed sources. Null when "
+            "the caller is not permitted to read the available sources."
         ),
     )
     catalog_present: bool | None = Field(
@@ -112,9 +112,8 @@ async def _probe(client: httpx.AsyncClient, path: str) -> Any:
     the credential itself: every probe would fail the same way, and reporting
     "not ready" for what is really a stale token would send the caller off
     fixing the wrong thing. A 403 is this caller against this route, and the
-    three probes do not need the same permission — a viewer may run chat and
-    browse the catalog while only admins read connections. Refusing to answer
-    at all there would deny a caller the verdict over a fact they never needed.
+    three probes may have different access restrictions. Refusing to answer at
+    all there would deny a caller the verdict over a fact they cannot check.
     """
     try:
         response = await client.get(path)
@@ -179,14 +178,14 @@ def _summarise(status: Any, connections: Any, databases: Any) -> Readiness:
     if connections is FORBIDDEN:
         unverified.append(
             "Whether a live database connection exists could not be checked: "
-            f"this account is not permitted to read {CONNECTIONS_PATH}, which "
-            "is often admin-only. Questions can still be asked; if one comes "
+            f"this account is not permitted to read {CONNECTIONS_PATH}. "
+            "Questions can still be asked; if one comes "
             "back empty, a missing connection is a likely cause."
         )
         can_execute: bool | None = None
     elif connections is None:
         blockers.append(
-            f"Could not read the configured connections ({CONNECTIONS_PATH} was "
+            f"Could not read the available sources ({CONNECTIONS_PATH} was "
             "unreadable), so it is unknown whether SQL can execute."
         )
         can_execute = False

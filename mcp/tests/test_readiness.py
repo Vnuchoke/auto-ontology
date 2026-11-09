@@ -95,6 +95,44 @@ def test_a_configured_deployment_is_ready() -> None:
     assert result.blockers == []
 
 
+def test_an_env_source_is_ready_without_managed_connections() -> None:
+    requests: list[tuple[str, str]] = []
+    routes = {
+        STATUS_PATH: _COMPILED,
+        "/api/connections": _NO_CONNECTIONS,
+        "/api/connections/sources": {
+            "data": [
+                {
+                    "connection_id": "env_schedule",
+                    "display_label": "schedule",
+                    "database_name": "schedule",
+                    "dialect": "postgres",
+                }
+            ],
+            "count": 1,
+        },
+        DATABASES_PATH: _ONE_DATABASE,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json=routes[request.url.path])
+
+    result = _check(handler)
+
+    assert result.ready is True
+    assert result.can_execute_sql is True
+    assert result.blockers == []
+    assert result.unverified == []
+    assert sorted(requests) == sorted(
+        [
+            ("GET", STATUS_PATH),
+            ("GET", "/api/connections/sources"),
+            ("GET", DATABASES_PATH),
+        ]
+    )
+
+
 def test_a_compiled_layer_with_no_connection_is_not_ready() -> None:
     """The silent failure this tool exists for: everything reads, nothing runs."""
     result = _check(_routed(connections=_NO_CONNECTIONS))
@@ -137,8 +175,7 @@ def test_a_transport_error_degrades_too() -> None:
 
     assert result.ready is False
     assert any(
-        "Could not read the configured connections" in blocker
-        for blocker in result.blockers
+        "Could not read the available sources" in blocker for blocker in result.blockers
     )
 
 
@@ -169,11 +206,7 @@ def test_a_rejected_credential_is_an_error_not_a_verdict() -> None:
 
 
 def test_connections_a_caller_may_not_read_do_not_make_it_unready() -> None:
-    """Reading connections is admin-only on some deployments.
-
-    A viewer who cannot see them can still ask questions, so the fact goes in
-    unverified and the verdict stands on what could be checked.
-    """
+    """A forbidden source probe stays unverified, not a missing connection."""
     result = _check(_routed(connections=403))
 
     assert result.ready is True
