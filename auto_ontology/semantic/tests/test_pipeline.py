@@ -11,11 +11,14 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import pandas as pd
 
 from auto_ontology.connectors.sources import SourceDescriptor
 
+from auto_ontology.semantic.embed import SemanticEmbedder
 from auto_ontology.semantic.models import ProcessTableResult
 from auto_ontology.semantic.pipeline import compile_semantic_layer
+from auto_ontology.vdb.postgres import PostgresVDB
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +53,80 @@ def test_compile_processes_all_tables(
 
     assert count == 2
     assert mock_process.call_count == 2
+
+
+@pytest.mark.parametrize("collection_exists", [False, True])
+@pytest.mark.parametrize("has_tables", [False, True])
+def test_compile_initializes_semantic_collection_only_from_embedded_rows(
+    monkeypatch: pytest.MonkeyPatch, collection_exists: bool, has_tables: bool
+) -> None:
+    vdb = PostgresVDB(
+        connection_string="postgresql://unused/test",
+        collection_name="semantic_objects_layer",
+        connection_id="dbx",
+    )
+    engine = MagicMock()
+    store = MagicMock()
+    monkeypatch.setattr(vdb, "_table_exists", lambda: collection_exists)
+    monkeypatch.setattr(vdb, "_get_engine", lambda: engine)
+    monkeypatch.setattr(vdb, "_ensure_schema", MagicMock())
+    monkeypatch.setattr(vdb, "_require_source_schema", MagicMock())
+    monkeypatch.setattr(vdb, "_create_vector_index", MagicMock())
+    monkeypatch.setattr("auto_ontology.vdb.postgres.psycopg.connect", MagicMock())
+    monkeypatch.setattr(
+        "auto_ontology.vdb.postgres.PGVectorStore.create_sync",
+        MagicMock(return_value=store),
+    )
+    embedder = SemanticEmbedder("sales", "dbx", MagicMock(), vdb)
+    tables = [{"id": "t1", "name": "orders"}] if has_tables else []
+    monkeypatch.setattr(
+        "auto_ontology.semantic.pipeline.fetch_all_tables_without_term",
+        lambda **kwargs: tables,
+    )
+    monkeypatch.setattr(
+        "auto_ontology.semantic.pipeline.fetch_table_context",
+        lambda *args, **kwargs: {"columns": [{"name": "id"}]},
+    )
+    monkeypatch.setattr(
+        "auto_ontology.semantic.pipeline.is_distinct_value_probing_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "auto_ontology.semantic.pipeline.load_domain_summary", lambda _: None
+    )
+
+    def batch_embed(rows: list[dict[str, Any]], _params: Any) -> pd.DataFrame:
+        assert vdb.vector_size is None
+        engine.init_vectorstore_table.assert_not_called()
+        for row in rows:
+            row["metadata"]["embedding"] = [0.25] * 1024
+        return pd.DataFrame(rows)
+
+    def process_table(
+        _table: dict[str, Any], _ctx: dict[str, Any], **kwargs: Any
+    ) -> ProcessTableResult:
+        with kwargs["commit_slot"]:
+            assert (
+                kwargs["embedder"].embed_term(
+                    {"id": "term1", "name": "Order", "connection_id": "dbx"}, []
+                )
+                == 1
+            )
+        return ProcessTableResult(term_names=["Order"])
+
+    monkeypatch.setattr("auto_ontology.semantic.embed.batch_embed", batch_embed)
+    monkeypatch.setattr("auto_ontology.semantic.pipeline.process_table", process_table)
+
+    assert compile_semantic_layer("dbx", embedder=embedder) == int(has_tables)
+    assert vdb.vector_size == (1024 if has_tables else None)
+    assert store.add_embeddings.call_count == int(has_tables)
+    if has_tables:
+        assert store.add_embeddings.call_args.kwargs["embeddings"] == [[0.25] * 1024]
+    if has_tables and not collection_exists:
+        engine.init_vectorstore_table.assert_called_once()
+        assert engine.init_vectorstore_table.call_args.kwargs["vector_size"] == 1024
+    else:
+        engine.init_vectorstore_table.assert_not_called()
 
 
 @patch("auto_ontology.semantic.pipeline.fetch_table_context")

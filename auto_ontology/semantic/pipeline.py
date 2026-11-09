@@ -216,9 +216,6 @@ def compile_semantic_layer(
 
     count = 0
 
-    if embedder is not None:
-        embedder.vdb.create_index()
-
     with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
         futures = {
             pool.submit(_process, table, position, position + 1): table
