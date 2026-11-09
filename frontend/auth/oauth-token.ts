@@ -14,7 +14,7 @@
 // approved it, and the request is then authorized against that user's role, the
 // same way a browser or API-token request is.
 
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { getPrisma } from '@/lib/prisma';
 
 // A Auto Ontology access token is opaque — random characters, no structure. An SSO id
@@ -53,7 +53,7 @@ export async function verifyOAuthToken(
 ): Promise<{ id: string; role: string | null } | null> {
 	// UserInfo accepts the bearer directly and validates opaque tokens against
 	// the stored grant, including expiry, revocation, client, and session state.
-	const response = await auth.api.oauth2UserInfo({ headers, asResponse: true });
+	const response = await (await getAuth()).api.oauth2UserInfo({ headers, asResponse: true });
 	if (!response.ok) {
 		if (response.status >= 500) {
 			throw new Error(`OAuth token validation failed with HTTP ${response.status}`);

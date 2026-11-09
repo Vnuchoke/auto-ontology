@@ -15,7 +15,7 @@
 // userCan() check every browser request goes through. Revoking a token or
 // deleting its owner therefore revokes the script's access immediately.
 
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { getPrisma } from '@/lib/prisma';
 
 /** Prefix every Auto Ontology-minted token carries (see the apiKey plugin config). */
@@ -62,7 +62,7 @@ export async function verifyApiToken(
 	const token = extractApiToken(headers);
 	if (!token) return null;
 
-	const { valid, key } = await auth.api.verifyApiKey({ body: { key: token } });
+	const { valid, key } = await (await getAuth()).api.verifyApiKey({ body: { key: token } });
 	if (!valid || !key) return null;
 
 	// `referenceId` is the owner's user id — the plugin is configured with the

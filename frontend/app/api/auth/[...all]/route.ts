@@ -4,11 +4,11 @@
 
 import { NextResponse } from 'next/server';
 import { toNextJsHandler } from 'better-auth/next-js';
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { isMcpClientCallback, mcpHandoffLocation } from '@/auth/oauth-loopback';
 import { withPublic } from '@/auth/with-auth';
 
-const handlers = toNextJsHandler(auth);
+const handlers = toNextJsHandler(async (req) => (await getAuth()).handler(req));
 
 // The apiKey plugin mounts its own management endpoints under this catch-all
 // (`/api/auth/api-key/create|get|list|update|delete`). They are session-gated by

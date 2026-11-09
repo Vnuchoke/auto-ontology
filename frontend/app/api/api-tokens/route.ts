@@ -8,7 +8,7 @@
 
 import { headers } from 'next/headers';
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { withPermission } from '@/auth/with-auth';
 import {
 	apiTokenErrorResponse,
@@ -29,7 +29,8 @@ export const GET = withPermission({ apiToken: ['manage'] })(async () => {
 	const denied = await requireSessionCaller();
 	if (denied) return denied;
 
-	const { apiKeys } = await auth.api.listApiKeys({ headers: await headers() });
+	const requestHeaders = await headers();
+	const { apiKeys } = await (await getAuth()).api.listApiKeys({ headers: requestHeaders });
 	return NextResponse.json(apiKeys.map(toApiToken));
 });
 
@@ -77,13 +78,15 @@ export const POST = withPermission({ apiToken: ['manage'] })(async (req) => {
 	// The checks above cover what this route promises, but the plugin enforces
 	// rules of its own; relay those rather than letting them surface as a 500.
 	let created;
+	const requestHeaders = await headers();
+	const auth = await getAuth();
 	try {
 		created = await auth.api.createApiKey({
 			body: {
 				name,
 				expiresIn: typeof days === 'number' ? days * SECONDS_PER_DAY : null,
 			},
-			headers: await headers(),
+			headers: requestHeaders,
 		});
 	} catch (err) {
 		const mapped = apiTokenErrorResponse(err);
