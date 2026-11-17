@@ -145,6 +145,7 @@ def build_column_attribute_semantic_rows(
     live_id: str,
     name: str,
     description: str,
+    column_description: str,
     term_name: str,
     source_column: str,
     table_id: str,
@@ -161,6 +162,7 @@ def build_column_attribute_semantic_rows(
             {
                 "name": name,
                 "description": description,
+                "column_description": column_description,
                 "term_name": term_name,
                 "source_column": source_column,
                 "table_id": table_id,

@@ -27,9 +27,16 @@ from auto_ontology.server.responses import (
 router = APIRouter()
 
 
+_EXPRESSION_DESCRIPTION = (
+    "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` "
+    "for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a "
+    "filter. SQL that references no catalog table is rejected."
+)
+
+
 class SqlAttributeValidate(BaseModel):
     connection_id: str | None = None
-    expression: str = Field(..., min_length=1)
+    expression: str = Field(..., min_length=1, description=_EXPRESSION_DESCRIPTION)
     term_id: str | None = None
     attribute_id: str | None = None
 
@@ -38,7 +45,7 @@ class SqlAttributeCreate(BaseModel):
     connection_id: str | None = None
     name: str = Field(..., min_length=1)
     description: str
-    expression: str = Field(..., min_length=1)
+    expression: str = Field(..., min_length=1, description=_EXPRESSION_DESCRIPTION)
     term_id: str
     source: str = "manual"
     owner_id: str | None = None
@@ -48,7 +55,7 @@ class SqlAttributeUpdate(BaseModel):
     connection_id: str | None = None
     name: str = Field(..., min_length=1)
     description: str
-    expression: str = Field(..., min_length=1)
+    expression: str = Field(..., min_length=1, description=_EXPRESSION_DESCRIPTION)
     term_id: str
     source: str = "manual"
 

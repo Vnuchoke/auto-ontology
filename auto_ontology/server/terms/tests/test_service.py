@@ -52,3 +52,59 @@ def test_a_missing_attribute_still_answers_not_found(
         service.update_column_attribute("term-1", "attr-1", sample_values=["abc"])
         is None
     )
+
+
+def _updated_row(**extra: object) -> dict[str, object]:
+    return {
+        "id": "attr-1",
+        "name": "Total",
+        "description": "Long attribute description",
+        "column_description": "Order total",
+        "family_prefix": "NEW_",
+        "term_name": "Order",
+        "source_column": "total",
+        "sample_values": "[10]",
+        "database_name": "shop",
+        **extra,
+    }
+
+
+@patch.object(service, "build_semantic_embedder")
+@patch("auto_ontology.dal.attributes.update_column_attribute")
+def test_a_description_edit_does_not_re_embed_the_attribute(
+    mock_update: MagicMock,
+    mock_embedder: MagicMock,
+) -> None:
+    mock_update.return_value = _updated_row()
+
+    row = service.update_column_attribute("term-1", "attr-1", description="New text")
+
+    assert row["sample_values"] == ["10"]
+    mock_embedder.assert_not_called()
+
+
+@patch.object(service, "build_semantic_embedder")
+@patch.object(service.terms_dal, "fetch_term_and_column_attributes_for_embedding")
+@patch.object(service.terms_dal, "fetch_term_projection_contexts")
+@patch("auto_ontology.dal.attributes.update_column_attribute")
+def test_a_rename_re_embeds_from_the_column_description(
+    mock_update: MagicMock,
+    mock_contexts: MagicMock,
+    mock_projection: MagicMock,
+    mock_embedder: MagicMock,
+) -> None:
+    mock_update.return_value = _updated_row(name="Order Total")
+    mock_contexts.return_value = [{"connection_id": "A", "database_name": "shop"}]
+    projected_attr = _updated_row(name="Order Total", connection_id="A")
+    mock_projection.return_value = ({"synonyms": ["Purchase"]}, [projected_attr])
+    embedder = mock_embedder.return_value
+
+    service.update_column_attribute("term-1", "attr-1", name="Order Total")
+
+    mock_projection.assert_called_once_with("term-1", connection_id="A")
+    mock_embedder.assert_called_once_with("shop", connection_id="A", reset=False)
+    embedder.vdb.delete_by_id.assert_called_once_with("attr-1", connection_id="A")
+    (_, (attr,)) = embedder.embed_term.call_args.args
+    assert attr["column_description"] == "Order total"
+    assert attr["family_prefix"] == "NEW_"
+    assert attr["connection_id"] == "A"

@@ -81,6 +81,15 @@ def test_all_compilation_stages_receive_identity_not_physical_name(monkeypatch):
     monkeypatch.setattr(compilation, "build_semantic_embedder", embed)
     monkeypatch.setattr(compilation, "load_domain_summary", lambda cid: None)
     stages = []
+    scoped_stages = []
+    for name in (
+        "resolve_term_families",
+        "attach_unmatched_fk_columns",
+        "describe_column_attributes",
+    ):
+        stage = Mock(return_value=0)
+        monkeypatch.setattr(compilation, name, stage)
+        scoped_stages.append(stage)
     for module, name in [
         (compilation, "compile_semantic_layer"),
         (compilation, "resolve_semantic_fks"),
@@ -93,6 +102,9 @@ def test_all_compilation_stages_receive_identity_not_physical_name(monkeypatch):
     assert compilation.run_semantic_compilation("a") == 2
     embed.assert_called_once_with("sales", connection_id="a", reset=False)
     assert [stage.call_args.args for stage in stages] == [("a",)] * 4
+    assert all(
+        stage.call_args.kwargs["connection_id"] == "a" for stage in scoped_stages
+    )
 
 
 def test_summary_cache_uses_path_safe_identity_without_name_fallback(

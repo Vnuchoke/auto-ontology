@@ -4342,6 +4342,7 @@
             "type": "string"
           },
           "expression": {
+            "description": "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a filter. SQL that references no catalog table is rejected.",
             "minLength": 1,
             "title": "Expression",
             "type": "string"
@@ -4541,6 +4542,7 @@
             "type": "string"
           },
           "expression": {
+            "description": "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a filter. SQL that references no catalog table is rejected.",
             "minLength": 1,
             "title": "Expression",
             "type": "string"
@@ -4594,6 +4596,7 @@
             "title": "Connection Id"
           },
           "expression": {
+            "description": "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a filter. SQL that references no catalog table is rejected.",
             "minLength": 1,
             "title": "Expression",
             "type": "string"
@@ -6735,7 +6738,7 @@
     },
     "/api/chat/completions": {
       "post": {
-        "description": "Run the text-to-SQL agent and stream OpenAI-style SSE frames back.\n\nEmits a ``sql`` event once the agent has a validated query, just before it\nexecutes, so callers can show the SQL while it runs. Emits the final SQL\nand formatted answer as a ``result`` event, then \u2014 if that\nanswer has an executed result \u2014 generates and persists the chart/table\nbubble itself and streams it back as a ``charts`` event before the stream\ncloses with ``[DONE]``. Callers that only care about the text/SQL answer\ncan still stop reading after ``result``; the chart step and its\npersistence happen server-side regardless of whether anyone keeps\nlistening (see ``_build_charts_event``).\n\nRequires a selected, source-ready semantic and vector context (503 if not\nready). The first SSE event is ``source``; ``answer.source`` repeats that\nauthoritative snapshot. Missing selection with multiple sources is 422.\n``conversation_id`` persists the\nturn and claims that conversation's single run slot \u2014 a second concurrent\nrequest for the same conversation gets 409 too. Omitting ``conversation_id``\nruns the question statelessly: no history, no persisted turn, and no chart\nstep (``_build_charts_event`` needs a conversation to save into).",
+        "description": "Run the agent on one chat message and stream OpenAI-style SSE frames back.\n\nThe agent answers data questions with SQL, and answers greetings and\nquestions about the catalog's tables, attributes and terms from the catalog\nwithout SQL. Emits a ``sql`` event once the agent has a validated query,\njust before it executes, so callers can show the SQL while it runs. Emits\nthe final answer (with its SQL, when there is one) as a ``result`` event,\nthen \u2014 if that\nanswer has an executed result \u2014 generates and persists the chart/table\nbubble itself and streams it back as a ``charts`` event before the stream\ncloses with ``[DONE]``. Callers that only care about the text/SQL answer\ncan still stop reading after ``result``; the chart step and its\npersistence happen server-side regardless of whether anyone keeps\nlistening (see ``_build_charts_event``).\n\nRequires a selected, source-ready semantic and vector context (503 if not\nready). The first SSE event is ``source``; ``answer.source`` repeats that\nauthoritative snapshot. Missing selection with multiple sources is 422.\n``conversation_id`` persists the\nturn and claims that conversation's single run slot \u2014 a second concurrent\nrequest for the same conversation gets 409 too. Omitting ``conversation_id``\nruns the question statelessly: no history, no persisted turn, and no chart\nstep (``_build_charts_event`` needs a conversation to save into).",
         "operationId": "chat_completions_api_chat_completions_post",
         "requestBody": {
           "content": {

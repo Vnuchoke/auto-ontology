@@ -229,9 +229,7 @@ def test_candidate_fk_prompt_requires_canonical_attribute_owner(
     from auto_ontology.retrieval.data_access.relevant_tables import (
         get_relevant_tables_from_candidates,
     )
-    from auto_ontology.retrieval.text_to_sql.formatters_util import (
-        format_tables_for_prompt,
-    )
+    from auto_ontology.retrieval.text_to_sql.react.retrieve import _table_block
 
     store().query_write(s.column__semantic_fk.delete())
     for col in ("c-left", "c-right", "c-hub-a"):
@@ -244,7 +242,9 @@ def test_candidate_fk_prompt_requires_canonical_attribute_owner(
     )
     assert len(tables) == 3
     assert all(t["columns"][0]["semantic_fk"] == "public.orders.id" for t in tables)
-    assert "public.orders.id" in format_tables_for_prompt(tables)
+    assert "public.orders.id" in "\n".join(
+        _table_block(t, set(), False) for t in tables
+    )
 
     store().query_write(
         s.column_attribute.update()
@@ -262,7 +262,7 @@ def test_candidate_fk_prompt_requires_canonical_attribute_owner(
         connection_id="a",
     )
     assert {t["connection_id"] for t in tables} == {"a"}
-    prompt = format_tables_for_prompt(tables)
+    prompt = "\n".join(_table_block(t, set(), False) for t in tables)
     assert "public.orders.id" not in prompt
     assert all(t["columns"][0]["semantic_fk"] is None for t in tables)
     assert "b_canonical_description" not in prompt

@@ -53,6 +53,7 @@ from auto_ontology.dal.datasources import fetch_col_table_contexts
 from auto_ontology.dal.session import store, write_transaction
 from auto_ontology.dal.source_scope import definition_source_scope, query_source_scope
 from auto_ontology.dal.tags import TARGET_COLUMN_ATTRIBUTE, TARGET_TERM, fetch_tags_map
+from auto_ontology.dal.term_families import attribute_family_prefix
 from auto_ontology.dal.users import resolve_accessible_catalog_ids
 from auto_ontology.dal.zones import fetch_table_zones_map, zone_covers_table
 from auto_ontology.semantic.constants import (
@@ -482,6 +483,10 @@ def upsert_table_term(
             return None
 
         table = tables[0]
+        # An empty proposal would be stored as "" (never embedded, so never
+        # retrieved), and the next one as " (db.schema.table)". Use the
+        # physical table name instead.
+        name = name.strip() or table["table_name"]
         qualified_table = ".".join(
             part
             for part in (
@@ -821,6 +826,10 @@ def _projection_attributes(connection_id: str) -> Select:
             s.column_attribute.c.term_name,
             s.column_attribute.c.source_column,
             s.catalog_column.c.name.label("column_name"),
+            s.catalog_column.c.description.label("column_description"),
+            attribute_family_prefix(
+                s.column_attribute.c.id, connection_id=connection_id
+            ).label("family_prefix"),
             s.catalog_column.c.sample_values,
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
@@ -1234,6 +1243,8 @@ def _embedding_attrs_for_table(table_id: str):
             s.column_attribute.c.description,
             s.column_attribute.c.term_name,
             s.column_attribute.c.source_column,
+            s.catalog_column.c.description.label("column_description"),
+            attribute_family_prefix(s.column_attribute.c.id).label("family_prefix"),
             s.catalog_column.c.sample_values,
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
@@ -1333,9 +1344,9 @@ def fetch_term_projection_contexts(term_id: str) -> list[dict[str, str]]:
 def fetch_column_attribute_embedding_contexts_by_column_id(
     column_id: str,
 ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
-    """The Term contexts a column's sample-value update invalidates.
+    """The Term contexts a column's description or sample-value update invalidates.
 
-    Sample values are part of a ColumnAttribute's embedding text, so profiling a
+    Both are part of a ColumnAttribute's embedding text, so editing either on a
     column stales every attribute on it and every term behind those.
     """
     rows = store().query_read(
@@ -1352,10 +1363,13 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
             s.column_attribute.c.description,
             s.column_attribute.c.term_name,
             s.column_attribute.c.source_column,
+            s.catalog_column.c.description.label("column_description"),
+            attribute_family_prefix(s.column_attribute.c.id).label("family_prefix"),
             s.catalog_column.c.sample_values,
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_schema.c.name.label("schema_name"),
             s.column_attribute.c.id,
         )
         .select_from(
@@ -1415,14 +1429,16 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
                 "description": row["description"],
                 "term_name": row["term_name"],
                 "source_column": row["source_column"],
+                "column_description": row["column_description"],
+                "family_prefix": row["family_prefix"],
                 "sample_values": row["sample_values"],
-                "id": row["id"],
-                "connection_id": row["connection_id"],
+                "is_unique": row["is_unique"],
                 "table_id": row["table_id"],
                 "table_name": row["table_name"],
                 "schema_name": row["schema_name"],
+                "id": row["id"],
+                "connection_id": row["connection_id"],
                 "datatype": row["datatype"],
-                "is_unique": row["is_unique"],
             }
         )
     return list(contexts.values())
@@ -1694,6 +1710,57 @@ def find_column_attribute_by_column_id(column_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Related terms
 # ---------------------------------------------------------------------------
+
+
+def fetch_semantic_coverage(
+    column_ids: list[str], table_ids: list[str], *, connection_id: str | None = None
+) -> tuple[set[str], set[str]]:
+    """``(column ids with a ColumnAttribute, table ids a semantic Term represents)``."""
+    columns: set[str] = set()
+    tables: set[str] = set()
+    if column_ids:
+        rows = store().query_read(
+            select(s.column__has_attribute.c.column_id)
+            .join(
+                s.catalog_column,
+                s.catalog_column.c.id == s.column__has_attribute.c.column_id,
+            )
+            .join(s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+            .where(s.column__has_attribute.c.column_id.in_(column_ids))
+            .where(
+                *(
+                    [s.catalog_schema.c.database_id == connection_id]
+                    if connection_id is not None
+                    else []
+                )
+            )
+            .distinct()
+        )
+        columns = {str(r["column_id"]) for r in rows}
+    if table_ids:
+        rows = store().query_read(
+            select(s.table__term.c.table_id)
+            .join(s.term, s.term.c.id == s.table__term.c.term_id)
+            .join(s.catalog_table, s.catalog_table.c.id == s.table__term.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+            .where(
+                s.table__term.c.table_id.in_(table_ids),
+                s.term.c.source == SEMANTIC_SOURCE,
+                *(
+                    [s.catalog_schema.c.database_id == connection_id]
+                    if connection_id is not None
+                    else []
+                ),
+            )
+            .distinct()
+        )
+        tables = {str(r["table_id"]) for r in rows}
+    return columns, tables
 
 
 def fetch_term_table_pairs(

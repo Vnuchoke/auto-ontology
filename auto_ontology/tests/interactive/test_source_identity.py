@@ -179,7 +179,7 @@ def test_coverage_graph_receives_canonical_identity() -> None:
     with (
         patch.object(entity_resolution, "get_llm_client", return_value=object()),
         patch.object(
-            entity_resolution._ec_app, "invoke", return_value={"path_state": {}}
+            entity_resolution, "_run_entity_coverage", return_value={"path_state": {}}
         ) as invoke,
     ):
         entity_resolution._run_entity_coverage_pipeline(

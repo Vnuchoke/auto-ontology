@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING
 from auto_ontology.catalog.constants import Labels
 
 from auto_ontology.semantic.constants import LABEL_SQL_ATTRIBUTE
+from auto_ontology.semantic.constants import LABEL_COLUMN_ATTRIBUTE, LABEL_TERM
+from auto_ontology.dal.attributes import fetch_attr_column_contexts
+from auto_ontology.dal.terms import get_full_term_by_id
 
 from auto_ontology.dal.custom_analyses import (
     fetch_custom_analyses_with_sql,
@@ -30,7 +33,11 @@ from auto_ontology.dal.sql_attributes import (
     fetch_sql_attributes_with_sql,
     fetch_tables_from_sql_attributes,
 )
-from auto_ontology.dal.datasources import fetch_col_table_contexts, fetch_tables_by_ids
+from auto_ontology.dal.datasources import (
+    fetch_col_table_contexts,
+    fetch_columns_for_table,
+    fetch_tables_by_ids,
+)
 from auto_ontology.retrieval.data_access.relevant_tables import (
     _normalize_table_to_relevant_shape,
 )
@@ -54,7 +61,17 @@ def expand_info(ids_and_labels: list | None, *, connection_id: str | None) -> di
     result: dict = {}
     for item in ids_and_labels or []:
         node_id, label = item.get("id"), item.get("label")
-        if label == Labels.COLUMN:
+        if label == LABEL_TERM:
+            term = get_full_term_by_id(node_id, connection_id=connection_id)
+            if term:
+                result[node_id] = term
+        elif label == LABEL_COLUMN_ATTRIBUTE:
+            context = fetch_attr_column_contexts(
+                [node_id], connection_id=connection_id
+            ).get(str(node_id))
+            if context:
+                result[node_id] = context
+        elif label == Labels.COLUMN:
             context = fetch_col_table_contexts(
                 [node_id], connection_id=connection_id
             ).get(node_id)
@@ -63,7 +80,23 @@ def expand_info(ids_and_labels: list | None, *, connection_id: str | None) -> di
             tables = fetch_tables_by_ids(
                 [context["table_id"]], connection_id=connection_id
             )
-            result[node_id] = {**context, "relevant_tables": tables}
+            table = fetch_columns_for_table(
+                context["table_id"], connection_id=connection_id
+            )
+            column = next(
+                (
+                    column
+                    for column in (table or {}).get("columns", [])
+                    if column["id"] == node_id
+                ),
+                None,
+            )
+            if column is not None:
+                result[node_id] = {
+                    **context,
+                    "name": column["column_name"],
+                    "relevant_tables": tables,
+                }
         elif label in (Labels.CUSTOM_ANALYSIS, LABEL_SQL_ATTRIBUTE):
             fetch, fetch_tables = (
                 (fetch_custom_analyses_with_sql, fetch_tables_from_custom_analyses)

@@ -174,14 +174,16 @@ def test_catalog_refresh_scopes_descriptions_before_embedding_text(
     from unittest.mock import Mock
 
     from auto_ontology.server.datasources import service
-    from auto_ontology.utils import embedding
-    import auto_ontology.utils as utils
-    import auto_ontology.vdb as vdb
-    from auto_ontology.vdb import records
+    from auto_ontology.utils import catalog_reembed
 
     store().query_write(
         s.column_attribute.update()
         .where(s.column_attribute.c.id == "attr-a")
+        .values(description=local_description)
+    )
+    store().query_write(
+        s.catalog_column.update()
+        .where(s.catalog_column.c.id == "c-a")
         .values(description=local_description)
     )
     store().query_write(
@@ -193,14 +195,16 @@ def test_catalog_refresh_scopes_descriptions_before_embedding_text(
         s.column__semantic_fk.insert().values(column_id="c-a", attribute_id="attr-b")
     )
     captured: list[dict] = []
-    monkeypatch.setattr(utils, "get_embed_params", lambda: None)
+    monkeypatch.setattr(catalog_reembed, "get_embed_params", lambda: None)
     monkeypatch.setattr(
-        embedding,
+        catalog_reembed,
         "embed_rows",
         lambda rows, *_args, **_kwargs: captured.extend(rows) or rows,
     )
-    monkeypatch.setattr(vdb, "get_data_vdb", Mock(return_value=Mock()))
-    monkeypatch.setattr(records, "write_embedded_rows", lambda _vdb, rows: len(rows))
+    monkeypatch.setattr(catalog_reembed, "get_data_vdb", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        catalog_reembed, "write_embedded_rows", lambda _vdb, rows: len(rows)
+    )
 
     service._refresh_vdb_embeddings([node_id])
     assert captured

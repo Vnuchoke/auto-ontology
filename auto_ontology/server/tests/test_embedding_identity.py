@@ -12,6 +12,7 @@ from auto_ontology.server.custom_analyses import service as analyses
 from auto_ontology.server.datasources import service as datasources
 from auto_ontology.server.sql_attributes import service as attributes
 from auto_ontology.utils import embedding
+from auto_ontology.utils import catalog_reembed
 from auto_ontology.vdb import records
 import auto_ontology.utils as utils
 import auto_ontology.vdb as vdb_module
@@ -60,13 +61,25 @@ def test_catalog_refresh_repeatedly_deletes_only_selected_source(
         ]
     )
     monkeypatch.setattr(
-        datasources,
+        catalog_reembed,
         "fetch_tables_and_columns_by_node_ids",
         lambda _ids: (tables, columns, "shop"),
     )
+    monkeypatch.setattr(
+        catalog_reembed, "fetch_parent_table_id_for_column", lambda _id: None
+    )
+    monkeypatch.setattr(catalog_reembed, "get_embed_params", lambda: None)
+    monkeypatch.setattr(
+        catalog_reembed,
+        "embed_rows",
+        lambda rows, *_args, **_kwargs: captured_embedding.extend(rows) or rows,
+    )
+    monkeypatch.setattr(
+        catalog_reembed, "write_embedded_rows", lambda _vdb, rows: len(rows)
+    )
     vdb = Mock()
     factory = Mock(return_value=vdb)
-    monkeypatch.setattr(vdb_module, "get_data_vdb", factory)
+    monkeypatch.setattr(catalog_reembed, "get_data_vdb", factory)
     for _ in range(2):
         datasources._refresh_vdb_embeddings(["table", "column"])
     assert len(captured_embedding) == 4
@@ -85,9 +98,17 @@ def test_catalog_refresh_rejects_mixed_source_input_before_embedding(
     tables = pd.DataFrame([dict(id="table", connection_id="A")])
     columns = pd.DataFrame([dict(id="column", connection_id="B")])
     monkeypatch.setattr(
-        datasources,
+        catalog_reembed,
         "fetch_tables_and_columns_by_node_ids",
         lambda _ids: (tables, columns, "shop"),
+    )
+    monkeypatch.setattr(
+        catalog_reembed, "fetch_parent_table_id_for_column", lambda _id: None
+    )
+    monkeypatch.setattr(
+        catalog_reembed,
+        "embed_rows",
+        lambda rows, *_args, **_kwargs: captured_embedding.extend(rows) or rows,
     )
     with pytest.raises(ValueError, match="single connection_id"):
         datasources._refresh_vdb_embeddings(["table", "column"])

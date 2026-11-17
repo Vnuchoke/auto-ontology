@@ -95,10 +95,10 @@ def test_direct_state_uses_one_cid_and_safe_provenance(
             }
         }
     )
-    monkeypatch.setattr(main, "app", SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(main, "run", invoke)
     selected, other = (
-        SimpleNamespace(connection_id="a"),
-        SimpleNamespace(connection_id="b"),
+        SimpleNamespace(connection_id="a", database_name="sales"),
+        SimpleNamespace(connection_id="b", database_name="sales"),
     )
     response = main.get_coverage_response(
         {

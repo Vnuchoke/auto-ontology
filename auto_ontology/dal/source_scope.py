@@ -13,10 +13,12 @@ def query_source_scope(connection_id: str) -> ColumnElement:
     """A statement and every linked table/column must belong to this source."""
     foreign_tables = (
         select(literal(1))
-        .select_from(s.sql_query__table.join(s.catalog_table).join(s.catalog_schema))
+        .select_from(
+            s.sql_query__table.outerjoin(s.catalog_table).outerjoin(s.catalog_schema)
+        )
         .where(
             s.sql_query__table.c.sql_query_id == s.sql_query.c.id,
-            s.catalog_schema.c.database_id != connection_id,
+            s.catalog_schema.c.database_id.is_distinct_from(connection_id),
         )
         .correlate(s.sql_query)
         .exists()
@@ -24,13 +26,13 @@ def query_source_scope(connection_id: str) -> ColumnElement:
     foreign_columns = (
         select(literal(1))
         .select_from(
-            s.sql_query__column.join(s.catalog_column)
-            .join(s.catalog_table)
-            .join(s.catalog_schema)
+            s.sql_query__column.outerjoin(s.catalog_column)
+            .outerjoin(s.catalog_table)
+            .outerjoin(s.catalog_schema)
         )
         .where(
             s.sql_query__column.c.sql_query_id == s.sql_query.c.id,
-            s.catalog_schema.c.database_id != connection_id,
+            s.catalog_schema.c.database_id.is_distinct_from(connection_id),
         )
         .correlate(s.sql_query)
         .exists()

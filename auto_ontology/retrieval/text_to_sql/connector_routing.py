@@ -75,6 +75,11 @@ def resolve_connector_from_tables(
     if len(connection_ids) > 1:
         raise ValueError("Relevant tables span multiple source connections.")
     if connection_ids:
+        if any(
+            not isinstance(table, dict) or not table.get("connection_id")
+            for table in tables
+        ):
+            raise ValueError("Relevant tables include unowned source dependencies.")
         connection_id = next(iter(connection_ids))
         matches = [
             connector

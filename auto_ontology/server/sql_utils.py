@@ -65,7 +65,9 @@ def validate_sql(
 
     if query_obj is None:
         raise SqlParseError(
-            "SQL doesn't reference any table known to the catalog; "
-            "ingest the schema first or check the query",
+            "SQL doesn't reference any table known to the catalog. Write a full "
+            "query, such as SELECT SUM(amount) FROM sales.orders; a bare "
+            "expression names no table. If the table is new, ingest its schema "
+            "first.",
         )
     return query_obj

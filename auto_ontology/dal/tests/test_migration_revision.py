@@ -18,25 +18,17 @@ import pathlib
 import re
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-VERSIONS = ROOT / "alembic" / "versions"
 VALUES = ROOT / "helm" / "auto-ontology" / "values.yaml"
 
 
 def _head_revisions() -> list[str]:
-    """Revisions nothing else lists as its ``down_revision``."""
-    revisions: dict[str, str | None] = {}
-    for path in VERSIONS.glob("*.py"):
-        text = path.read_text()
-        rev = re.search(r'^revision: str = ["\']([^"\']+)["\']', text, re.M)
-        down = re.search(
-            r'^down_revision: [^=]+= (?:["\']([^"\']+)["\']|None)', text, re.M
-        )
-        if rev:
-            revisions[rev.group(1)] = down.group(1) if down else None
-    parents = {d for d in revisions.values() if d}
-    return sorted(set(revisions) - parents)
+    """Use Alembic's graph so tuple parents of merge revisions are counted."""
+    config = Config(str(ROOT / "alembic.ini"))
+    return sorted(ScriptDirectory.from_config(config).get_heads())
 
 
 def test_there_is_exactly_one_head_migration() -> None:

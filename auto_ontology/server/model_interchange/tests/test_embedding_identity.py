@@ -149,6 +149,7 @@ def test_import_column_projection_contains_only_its_samples():
         live_id="attr",
         name="Amount",
         description="local-A",
+        column_description="column-A",
         term_name="Revenue",
         source_column="amount",
         table_id="table-A",

@@ -152,5 +152,5 @@ def test_connector_mismatch_rejected_before_model_sql_store(
 def test_probe_without_connector_identity_never_executes() -> None:
     connector = Mock(connection_id=None)
     with pytest.raises(ValueError, match="source_not_ready"):
-        ve._execute_capped(connector, "SELECT 1")
+        ve.execute_capped(connector, "SELECT 1")
     connector.execute.assert_not_called()

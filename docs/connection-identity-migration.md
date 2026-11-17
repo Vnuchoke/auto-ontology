@@ -145,7 +145,22 @@ PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic check
 Цепочка включает constraints revision `d27b94f58c31` и retirement revision
 `e38c06a17f42`: непустые уникальные ярлыки, повтор физических имён,
 source-scoped уникальность SQL metadata и таблицу `retired_connection`.
-Helm pin и runtime schema gate этого релиза ожидают `e38c06a17f42`.
+После завершения backfill и этой цепочки применить объединённую ревизию релиза:
+
+```bash
+PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic upgrade f5b40e9c3271
+```
+
+Merge-ревизия `f4a39d8b2160` объединяет identity head `e38c06a17f42` и upstream head `caee572fa81c`
+(семейства терминов и статистика distinct-значений). Обе ветки сохраняются;
+сама merge-ревизия не выполняет DDL. Следующая ревизия `f5b40e9c3271` снимает
+глобальную уникальность членства Term в семействе: общий Term сохраняет
+независимые семейства схем разных источников. Выбор family prefix ограничен
+схемой таблицы-владельца атрибута. Downgrade не удаляет эти членства и отказывает,
+если старое ограничение нарушено. Helm pin и runtime schema gate этого
+релиза ожидают `f5b40e9c3271`. Это не отменяет staged backfill выше и запрет
+смешанного запуска старых и source-aware writers. Команды миграции выполняются
+только на отдельно разрешённом store; слияние кода не применяет их к БД.
 Проверить одинаковые ID-наборы у API/ingestion, env-first при непустом
 `CONNECTION_STRINGS`, выбранный source результата и отсутствие изменений
 соседа после scoped reset. До этих проверок API/workers не активировать.

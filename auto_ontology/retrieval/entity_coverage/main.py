@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Entry point for the entity-coverage LangGraph pipeline."""
+"""Entry point for the entity-coverage pipeline."""
 
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from auto_ontology.retrieval.data_access.custom_analyses import fetch_custom_analyses
-from auto_ontology.retrieval.entity_coverage.graph import create_graph
+from auto_ontology.retrieval.entity_coverage.pipeline import create_steps, run
 from auto_ontology.retrieval.entity_coverage.state import (
     DEFAULT_MAX_DISTANCE,
     EntityCoveragePayload,
 )
 from auto_ontology.retrieval.text_to_sql.state import AgentState
 from auto_ontology.utils.llm_invoke import get_llm_client
-from auto_ontology.connectors.sources import SourceDescriptor
+from auto_ontology.connectors.sources import SourceSelectionError
 from auto_ontology.retrieval.source_context import resolve_query_source
 
 logger = logging.getLogger(__name__)
@@ -30,23 +30,22 @@ except (ValueError, EnvironmentError, OSError) as exc:
     logger.error("Failed to initialize LLM client: %s", exc)
     llm_client = None
 
-graph = create_graph()
-app = graph.compile()
+steps = create_steps()
 
 
-def _build_state(
-    payload: EntityCoveragePayload, source: SourceDescriptor
-) -> AgentState:
+def _build_state(payload: EntityCoveragePayload) -> AgentState:
+    source = resolve_query_source(
+        connection_id=payload.get("connection_id"),
+        connection_label=payload.get("connection_label"),
+        target_db=payload.get("target_db"),
+    )
     connectors = [
         connector
         for connector in payload.get("connectors", [])
         if getattr(connector, "connection_id", None) == source.connection_id
     ]
-    if not connectors:
-        raise ValueError(
-            "EntityCoveragePayload is missing required 'connectors'. "
-            "Provide a non-empty list of database connectors."
-        )
+    if len(connectors) != 1 or connectors[0].database_name != source.database_name:
+        raise SourceSelectionError(503, "source_unavailable")
 
     data_retriever = payload.get("data_retriever")
     if data_retriever is None:
@@ -63,7 +62,8 @@ def _build_state(
         acronyms or []
     )
 
-    initial_path_state = dict(payload.get("path_state") or {})
+    # Coverage always starts a fresh extraction; resume artifacts are not evidence.
+    initial_path_state = {}
     max_distance = payload.get("max_distance", DEFAULT_MAX_DISTANCE)
     initial_path_state["max_distance"] = float(max_distance)
     initial_path_state["return_uncovered_entities"] = bool(
@@ -97,16 +97,11 @@ def _build_state(
 
 def get_coverage_response(payload: EntityCoveragePayload) -> dict:
     """Run the entity-coverage graph and return coverage and ranked candidates."""
-    source = resolve_query_source(
-        connection_id=payload.get("connection_id"),
-        connection_label=payload.get("connection_label"),
-        target_db=payload.get("target_db"),
-    )
+    state = _build_state(payload)
     if llm_client is None:
         raise RuntimeError("LLM client is not configured.")
 
-    state = _build_state(payload, source)
-    final_state = app.invoke(state, config={"recursion_limit": 10})
+    final_state = run(state, steps)
 
     path_state = final_state.get("path_state", {})
     final_response = path_state.get("final_response")
@@ -121,7 +116,6 @@ def get_coverage_response(payload: EntityCoveragePayload) -> dict:
 
 __all__ = [
     "get_coverage_response",
-    "app",
-    "graph",
+    "steps",
     "llm_client",
 ]

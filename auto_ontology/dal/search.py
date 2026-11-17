@@ -59,6 +59,7 @@ from sqlalchemy import (
 from auto_ontology.catalog.constants import Labels, TableTypes
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import store
+from auto_ontology.dal.source_scope import definition_source_scope
 from auto_ontology.semantic.constants import (
     LABEL_COLUMN_ATTRIBUTE,
     LABEL_PQL_ANALYSIS,
@@ -891,7 +892,9 @@ def _catalog_breadcrumbs(ids_by_label: dict[str, list[str]]) -> dict[str, list[d
     return out
 
 
-def _attribute_breadcrumbs(ids_by_label: dict[str, list[str]]) -> dict[str, list[dict]]:
+def _attribute_breadcrumbs(
+    ids_by_label: dict[str, list[str]], *, connection_id: str | None = None
+) -> dict[str, list[dict]]:
     """The Term each attribute is a property of.
 
     An attribute linked to several Terms shows the lowest-id one. Which Term
@@ -916,6 +919,13 @@ def _attribute_breadcrumbs(ids_by_label: dict[str, list[str]]) -> dict[str, list
             )
             .select_from(link.join(s.term, s.term.c.id == link.c.term_id))
             .where(link.c.attribute_id.in_(ids), _term_is_visible())
+            .where(
+                *(
+                    [s.term.c.id.in_(_scoped_term_ids(connection_id))]
+                    if connection_id is not None
+                    else []
+                )
+            )
             .order_by(link.c.attribute_id, s.term.c.id)
         ):
             if row["attribute_id"] in out:
@@ -950,7 +960,9 @@ def _list_rank(
     )
 
 
-def _with_breadcrumbs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _with_breadcrumbs(
+    rows: list[dict[str, Any]], *, connection_id: str | None = None
+) -> list[dict[str, Any]]:
     """Attach each hit's ancestor path, and flatten the two certified columns.
 
     The union carries certification in two columns because a Term's is a
@@ -961,7 +973,9 @@ def _with_breadcrumbs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         ids_by_label.setdefault(row["label"], []).append(row["id"])
 
-    crumbs = _catalog_breadcrumbs(ids_by_label) | _attribute_breadcrumbs(ids_by_label)
+    crumbs = _catalog_breadcrumbs(ids_by_label) | _attribute_breadcrumbs(
+        ids_by_label, connection_id=connection_id
+    )
 
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -983,6 +997,71 @@ def _with_breadcrumbs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _scoped_term_ids(connection_id: str) -> Select:
+    from auto_ontology.dal.terms import _term_projection_links
+
+    return select(_term_projection_links(connection_id).c.term_id)
+
+
+def _source_hits(statement: Select, connection_id: str) -> Select:
+    """Apply ownership before ranking/limiting, without changing global reads."""
+    from auto_ontology.dal.terms import _projection_attributes, _term_projection_links
+
+    tables = (
+        select(s.catalog_table.c.id)
+        .join(s.catalog_schema)
+        .where(s.catalog_schema.c.database_id == connection_id)
+    )
+    links = _term_projection_links(connection_id)
+    attributes = _projection_attributes(connection_id).subquery()
+    hits = statement.subquery()
+    scopes = (
+        (
+            "Database",
+            select(s.catalog_database.c.id).where(
+                s.catalog_database.c.id == connection_id
+            ),
+        ),
+        (
+            "Schema",
+            select(s.catalog_schema.c.id).where(
+                s.catalog_schema.c.database_id == connection_id
+            ),
+        ),
+        ("Table", tables),
+        (
+            "Column",
+            select(s.catalog_column.c.id).where(
+                s.catalog_column.c.table_id.in_(tables)
+            ),
+        ),
+        ("Term", select(links.c.term_id)),
+        ("ColumnAttribute", select(attributes.c.id)),
+        (
+            "SqlAttribute",
+            select(s.sql_attribute.c.id).where(
+                definition_source_scope(
+                    s.sql_attribute, s.sql_attribute__sql, "attribute_id", connection_id
+                )
+            ),
+        ),
+        (
+            "CustomAnalysis",
+            select(s.custom_analysis.c.id).where(
+                definition_source_scope(
+                    s.custom_analysis,
+                    s.custom_analysis__sql,
+                    "analysis_id",
+                    connection_id,
+                )
+            ),
+        ),
+    )
+    return select(hits).where(
+        or_(*(and_(hits.c.label == label, hits.c.id.in_(ids)) for label, ids in scopes))
+    )
+
+
 def fetch_global_search(
     tokens: list[str],
     object_types: set[str],
@@ -994,6 +1073,7 @@ def fetch_global_search(
     data_ids: list[str] | None = None,
     limit: int = LIST_LIMIT,
     synonym_limit: int | None = None,
+    connection_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Enriched hits for *tokens*, plus the Terms reached only by its synonyms.
 
@@ -1035,6 +1115,8 @@ def fetch_global_search(
     # a future branch, not a correction of these.
     rows: list[dict[str, Any]] = []
     if selects:
+        if connection_id is not None:
+            selects = [_source_hits(statement, connection_id) for statement in selects]
         hits = union_all(*selects).subquery()
         rows = store().query_read(
             select(hits)
@@ -1052,6 +1134,8 @@ def fetch_global_search(
         data_ids=data_ids or [],
     )
     if synonym_select is not None:
+        if connection_id is not None:
+            synonym_select = _source_hits(synonym_select, connection_id)
         if synonym_limit is not None:
             # Same rank as the page it is about to compete for, so the rows kept
             # are the ones the service would have seated anyway. Every row here
@@ -1071,7 +1155,11 @@ def fetch_global_search(
 
     seen: set[str] = set()
     unique = [row for row in rows if not (row["id"] in seen or seen.add(row["id"]))]
-    return _with_breadcrumbs(unique)
+    results = _with_breadcrumbs(unique, connection_id=connection_id)
+    if connection_id is not None:
+        for result in results:
+            result["connection_id"] = connection_id
+    return results
 
 
 def count_global_search(

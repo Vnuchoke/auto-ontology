@@ -22,10 +22,10 @@ from auto_ontology.utils.llm_invoke import (
     _structured_output_kwargs,
     _system_messages_first,
 )
-from auto_ontology.retrieval.text_to_sql.models import TableRelevanceModel
-from auto_ontology.retrieval.text_to_sql.agents.sql_reconstruction import ErrorAnalysis
-from auto_ontology.retrieval.text_to_sql.agents.sql_parse_validation import (
-    IntentValidationModel,
+from auto_ontology.retrieval.text_to_sql.models import (
+    CandidateFilterModel,
+    CombinedCandidateFilterModel,
+    FollowUpResolutionModel,
 )
 
 
@@ -159,20 +159,16 @@ def openai_transport() -> Any:
 @pytest.mark.parametrize(
     ("schema", "payload"),
     [
-        (TableRelevanceModel, {"reasoning": "keep tables", "tables_to_remove": []}),
+        (CandidateFilterModel, {"reasoning": "keep candidate", "best_id": None}),
         (
-            ErrorAnalysis,
-            {"error_type": "fixable", "search_queries": [], "explanation": "syntax"},
+            CombinedCandidateFilterModel,
+            {"custom_analysis_ids": [], "sql_attribute_ids": []},
         ),
         (
-            IntentValidationModel,
+            FollowUpResolutionModel,
             {
-                "reasoning": "valid",
-                "is_valid": True,
-                "join_issues": [],
-                "aggregation_issues": [],
-                "projection_issues": [],
-                "evidence_issues": [],
+                "is_follow_up": True,
+                "standalone_question": "How many orders were placed?",
             },
         ),
     ],
@@ -203,9 +199,9 @@ def test_real_openai_serializes_strict_production_schemas(
 @pytest.mark.parametrize(
     ("schema", "payload"),
     [
-        (TableRelevanceModel, {"reasoning": "bad", "tables_to_remove": "not a list"}),
-        (ErrorAnalysis, {"error_type": "unknown"}),
-        (IntentValidationModel, {"is_valid": "not a boolean"}),
+        (CandidateFilterModel, {"reasoning": "bad", "best_id": []}),
+        (CombinedCandidateFilterModel, {"custom_analysis_ids": "not a list"}),
+        (FollowUpResolutionModel, {"is_follow_up": "not a boolean"}),
     ],
 )
 def test_real_openai_rejects_malformed_output(
@@ -241,7 +237,7 @@ def test_nonretryable_400_is_not_repeated_or_reported_as_exhausted(
     monkeypatch.setattr(llm_invoke, "get_llm_client", lambda: reasoning)
     assert (
         llm_invoke.invoke_with_structured_output(
-            client, [HumanMessage(content="check")], TableRelevanceModel
+            client, [HumanMessage(content="check")], CandidateFilterModel
         )
         is None
     )
@@ -260,7 +256,7 @@ def test_client_build_failure_does_not_claim_retries(
 
     monkeypatch.setattr(llm_invoke, "get_non_reasoning_llm_client", unavailable)
     monkeypatch.setattr(llm_invoke, "get_llm_client", unavailable)
-    assert llm_invoke.safe_invoke_structured_nr([], TableRelevanceModel) is None
+    assert llm_invoke.safe_invoke_structured_nr([], CandidateFilterModel) is None
     assert "exhausted" not in caplog.text
 
 
@@ -321,7 +317,7 @@ def test_a_client_exposing_model_instead_of_model_name_still_matches() -> None:
 
 
 def _interleaved() -> list[BaseMessage]:
-    """The shape sql_from_semantic sends: system, user, system, system, user."""
+    """An interleaved shape: system, user, system, system, user."""
     return [
         SystemMessage(content="role"),
         HumanMessage(content="question"),

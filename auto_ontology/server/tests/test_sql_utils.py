@@ -50,3 +50,12 @@ def test_validation_propagates_source_context(parse) -> None:
     parse.assert_called_once_with(
         sql="select 1", dialects=[""], schemas={}, connection_id="a"
     )
+
+
+def test_sql_naming_no_catalog_table_asks_for_a_full_query() -> None:
+    with patch.object(sql_utils, "parse_query_single", return_value=None):
+        with pytest.raises(sql_utils.SqlParseError) as raised:
+            sql_utils.validate_sql("SUM(amount)", ["postgres"], {}, connection_id="a")
+    message = str(raised.value)
+    assert "known to the catalog" in message
+    assert "Write a full query" in message

@@ -69,6 +69,19 @@ def _delete_scoped_semantic(connection_id: str) -> int:
     ]
     deleted = len(
         store().query_write(
+            delete(s.term_family)
+            .where(
+                s.term_family.c.schema_id.in_(
+                    select(s.catalog_schema.c.id).where(
+                        s.catalog_schema.c.database_id == connection_id
+                    )
+                )
+            )
+            .returning(s.term_family.c.id)
+        )
+    )
+    deleted += len(
+        store().query_write(
             delete(s.column_attribute)
             .where(s.column_attribute.c.id.in_(attributes))
             .returning(s.column_attribute.c.id)

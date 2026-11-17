@@ -50,6 +50,9 @@ def test_boundary_selects_only_exact_connection_and_overwrites_resume(
         "display_label": "Local",
         "database_name": "sales",
     }
+    source_gate.assert_called_once_with(
+        connection_id="a", connection_label=None, target_db=None
+    )
 
 
 def test_foreign_resume_cannot_reuse_compiled_sql_context(source_gate: Mock) -> None:
@@ -77,10 +80,10 @@ def test_unknown_source_fails_before_graph_or_payload_checks(
 ) -> None:
     source_gate.side_effect = SourceSelectionError(422, "source_required")
     graph = Mock()
-    monkeypatch.setattr(main, "app", graph)
+    monkeypatch.setattr(main, "run_steps", graph)
     with pytest.raises(SourceSelectionError, match="source_required"):
         main.get_agent_response({"question": "q"})
-    graph.stream.assert_not_called()
+    graph.assert_not_called()
 
 
 def test_merge_and_answer_cannot_override_source() -> None:
@@ -90,7 +93,7 @@ def test_merge_and_answer_cannot_override_source() -> None:
         "source": source,
         "path_state": {"connection_id": "a", "target_db": "sales"},
     }
-    main._merge_node_output(
+    main._merge_step_output(
         state,
         {
             "connection_id": "b",
@@ -111,9 +114,10 @@ def test_merge_and_answer_cannot_override_source() -> None:
 def test_same_sales_connections_execute_distinct_results(
     source_gate: Mock, monkeypatch: pytest.MonkeyPatch, connection_id: str
 ) -> None:
-    import json
     import pandas as pd
-    from auto_ontology.retrieval.text_to_sql.agents import sql_execution
+    from auto_ontology.retrieval.text_to_sql.react import run_sql
+    from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
+    from .react_fakes import FakeCatalog
 
     source_gate.return_value = SourceDescriptor(
         connection_id, connection_id.upper(), "sales", "postgres", "env"
@@ -124,11 +128,16 @@ def test_same_sales_connections_execute_distinct_results(
     ]
     executed: list[str] = []
 
-    def execute(connector: object, sql: str) -> pd.DataFrame:
+    def execute(connector: object, sql: str, **kwargs) -> pd.DataFrame:
         executed.append(connector.connection_id)
         return pd.DataFrame({"marker": [connector.connection_id]})
 
-    monkeypatch.setattr(sql_execution, "execute_chat_sql", execute)
+    monkeypatch.setattr(run_sql, "execute_chat_sql", execute)
+    monkeypatch.setattr(
+        run_sql,
+        "catalog_for",
+        lambda *args: FakeCatalog({"orders": ["marker"]}, {"orders": ["public"]}),
+    )
     state = main._build_state(
         {
             "question": "q",
@@ -149,18 +158,23 @@ def test_same_sales_connections_execute_distinct_results(
             },
         }
     )
-    result = sql_execution.SQLExecutionAgent().execute(state)
+    ctx = ToolContext(
+        retriever=None,
+        connectors=state["connectors"],
+        database_name="sales",
+        connection_id=state["connection_id"],
+    )
+    ctx.show_table("public", "orders")
+    result = run_sql.run_sql(ctx, "SELECT marker FROM public.orders")
     assert executed == [connection_id]
-    assert json.loads(result["path_state"]["sql_response_from_db"][0]) == [
-        {"marker": connection_id}
-    ]
+    assert result == f"1 rows\nmarker\n{connection_id}"
 
 
 def test_foreign_resume_dependencies_rejected_before_graph(
     source_gate: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     graph = Mock()
-    monkeypatch.setattr(main, "app", graph)
+    monkeypatch.setattr(main, "run_steps", graph)
     with pytest.raises(SourceSelectionError, match="source_conflict"):
         main.get_agent_response(
             {
@@ -177,4 +191,42 @@ def test_foreign_resume_dependencies_rejected_before_graph(
                 },
             }
         )
-    graph.stream.assert_not_called()
+    graph.assert_not_called()
+
+
+def test_source_is_first_and_restore_injection_never_reaches_steps(
+    source_gate, monkeypatch
+):
+    connector = SimpleNamespace(connection_id="a", database_name="sales")
+    called = []
+
+    def steps(state, definitions):
+        called.append(state)
+        assert state["connectors"] == [connector]
+        assert not {"source", "connectors", "restore_from"} & state["path_state"].keys()
+        yield (
+            "end",
+            "react_sql_agent",
+            {"path_state": {"final_response": {"response": "ok"}}},
+        )
+
+    monkeypatch.setattr(main, "run_steps", steps)
+    stream = main.stream_agent_response(
+        {
+            "question": "q",
+            "connection_id": "a",
+            "connectors": [connector],
+            "data_retriever": object(),
+            "restore_from": {"connection_id": "b"},
+            "path_state": {
+                "connection_id": "a",
+                "source": {"connection_id": "b"},
+                "connectors": [object()],
+                "restore_from": {"connection_id": "b"},
+            },
+        }
+    )
+    assert next(stream)["type"] == "source"
+    assert called == []
+    assert list(stream)[-1]["answer"]["source"]["connection_id"] == "a"
+    source_gate.assert_called_once()

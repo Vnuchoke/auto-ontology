@@ -12969,6 +12969,7 @@
             "type": "string"
           },
           "expression": {
+            "description": "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a filter. SQL that references no catalog table is rejected.",
             "minLength": 1,
             "title": "Expression",
             "type": "string"
@@ -13158,6 +13159,7 @@
             "type": "string"
           },
           "expression": {
+            "description": "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a filter. SQL that references no catalog table is rejected.",
             "minLength": 1,
             "title": "Expression",
             "type": "string"
@@ -13206,6 +13208,7 @@
             "title": "Connection Id"
           },
           "expression": {
+            "description": "A full SQL query over catalog tables: `SELECT <expression> FROM <tables>` for a calculation, or `SELECT * FROM <tables> WHERE <condition>` for a filter. SQL that references no catalog table is rejected.",
             "minLength": 1,
             "title": "Expression",
             "type": "string"
