@@ -84,6 +84,7 @@ def _stubbed(monkeypatch: MonkeyPatch) -> None:
         lambda *_a, **_k: ("term1", "Order"),
     )
     monkeypatch.setattr(visit_enter, "merge_column_attribute", lambda **_k: None)
+    monkeypatch.setattr(visit_enter, "clear_column_values", lambda *_a: None)
     monkeypatch.setattr(
         visit_enter,
         "fetch_terms_and_attributes_for_table",
@@ -151,6 +152,35 @@ def test_steps_are_logged_in_pipeline_order(
         "Embedding 1 term(s)",
     ]
     assert [s.split("] ", 1)[1].rstrip("…") for s in starts] == order
+
+
+def test_unreadable_pii_tags_skip_the_inline_embed(
+    _stubbed: None, monkeypatch: MonkeyPatch, caplog: LogCaptureFixture
+) -> None:
+    """The embed reads catalog sample_values, so unknown PII tags skip it."""
+
+    def _unreadable(_ids: list[str]) -> set[str]:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(visit_enter, "pii_tagged_column_ids", _unreadable)
+    embedded: list[Any] = []
+    embedder = SimpleNamespace(
+        connection_id="source-sales", embed_term=lambda *a: embedded.append(a)
+    )
+    ctx = {**CTX, "columns": [{"id": "c1", "name": "status"}]}
+
+    with caplog.at_level(logging.INFO, logger="auto_ontology.semantic.visit_enter"):
+        visit_enter.process_table(
+            TABLE,
+            ctx,
+            connection_id="source-sales",
+            domain_summary=None,
+            embedder=embedder,
+        )
+
+    assert embedded == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert "[orders] Skipping inline embed — could not read PII tags" in messages
 
 
 def test_sampling_skip_is_logged_without_connector(

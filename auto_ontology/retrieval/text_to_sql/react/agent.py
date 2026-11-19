@@ -79,6 +79,13 @@ class ReactSQLAgent(BaseAgent):
             custom_prompts=state.get("custom_prompts") or "",
         )
         connector = connector_for(ctx)
+        # A connector that charges for queries says so through cost_status.
+        cost_status = getattr(connector, "cost_status", None)
+        if callable(cost_status):
+            ctx.cost_status = cost_status
+        can_run_queries = getattr(connector, "can_run_queries", None)
+        if callable(can_run_queries):
+            ctx.can_run_queries = can_run_queries
         result = run_episode(
             state.get("reasoning_llm") or state["llm"],
             ctx,
@@ -87,6 +94,9 @@ class ReactSQLAgent(BaseAgent):
             dialect=getattr(connector, "dialect", None),
             mode=episode_mode(state.get("prediction_override")),
             custom_prompts=state.get("custom_prompts"),
+            sql_examples=state.get("sql_examples"),
+            value_anchors=state.get("value_anchors"),
+            shorten_answer=bool(state.get("shorten_answer")),
         )
 
         for step in result.trajectory:

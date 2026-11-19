@@ -46,7 +46,7 @@ class Database:
     def __init__(self, prefix: str, label: str) -> None:
         self.prefix = prefix
         self.name = f"{prefix}-{label}"
-        self.id = _add(s.catalog_database, name=self.name)
+        self.id = _add(s.catalog_database, name=self.name, display_label=self.name)
         self.schema = _add(s.catalog_schema, database_id=self.id, name="dw")
         self.columns: dict[str, str] = {}
 

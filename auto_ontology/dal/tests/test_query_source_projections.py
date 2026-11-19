@@ -6,6 +6,7 @@ import pytest
 
 from auto_ontology.dal import datasources, schema as s, terms
 from auto_ontology.dal.session import store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_term_projections import (
     identity_database as identity_database,
     projections as projections,
@@ -152,7 +153,7 @@ def test_foreign_attribute_description_never_enters_table_context() -> None:
         .values(description="b_secret_description")
     )
     store().query_write(
-        s.column__semantic_fk.insert().values(column_id="c-a", attribute_id="attr-b")
+        s.column__semantic_fk.insert().values(column_id="c-a", key_id=column_key("c-b"))
     )
     rows = datasources.fetch_tables_by_ids(["t-a"], connection_id="a")
     assert "b_secret_description" not in str(rows)
@@ -192,7 +193,7 @@ def test_catalog_refresh_scopes_descriptions_before_embedding_text(
         .values(description="b_secret_description")
     )
     store().query_write(
-        s.column__semantic_fk.insert().values(column_id="c-a", attribute_id="attr-b")
+        s.column__semantic_fk.insert().values(column_id="c-a", key_id=column_key("c-b"))
     )
     captured: list[dict] = []
     monkeypatch.setattr(catalog_reembed, "get_embed_params", lambda: None)

@@ -148,7 +148,7 @@ source-scoped уникальность SQL metadata и таблицу `retired_c
 После завершения backfill и этой цепочки применить объединённую ревизию релиза:
 
 ```bash
-PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic upgrade f5b40e9c3271
+PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic upgrade 38a47b1ef206
 ```
 
 Merge-ревизия `f4a39d8b2160` объединяет identity head `e38c06a17f42` и upstream head `caee572fa81c`
@@ -157,8 +157,11 @@ Merge-ревизия `f4a39d8b2160` объединяет identity head `e38c06a1
 глобальную уникальность членства Term в семействе: общий Term сохраняет
 независимые семейства схем разных источников. Выбор family prefix ограничен
 схемой таблицы-владельца атрибута. Downgrade не удаляет эти членства и отказывает,
-если старое ограничение нарушено. Helm pin и runtime schema gate этого
-релиза ожидают `f5b40e9c3271`. Это не отменяет staged backfill выше и запрет
+если старое ограничение нарушено. Ревизия `38a47b1ef206` добавляет Concepts по
+источникам и переносит каждую цель semantic FK с её признаком маршрута.
+Если цель нельзя однозначно перенести в пределах источника, транзакция
+останавливается с ID рёбер и причинами вместо удаления. Helm pin и runtime
+schema gate ожидают `38a47b1ef206`. Это не отменяет staged backfill выше и запрет
 смешанного запуска старых и source-aware writers. Команды миграции выполняются
 только на отдельно разрешённом store; слияние кода не применяет их к БД.
 Проверить одинаковые ID-наборы у API/ingestion, env-first при непустом

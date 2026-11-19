@@ -22,6 +22,7 @@ from auto_ontology.semantic.models import SemanticFkJoinDefaultSelection
 
 @pytest.fixture(autouse=True)
 def active_source(monkeypatch):
+    monkeypatch.setattr(semantic_fk, "fetch_semantic_fk_ends", lambda **_: [])
     monkeypatch.setattr(
         "auto_ontology.connectors.sources.list_active_sources",
         lambda: [SourceDescriptor("database", "Test", "sales", "postgres", "managed")],
@@ -446,7 +447,7 @@ def test_pruning_reads_only_selected_source_and_removes_disjoint_edge() -> None:
         "target_schema_name": "public",
         "target_table_name": "A_TARGET",
         "target_column_name": "id",
-        "target_attribute_id": "a-attr",
+        "target_key_id": "a-key",
     }
     connector = MagicMock(dialect="postgres")
     connector.qualify.side_effect = lambda schema, table: f'"{schema}"."{table}"'
@@ -456,18 +457,44 @@ def test_pruning_reads_only_selected_source_and_removes_disjoint_edge() -> None:
             semantic_fk, "is_semantic_fk_db_query_prevented", return_value=False
         ),
         patch.object(
-            semantic_fk, "fetch_semantic_fk_join_groups", return_value=[row]
+            semantic_fk, "fetch_semantic_fk_ends", return_value=[row]
         ) as fetch,
         patch.object(
             semantic_fk, "_resolve_connector", return_value=connector
         ) as resolve,
-        patch.object(semantic_fk, "delete_semantic_fk") as delete,
+        patch.object(semantic_fk, "delete_semantic_fk", return_value=True) as delete,
     ):
         assert semantic_fk.prune_disjoint_semantic_fks("database") == 1
     fetch.assert_called_once_with(connection_id="database")
     resolve.assert_called_once_with("database")
-    delete.assert_called_once_with("a-col", "a-attr")
+    delete.assert_called_once_with("a-col", "a-key", connection_id="database")
     assert "B_ONLY" not in connector.execute.call_args.args[0]
+
+
+def test_pruning_preserves_split_key_with_overlap_and_deletes_only_other_key() -> None:
+    row = {
+        "source_table_name": "orders",
+        "source_column_name": "ref",
+        "source_column_id": "ref-col",
+        "target_column_name": "id",
+    }
+    rows = [
+        {**row, "target_key_id": "split", "target_table_name": "member_one"},
+        {**row, "target_key_id": "other", "target_table_name": "other_target"},
+        {**row, "target_key_id": "split", "target_table_name": "member_two"},
+    ]
+    connector = MagicMock(dialect="postgres")
+    connector.execute.side_effect = [pd.DataFrame({"n": [1, n]}) for n in (0, 0, 1)]
+    with (
+        patch.object(
+            semantic_fk, "is_semantic_fk_db_query_prevented", return_value=False
+        ),
+        patch.object(semantic_fk, "fetch_semantic_fk_ends", return_value=rows),
+        patch.object(semantic_fk, "_resolve_connector", return_value=connector),
+        patch.object(semantic_fk, "delete_semantic_fk", return_value=True) as delete,
+    ):
+        assert semantic_fk.prune_disjoint_semantic_fks("database") == 1
+    delete.assert_called_once_with("ref-col", "other", connection_id="database")
 
 
 def test_join_validation_accepts_a_returned_row() -> None:
@@ -583,6 +610,8 @@ def _join_group_row(column_id: str, column_name: str) -> dict:
         "source_column_id": column_id,
         "source_column_name": column_name,
         "source_column_description": f"The {column_name} role.",
+        "target_concept_id": "customer-concept",
+        "target_key_id": "customer-key",
         "target_attribute_id": "customer-attribute",
         "target_attribute_name": "Customer ID",
         "target_table_id": "customers-table",
@@ -612,8 +641,9 @@ def test_single_semantic_fk_is_default_without_llm() -> None:
     get_llm_client.assert_not_called()
     set_default.assert_called_once_with(
         "orders-table",
-        "customer-attribute",
+        "customer-key",
         "customer-id-column",
+        connection_id="database",
     )
 
 
@@ -647,8 +677,9 @@ def test_llm_selects_default_from_parallel_semantic_fks() -> None:
 
     set_default.assert_called_once_with(
         "orders-table",
-        "customer-attribute",
+        "customer-key",
         "customer-column",
+        connection_id="database",
     )
 
 
@@ -682,8 +713,9 @@ def test_invalid_llm_selection_uses_deterministic_default() -> None:
 
     set_default.assert_called_once_with(
         "orders-table",
-        "customer-attribute",
+        "customer-key",
         "a-column",
+        connection_id="database",
     )
 
 
@@ -709,8 +741,9 @@ def test_missing_llm_uses_deterministic_default() -> None:
 
     set_default.assert_called_once_with(
         "orders-table",
-        "customer-attribute",
+        "customer-key",
         "a-column",
+        connection_id="database",
     )
 
 
@@ -786,7 +819,7 @@ def test_inferred_fk_is_stored_when_the_join_returns_rows() -> None:
 
     assert created == 1
     join.assert_called_once()
-    merge.assert_called_once_with("col-1", "attr")
+    merge.assert_called_once_with("col-1", "attr", connection_id="database")
 
 
 def test_inferred_fk_is_dropped_when_the_join_returns_nothing() -> None:
@@ -804,7 +837,7 @@ def test_prevented_db_queries_store_the_pick_without_validation() -> None:
     assert created == 1
     resolve_connector.assert_not_called()
     join.assert_not_called()
-    merge.assert_called_once_with("col-1", "attr")
+    merge.assert_called_once_with("col-1", "attr", connection_id="database")
 
 
 @pytest.mark.parametrize(
@@ -828,11 +861,8 @@ def test_declared_fk_is_trusted_without_a_join(name: str, target: str) -> None:
             return_value=candidates,
         ),
         patch(
-            "auto_ontology.semantic.semantic_fk.find_column_attribute_by_column_id",
-            return_value="attr",
-        ),
-        patch(
-            "auto_ontology.semantic.semantic_fk.merge_semantic_fk", return_value=True
+            "auto_ontology.semantic.semantic_fk.merge_semantic_fk_to_column",
+            return_value=True,
         ) as merge,
         patch("auto_ontology.semantic.semantic_fk._join_returns_rows") as join,
         patch(
@@ -842,8 +872,41 @@ def test_declared_fk_is_trusted_without_a_join(name: str, target: str) -> None:
     ):
         assert semantic_fk.resolve_semantic_fks("database") == 1
 
-    merge.assert_called_once_with("col-1", "attr")
+    merge.assert_called_once_with(
+        "col-1", target, declared=True, connection_id="database"
+    )
     join.assert_not_called()
+
+
+def test_a_declared_fk_that_cannot_be_keyed_is_left_unresolved() -> None:
+    """The declared target is the one answer; inference is not tried instead."""
+    candidates = [
+        {
+            "id": "col-1",
+            "name": "customer_id",
+            "table_name": "orders",
+            "table_id": "orders-table",
+            "fk_target_col_id": "customers-id",
+        }
+    ]
+    with (
+        patch(
+            "auto_ontology.semantic.semantic_fk.find_unlinked_fk_columns",
+            return_value=candidates,
+        ),
+        patch(
+            "auto_ontology.semantic.semantic_fk.merge_semantic_fk_to_column",
+            return_value=False,
+        ),
+        patch("auto_ontology.semantic.semantic_fk._build_retriever") as retriever,
+        patch(
+            "auto_ontology.semantic.semantic_fk.fetch_semantic_fk_join_groups",
+            return_value=[],
+        ),
+    ):
+        assert semantic_fk.resolve_semantic_fks("database") == 0
+
+    retriever.assert_not_called()
 
 
 def test_declared_fk_onto_the_column_itself_is_rejected() -> None:

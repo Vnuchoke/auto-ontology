@@ -299,7 +299,7 @@ def test_a_term_family_goes_with_its_database(world) -> None:
     _link(s.term__term_family, term_id=shop.term("Room"), family_id=ours, base_name="R")
     theirs = _add(s.term_family, schema_id=warehouse.schema, prefix="OLD")
 
-    r.delete_semantic_layer(shop.name)
+    r.delete_semantic_layer(shop.id)
 
     assert not _exists(s.term_family, ours)
     assert _exists(s.term_family, theirs)

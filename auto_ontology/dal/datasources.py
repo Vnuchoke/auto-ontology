@@ -19,7 +19,7 @@ Two shapes recur and are easy to break:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Sequence
 
 import pandas as pd
 from sqlalchemy import (
@@ -36,8 +36,13 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy import values as sa_values
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 
 from auto_ontology.dal import schema as s
+from auto_ontology.dal.concepts import (
+    semantic_fk_attribute_links,
+    semantic_fk_targets,
+)
 from auto_ontology.dal.session import store, write_transaction
 from auto_ontology.dal.sql_fragments import (
     column_description_expr,
@@ -73,10 +78,14 @@ def query_column_description_expr(connection_id: str | None) -> ColumnElement:
         .where(s.catalog_schema.c.database_id == connection_id)
     )
     descriptions = []
-    for link in (s.column__has_attribute, s.column__semantic_fk):
+    for link in (s.column__has_attribute, semantic_fk_attribute_links()):
         descriptions.append(
             select(s.column_attribute.c.description)
-            .select_from(link.join(s.column_attribute))
+            .select_from(
+                link.join(
+                    s.column_attribute, s.column_attribute.c.id == link.c.attribute_id
+                )
+            )
             .where(
                 link.c.column_id == s.catalog_column.c.id,
                 s.column_attribute.c.table_id.in_(tables),
@@ -643,6 +652,38 @@ def store_column_sample_values(table_id: str, samples: dict[str, list]) -> None:
     _set_column_property(table_id, encoded, "sample_values")
 
 
+#: The ``catalog_column`` fields profiling derives from a column's values.
+VALUE_PROFILE_COLUMNS = (
+    "sample_values",
+    "distinct_values",
+    "is_unique",
+    "distinct_ratio",
+    "format",
+)
+
+
+def clear_column_values(table_id: str, column_names: Sequence[str]) -> None:
+    """Null everything profiling derived from the values of columns.
+
+    That is every field in :data:`VALUE_PROFILE_COLUMNS`. The store functions
+    above leave a column they are not given untouched, so a profile persisted
+    before a column was withheld from sampling would otherwise outlive the
+    decision. A stale ``is_unique`` is not harmless: it keeps the column a
+    semantic FK target, whose values are probed live when none are stored.
+    """
+    names = list(column_names)
+    if not names:
+        return
+    store().query_write(
+        update(s.catalog_column)
+        .where(
+            s.catalog_column.c.table_id == table_id,
+            s.catalog_column.c.name.in_(names),
+        )
+        .values(dict.fromkeys(VALUE_PROFILE_COLUMNS))
+    )
+
+
 def store_column_uniqueness(table_id: str, uniqueness: dict[str, bool]) -> None:
     """Write ``is_unique`` flags onto a table's columns."""
     if not uniqueness:
@@ -982,6 +1023,7 @@ def _terms_count(table_id: ColumnElement) -> ColumnElement:
             .exists()
         )
 
+    referencing = semantic_fk_attribute_links("terms_count_referencing")
     direct = (
         select(literal(1))
         .where(
@@ -994,7 +1036,7 @@ def _terms_count(table_id: ColumnElement) -> ColumnElement:
     return (
         select(func.count())
         .select_from(s.term)
-        .where(direct | via(s.column__has_attribute) | via(s.column__semantic_fk))
+        .where(direct | via(s.column__has_attribute) | via(referencing))
         .correlate(owner)
         .scalar_subquery()
     )
@@ -1180,66 +1222,53 @@ def fetch_columns_for_table(
 
 
 def _semantic_fk_target_expr(connection_id: str | None = None) -> ColumnElement:
-    """``schema.table.column`` a catalog column's semantic FK lands on.
-
-    The FK points at an attribute; the column that owns the attribute is the
-    target. Correlated on ``catalog_column``.
-    """
-    semantic_owner = s.column__has_attribute.alias("semantic_fk_owner")
-    semantic_target = s.catalog_column.alias("semantic_fk_target")
-    semantic_table = s.catalog_table.alias("semantic_fk_table")
-    semantic_schema = s.catalog_schema.alias("semantic_fk_schema")
-    semantic_attribute = s.column_attribute.alias("semantic_fk_attribute")
-    return (
+    """Render every target key, retaining each split key's member columns."""
+    targets = semantic_fk_targets("prompt_fk_target")
+    column = s.catalog_column.alias("prompt_target_column")
+    table = s.catalog_table.alias("prompt_target_table")
+    schema = s.catalog_schema.alias("prompt_target_schema")
+    qualified = func.concat_ws(".", schema.c.name, table.c.name, column.c.name)
+    members = func.string_agg(qualified, aggregate_order_by(literal(", "), qualified))
+    per_key = (
         select(
-            func.concat_ws(
-                ".",
-                semantic_schema.c.name,
-                semantic_table.c.name,
-                semantic_target.c.name,
-            )
+            targets.c.key_id,
+            targets.c.use_in_join_paths,
+            case(
+                (func.count() > 1, s.concept.c.name + " (" + members + ")"),
+                else_=func.min(qualified),
+            ).label("label"),
         )
         .select_from(
-            s.column__semantic_fk.join(
-                semantic_owner,
-                semantic_owner.c.attribute_id == s.column__semantic_fk.c.attribute_id,
-            )
-            .join(
-                semantic_target,
-                semantic_target.c.id == semantic_owner.c.column_id,
-            )
-            .join(
-                semantic_table,
-                semantic_table.c.id == semantic_target.c.table_id,
-            )
-            .join(
-                semantic_schema,
-                semantic_schema.c.id == semantic_table.c.schema_id,
-            )
-            .join(
-                semantic_attribute,
-                semantic_attribute.c.id == s.column__semantic_fk.c.attribute_id,
-            )
+            targets.join(column, column.c.id == targets.c.target_column_id)
+            .join(table, table.c.id == column.c.table_id)
+            .join(schema, schema.c.id == table.c.schema_id)
+            .join(s.concept, s.concept.c.id == targets.c.concept_id)
         )
         .where(
-            s.column__semantic_fk.c.column_id == s.catalog_column.c.id,
+            targets.c.fk_column_id == s.catalog_column.c.id,
             *(
-                [
-                    semantic_schema.c.database_id == connection_id,
-                    semantic_attribute.c.table_id == semantic_target.c.table_id,
-                    semantic_attribute.c.source_column == semantic_target.c.name,
-                ]
+                [targets.c.database_id == connection_id]
                 if connection_id is not None
                 else []
             ),
         )
+        .group_by(targets.c.key_id, targets.c.use_in_join_paths, s.concept.c.name)
         .correlate(s.catalog_column)
-        .order_by(
-            semantic_schema.c.name,
-            semantic_table.c.name,
-            semantic_target.c.name,
+        .subquery("prompt_key_labels")
+    )
+    return (
+        select(
+            func.string_agg(
+                per_key.c.label,
+                aggregate_order_by(
+                    literal("; "),
+                    per_key.c.use_in_join_paths.desc(),
+                    per_key.c.label,
+                    per_key.c.key_id,
+                ),
+            )
         )
-        .limit(1)
+        .correlate(s.catalog_column)
         .scalar_subquery()
     )
 
@@ -1264,8 +1293,8 @@ def fetch_tables_by_ids(
     without sample_values from the vector-index hit can be back-filled. ``is_nullable`` is included
     alongside it so projection rules can tell when a requested item may be
     missing; ``None`` means the connector could not determine it.
-    ``semantic_fk`` resolves the referenced attribute back to its owning column
-    and returns that target as ``schema.table.column`` for SQL prompts.
+    ``semantic_fk`` names what the column references for SQL prompts — see
+    :func:`_semantic_fk_target_expr`.
     """
     if not table_ids:
         return []
@@ -1613,11 +1642,11 @@ def fetch_bridge_table_candidates(connection_id: str) -> list[dict[str, Any]]:
     # target contributes nothing and the size comparison fails -- the second of
     # the two checks described above.
     #
-    # The SEMANTIC_FK route is Column -> ColumnAttribute <- Column: the
-    # attribute this column references is *owned* by some other column, and that
-    # other column is the join target. Reversing it would make every bridge
-    # point back at itself.
-    sem_owner = s.column__has_attribute.alias("sem_owner")
+    # The SEMANTIC_FK route is Column -> Concept key -> member Column: the key
+    # this column references is held by some other column, and that other
+    # column is the join target -- one member of a split Concept is enough.
+    # Reversing it would make every bridge point back at itself.
+    sem_owner = semantic_fk_targets("sem_owner", one_per_fk=True)
     resolved = (
         select(
             s.catalog_column.c.id.label("column_id"),
@@ -1639,14 +1668,11 @@ def fetch_bridge_table_candidates(connection_id: str) -> list[dict[str, Any]]:
             .outerjoin(fk_table, fk_table.c.id == fk_target.c.table_id)
             .outerjoin(fk_schema, fk_schema.c.id == fk_table.c.schema_id)
             .outerjoin(
-                s.column__semantic_fk,
-                s.column__semantic_fk.c.column_id == s.catalog_column.c.id,
-            )
-            .outerjoin(
                 sem_owner,
-                sem_owner.c.attribute_id == s.column__semantic_fk.c.attribute_id,
+                (sem_owner.c.fk_column_id == s.catalog_column.c.id)
+                & s.column__foreign_key.c.source_column_id.is_(None),
             )
-            .outerjoin(sem_target, sem_target.c.id == sem_owner.c.column_id)
+            .outerjoin(sem_target, sem_target.c.id == sem_owner.c.target_column_id)
             .outerjoin(sem_table, sem_table.c.id == sem_target.c.table_id)
             .outerjoin(sem_schema, sem_schema.c.id == sem_table.c.schema_id)
         )

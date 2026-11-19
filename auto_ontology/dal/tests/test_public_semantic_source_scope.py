@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from auto_ontology.dal import schema as s, terms
 from auto_ontology.dal import exploration
 from auto_ontology.dal.session import dispose_engine, store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_connection_identity_schema import (
     ROOT,
     identity_database,  # noqa: F401
@@ -199,7 +200,7 @@ def test_scoped_count_and_paths_use_canonical_owned_attributes(
 ) -> None:
     store().query_write(
         insert(s.column__semantic_fk).values(
-            column_id="column-b", attribute_id="attr-a"
+            column_id="column-b", key_id=column_key("column-a")
         )
     )
     store().query_write(
@@ -298,7 +299,10 @@ def test_table_detail_scopes_before_count_page_and_query_hydration(
         (s.table__term, {"term_id": "local", "table_id": "table-a"}),
         (s.column_attribute__term, {"attribute_id": "attr-b", "term_id": "only-b"}),
         (s.column__has_attribute, {"attribute_id": "attr-b", "column_id": "column-a"}),
-        (s.column__semantic_fk, {"attribute_id": "attr-b", "column_id": "column-a"}),
+        (
+            s.column__semantic_fk,
+            {"key_id": column_key("column-b"), "column_id": "column-a"},
+        ),
         (s.sql_query__table, {"sql_query_id": "sql-b", "table_id": "table-a"}),
         (s.sql_query, {"id": "legacy", "sql_full_query": "SELECT 'legacy-secret'"}),
         (s.sql_query__table, {"sql_query_id": "legacy", "table_id": "table-a"}),
@@ -386,7 +390,7 @@ def test_table_detail_requires_canonical_column_but_keeps_local_semantic_fk(
     )
     store().query_write(
         insert(s.column__semantic_fk).values(
-            column_id="column-a", attribute_id="other-attr-a"
+            column_id="column-a", key_id=column_key("other-column-a")
         )
     )
     assert (

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from sqlalchemy import Select, delete, select, union
 
 from auto_ontology.dal import schema as s
+from auto_ontology.dal.concepts import delete_orphan_concepts
 from auto_ontology.dal.connections import finalize_connection_removal
 from auto_ontology.dal.session import store, write_transaction
 from auto_ontology.vdb import get_data_vdb, get_semantic_vdb
@@ -95,8 +96,24 @@ def _delete_scoped_semantic(connection_id: str) -> int:
                 .returning(table.c.id)
             )
         )
+    deleted += len(
+        store().query_write(
+            delete(s.column__semantic_fk)
+            .where(
+                s.column__semantic_fk.c.column_id.in_(
+                    select(s.catalog_column.c.id).where(
+                        s.catalog_column.c.table_id.in_(tables)
+                    )
+                )
+            )
+            .returning(s.column__semantic_fk.c.column_id)
+        )
+    )
     store().query_write(
         delete(s.table__term).where(s.table__term.c.table_id.in_(tables))
+    )
+    store().query_write(
+        delete(s.term__concept).where(s.term__concept.c.database_id == connection_id)
     )
     needed = union(
         select(s.table__term.c.term_id),
@@ -113,6 +130,7 @@ def _delete_scoped_semantic(connection_id: str) -> int:
     )
     # Keep ingestion history for rebuilding semantics; remove only unlinked SQL.
     _delete_queries(connection_id)
+    deleted += delete_orphan_concepts([connection_id])
     return deleted
 
 

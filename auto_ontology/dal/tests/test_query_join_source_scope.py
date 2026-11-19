@@ -10,6 +10,7 @@ from alembic.config import Config
 
 from auto_ontology.dal import attributes, datasources, schema as s, terms
 from auto_ontology.dal.session import dispose_engine, store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_connection_identity_schema import (
     ROOT,
     identity_database as identity_database,
@@ -87,7 +88,9 @@ def join_sources(identity_database: None) -> Iterator[None]:
         for column in ("c-left", "c-right"):
             store().query_write(
                 s.column__semantic_fk.insert().values(
-                    column_id=column, attribute_id="attr-b", use_in_join_paths=True
+                    column_id=column,
+                    key_id=column_key("c-hub-b"),
+                    use_in_join_paths=True,
                 )
             )
         yield
@@ -123,12 +126,12 @@ def test_foreign_intermediate_and_wrong_source_cannot_bridge(
 
 
 @pytest.mark.usefixtures("join_sources")
-def test_local_routes_work_but_foreign_canonical_owner_is_rejected() -> None:
+def test_local_routes_do_not_depend_on_column_attribute_metadata() -> None:
     store().query_write(s.column__semantic_fk.delete())
     for column in ("c-left", "c-right"):
         store().query_write(
             s.column__semantic_fk.insert().values(
-                column_id=column, attribute_id="attr-a", use_in_join_paths=True
+                column_id=column, key_id=column_key("c-hub-a"), use_in_join_paths=True
             )
         )
     assert len(attributes.find_join_path("c-left", "c-right", connection_id="a")) == 2
@@ -154,8 +157,7 @@ def test_local_routes_work_but_foreign_canonical_owner_is_rejected() -> None:
         .where(s.column_attribute.c.id == "attr-a")
         .values(table_id="hub-b")
     )
-    _assert_no_routes("a")
-    # Explicit administrative inspection retains the legacy graph behavior.
+    assert len(attributes.find_join_path("c-left", "c-right", connection_id="a")) == 2
     assert attributes.find_shared_hub_bridge("c-left", "c-right") == {
         "hub_table": "orders",
         "hub_column": "id",
@@ -223,7 +225,7 @@ def test_relevant_candidate_tables_ignore_forged_identity_and_text() -> None:
 @pytest.mark.parametrize(
     "corruption", [{"table_id": "hub-b"}, {"source_column": "not_id"}]
 )
-def test_candidate_fk_prompt_requires_canonical_attribute_owner(
+def test_candidate_fk_prompt_uses_key_ancestry_not_attribute_metadata(
     corruption: dict[str, str],
 ) -> None:
     from auto_ontology.retrieval.data_access.relevant_tables import (
@@ -234,7 +236,9 @@ def test_candidate_fk_prompt_requires_canonical_attribute_owner(
     store().query_write(s.column__semantic_fk.delete())
     for col in ("c-left", "c-right", "c-hub-a"):
         store().query_write(
-            s.column__semantic_fk.insert().values(column_id=col, attribute_id="attr-a")
+            s.column__semantic_fk.insert().values(
+                column_id=col, key_id=column_key("c-hub-a")
+            )
         )
     tables = get_relevant_tables_from_candidates(
         [{"relevant_tables": [{"id": tid} for tid in ("left", "right", "hub-a")]}],
@@ -263,34 +267,27 @@ def test_candidate_fk_prompt_requires_canonical_attribute_owner(
     )
     assert {t["connection_id"] for t in tables} == {"a"}
     prompt = "\n".join(_table_block(t, set(), False) for t in tables)
-    assert "public.orders.id" not in prompt
-    assert all(t["columns"][0]["semantic_fk"] is None for t in tables)
+    assert "public.orders.id" in prompt
+    assert all(t["columns"][0]["semantic_fk"] == "public.orders.id" for t in tables)
     assert "b_canonical_description" not in prompt
     assert "b_sample" not in prompt
     admin = datasources.fetch_tables_by_ids(["left", "right"])
     assert all(t["columns"][0]["semantic_fk"] == "public.orders.id" for t in admin)
 
-    # An independent valid parallel target must survive the invalid relation.
-    store().query_write(
-        s.column_attribute.insert().values(
-            id="valid-alt",
-            table_id="hub-a",
-            source_column="id",
-            name="Alternate identity",
-            term_name="Term a",
-            source="semantic",
-        )
-    )
-    store().query_write(
-        s.column__has_attribute.insert().values(
-            attribute_id="valid-alt", column_id="c-hub-a"
-        )
-    )
+    # A second edge on one column is exposed without changing the other column.
     store().query_write(
         s.column__semantic_fk.insert().values(
-            attribute_id="valid-alt", column_id="c-right"
+            key_id=column_key("c-left"),
+            column_id="c-right",
+            use_in_join_paths=False,
         )
     )
-    tables = datasources.fetch_tables_by_ids(["left", "right"], connection_id="a")
-    assert tables[0]["columns"][0]["semantic_fk"] is None
-    assert tables[1]["columns"][0]["semantic_fk"] == "public.orders.id"
+    tables = {
+        row["id"]: row
+        for row in datasources.fetch_tables_by_ids(["left", "right"], connection_id="a")
+    }
+    assert tables["left"]["columns"][0]["semantic_fk"] == "public.orders.id"
+    assert (
+        tables["right"]["columns"][0]["semantic_fk"]
+        == "public.orders.id; public.left.id"
+    )

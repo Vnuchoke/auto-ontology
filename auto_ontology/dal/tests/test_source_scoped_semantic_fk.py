@@ -11,6 +11,7 @@ from sqlalchemy import insert, select
 
 from auto_ontology.dal import attributes as a, schema as s
 from auto_ontology.dal.session import dispose_engine, store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_connection_identity_schema import (
     ROOT,
     identity_database,  # noqa: F401
@@ -76,6 +77,15 @@ def sources(identity_database):  # noqa: F811
             ),
         ):
             store().query_write(insert(table).values(**values))
+    for cid in ("a", "b"):
+        store().query_write(
+            insert(s.term).values(id=f"term-{cid}", name=f"Customer {cid}")
+        )
+        store().query_write(
+            insert(s.table__term).values(
+                term_id=f"term-{cid}", table_id=f"customers-{cid}"
+            )
+        )
     store().query_write(
         insert(s.column__foreign_key).values(
             source_column_id="bad-a", target_column_id="target-b"
@@ -101,8 +111,8 @@ def test_foreign_merge_with_same_physical_name_is_rejected_without_write(sources
 def test_local_merge_is_idempotent(sources):
     assert a.merge_semantic_fk("customer-a", "attr-a") is True
     assert a.merge_semantic_fk("customer-a", "attr-a") is True
-    assert [(row["column_id"], row["attribute_id"]) for row in edges()] == [
-        ("customer-a", "attr-a")
+    assert [(row["column_id"], row["key_id"]) for row in edges()] == [
+        ("customer-a", column_key("target-a"))
     ]
 
 
@@ -113,7 +123,9 @@ def test_guard_uses_canonical_owner_not_reverse_fk_fallback(sources):
         )
     )
     store().query_write(
-        insert(s.column__semantic_fk).values(column_id="free-a", attribute_id="attr-b")
+        insert(s.column__semantic_fk).values(
+            column_id="free-a", key_id=column_key("target-b")
+        )
     )
     before = edges()
     assert a.merge_semantic_fk("customer-a", "attr-b") is False
@@ -140,14 +152,14 @@ def test_one_local_target_does_not_hide_another_foreign_declared_target(sources)
 
 
 def test_join_groups_exclude_corrupted_foreign_and_noncanonical_links(sources):
-    for column, attribute in [
-        ("customer-a", "attr-a"),
-        ("free-a", "attr-b"),
-        ("customer-b", "attr-b"),
+    for column, target in [
+        ("customer-a", "target-a"),
+        ("free-a", "target-b"),
+        ("customer-b", "target-b"),
     ]:
         store().query_write(
             insert(s.column__semantic_fk).values(
-                column_id=column, attribute_id=attribute
+                column_id=column, key_id=column_key(target)
             )
         )
     store().query_write(
@@ -164,7 +176,9 @@ def test_join_groups_exclude_corrupted_foreign_and_noncanonical_links(sources):
 
 def test_scoped_attribute_context_never_decorates_with_foreign_metadata(sources):
     store().query_write(
-        insert(s.column__semantic_fk).values(column_id="free-a", attribute_id="attr-b")
+        insert(s.column__semantic_fk).values(
+            column_id="free-a", key_id=column_key("target-b")
+        )
     )
     store().query_write(
         insert(s.column__has_attribute).values(

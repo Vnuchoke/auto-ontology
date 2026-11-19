@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Select, Text, exists, literal, not_, select
+from typing import Any
+
+from sqlalchemy import ColumnElement, Select, Text, exists, literal, not_, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from auto_ontology.dal import schema as s
+from auto_ontology.dal.datasources import VALUE_PROFILE_COLUMNS
 from auto_ontology.dal.session import IN_QUERY_BATCH, store, write_transaction
 from auto_ontology.dal.source_scope import definition_source_scope
 from auto_ontology.dal.tags import (
@@ -49,6 +52,174 @@ def mark_columns_pii_processed(column_ids: list[str]) -> int:
         )
         marked += len(rows)
     return marked
+
+
+def pii_tagged_column_ids(column_ids: list[str]) -> set[str]:
+    """The subset of *column_ids* that carry the shared ``PII`` tag.
+
+    Read from the label on the column, so a hand-applied tag counts exactly
+    like a detector one. Empty when no column was ever tagged ``PII`` (the tag
+    does not exist yet). Batched by :data:`IN_QUERY_BATCH` for the same
+    bind-parameter limit as :func:`mark_columns_pii_processed`.
+    """
+    ids = [column_id for column_id in column_ids if column_id]
+    if not ids:
+        return set()
+    pii_tag = get_tag_by_name(PII_TAG_NAME)
+    if pii_tag is None:
+        return set()
+
+    tagged: set[str] = set()
+    for offset in range(0, len(ids), IN_QUERY_BATCH):
+        chunk = ids[offset : offset + IN_QUERY_BATCH]
+        rows = store().query_read(
+            select(s.tag_target.c.column_id).where(
+                s.tag_target.c.tag_id == str(pii_tag["id"]),
+                s.tag_target.c.column_id.in_(chunk),
+            )
+        )
+        tagged.update(str(row["column_id"]) for row in rows)
+    return tagged
+
+
+def _pii_column_scope(
+    column_ids: list[str] | None,
+    connection_id: str | None,
+) -> tuple[ColumnElement[bool], list[list[str] | None]] | None:
+    """The "column is tagged ``PII``" condition, and the id chunks to apply it to.
+
+    ``None`` when there is nothing to do: no ``PII`` tag exists yet, or
+    *column_ids* names no column. A ``None`` chunk means the whole catalog.
+    """
+    if connection_id is not None and not connection_id.strip():
+        raise ValueError("connection_id must not be blank")
+    pii_tag = get_tag_by_name(PII_TAG_NAME)
+    if pii_tag is None:
+        return None
+    tagged = (
+        select(literal(1))
+        .where(
+            s.tag_target.c.tag_id == str(pii_tag["id"]),
+            s.tag_target.c.column_id == s.catalog_column.c.id,
+        )
+        .exists()
+    )
+    if connection_id is not None:
+        tagged = tagged & (
+            select(literal(1))
+            .select_from(s.catalog_table.join(s.catalog_schema))
+            .where(
+                s.catalog_table.c.id == s.catalog_column.c.table_id,
+                s.catalog_schema.c.database_id == connection_id,
+            )
+            .correlate(s.catalog_column)
+            .exists()
+        )
+    if column_ids is None:
+        return tagged, [None]
+    ids = [column_id for column_id in column_ids if column_id]
+    if not ids:
+        return None
+    return tagged, [
+        ids[offset : offset + IN_QUERY_BATCH]
+        for offset in range(0, len(ids), IN_QUERY_BATCH)
+    ]
+
+
+def clear_values_of_pii_columns(
+    column_ids: list[str] | None = None, *, connection_id: str | None = None
+) -> int:
+    """Null the value profile of ``PII``-tagged columns that still hold one.
+
+    Every field in :data:`~auto_ontology.dal.datasources.VALUE_PROFILE_COLUMNS`,
+    for every tagged column -- or only those among *column_ids* -- whose profile
+    is not already empty. Driven by the labels, like
+    :func:`tag_attributes_of_tagged_columns`, so a hand-applied or rule-applied
+    tag counts, and a column cleared once is not touched again: the pass is
+    idempotent and the first run is the backfill.
+
+    If *connection_id* is given, only columns owned by that source are cleared.
+    Returns how many columns were cleared.
+    """
+    scope = _pii_column_scope(column_ids, connection_id)
+    if scope is None:
+        return 0
+    tagged, chunks = scope
+    holding = or_(
+        *(s.catalog_column.c[name].is_not(None) for name in VALUE_PROFILE_COLUMNS)
+    )
+
+    cleared = 0
+    for chunk in chunks:
+        conditions = [tagged, holding]
+        if chunk is not None:
+            conditions.append(s.catalog_column.c.id.in_(chunk))
+        rows = store().query_write(
+            s.catalog_column.update()
+            .where(*conditions)
+            .values(dict.fromkeys(VALUE_PROFILE_COLUMNS))
+            .returning(s.catalog_column.c.id)
+        )
+        cleared += len(rows)
+    return cleared
+
+
+def fetch_attributes_of_pii_columns(
+    column_ids: list[str] | None = None, *, connection_id: str | None = None
+) -> list[dict[str, Any]]:
+    """The ColumnAttributes owned by ``PII``-tagged columns, wherever they live.
+
+    Every tagged column, or only those among *column_ids*, whatever their
+    profile holds: a vector embedded from the values outlives the catalog
+    clearing them, so this is what the semantic VDB is checked against.
+
+    Rows carry ``attribute_id``, ``table_id``, ``connection_id`` and display
+    ``database_name``. If supplied, *connection_id* narrows the catalog ancestry.
+    """
+    scope = _pii_column_scope(column_ids, connection_id)
+    if scope is None:
+        return []
+    tagged, chunks = scope
+
+    rows: list[dict[str, Any]] = []
+    for chunk in chunks:
+        conditions = [tagged]
+        if chunk is not None:
+            conditions.append(s.catalog_column.c.id.in_(chunk))
+        rows.extend(
+            dict(row)
+            for row in store().query_read(
+                select(
+                    s.column__has_attribute.c.attribute_id,
+                    s.catalog_table.c.id.label("table_id"),
+                    s.catalog_database.c.name.label("database_name"),
+                    s.catalog_database.c.id.label("connection_id"),
+                )
+                .select_from(
+                    s.column__has_attribute.join(s.column_attribute)
+                    .join(
+                        s.catalog_column,
+                        s.catalog_column.c.id == s.column__has_attribute.c.column_id,
+                    )
+                    .join(
+                        s.catalog_table,
+                        s.catalog_table.c.id == s.catalog_column.c.table_id,
+                    )
+                    .join(
+                        s.catalog_schema,
+                        s.catalog_schema.c.id == s.catalog_table.c.schema_id,
+                    )
+                    .join(
+                        s.catalog_database,
+                        s.catalog_database.c.id == s.catalog_schema.c.database_id,
+                    )
+                )
+                .where(
+                    s.column_attribute.c.table_id == s.catalog_table.c.id, *conditions
+                )
+            )
+        )
+    return rows
 
 
 def _column_attributes_of_tagged_columns(

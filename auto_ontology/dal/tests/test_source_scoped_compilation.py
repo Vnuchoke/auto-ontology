@@ -10,7 +10,9 @@ from alembic.config import Config
 from sqlalchemy import insert
 
 from auto_ontology.dal import datasources as d, schema as s, terms as t
+from auto_ontology.dal.concepts import ensure_term_concept, fetch_concept_members
 from auto_ontology.dal.session import dispose_engine, store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_connection_identity_schema import (
     ROOT,
     identity_database,  # noqa: F401
@@ -86,6 +88,17 @@ def test_compilation_reads_never_mix_same_named_sources(sources):
     assert [(r["id"], r["connection_id"]) for r in tables] == [("t-a", "a")]
 
 
+def test_shared_term_gets_a_separate_concept_per_connection(sources):
+    assert ensure_term_concept("shared") is None
+    a = ensure_term_concept("shared", connection_id="a")
+    b = ensure_term_concept("shared", connection_id="b")
+    assert a and b and a != b
+    assert ensure_term_concept("shared", connection_id="a") == a
+    members = fetch_concept_members(["t-a", "t-b"], connection_id="a")
+    assert set(members) == {"t-a"}
+    assert [row["table_id"] for row in members["t-a"]["members"]] == ["t-a"]
+
+
 def test_foreign_query_link_excludes_entire_statement(sources):
     store().query_write(
         insert(s.sql_query__table).values(sql_query_id="q-a", table_id="t-b")
@@ -144,7 +157,7 @@ def test_term_pairs_exclude_foreign_attribute_projection(sources):
         insert(s.column__has_attribute).values(attribute_id="attr-b", column_id="c-b")
     )
     store().query_write(
-        insert(s.column__semantic_fk).values(attribute_id="attr-b", column_id="c-a")
+        insert(s.column__semantic_fk).values(key_id=column_key("c-b"), column_id="c-a")
     )
     assert {r["term_id"] for r in t.fetch_term_table_pairs(connection_id="a")} == {
         "shared"

@@ -6,6 +6,7 @@ import pytest
 
 from auto_ontology.dal import attributes, schema as s
 from auto_ontology.dal.session import store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_connection_identity_schema import (
     identity_database as identity_database,
 )
@@ -42,12 +43,12 @@ def junction_sources(join_sources: None) -> None:
     )
     store().query_write(
         s.column__semantic_fk.insert().values(
-            column_id="c-right", attribute_id="attr-a", use_in_join_paths=True
+            column_id="c-right", key_id=column_key("c-hub-a"), use_in_join_paths=True
         )
     )
     store().query_write(
         s.column__semantic_fk.insert().values(
-            column_id="c-hub-b", attribute_id="attr-b", use_in_join_paths=True
+            column_id="c-hub-b", key_id=column_key("c-hub-b"), use_in_join_paths=True
         )
     )
     store().query_write(
@@ -101,7 +102,7 @@ def test_wrong_source_or_empty_source_has_no_local_paths(connection_id: str) -> 
 @pytest.mark.parametrize(
     "corruption", [{"table_id": "hub-b"}, {"source_column": "wrong"}]
 )
-def test_canonical_owner_rejects_semantic_but_preserves_declared_path(
+def test_attribute_metadata_does_not_change_key_based_junction_path(
     corruption: dict[str, str],
 ) -> None:
     store().query_write(
@@ -112,9 +113,8 @@ def test_canonical_owner_rejects_semantic_but_preserves_declared_path(
     junctions, paths = attributes.find_connected_junction_tables(
         ["hub-a"], connection_id="a"
     )
-    assert junctions == [{"id": "left", "name": "left"}]
-    assert len(paths) == 1 and paths[0][0]["source_table"] == "left"
-    # Administrative inspection retains its unscoped legacy graph behavior.
+    assert {row["id"] for row in junctions} == {"left", "right"}
+    assert len(paths) == 2
     assert len(attributes.find_connected_junction_tables(["hub-a"])[0]) == 2
 
 
@@ -130,7 +130,9 @@ def test_foreign_junction_cannot_connect_to_local_target(edge_kind: str) -> None
     else:
         store().query_write(
             s.column__semantic_fk.insert().values(
-                column_id="c-hub-b", attribute_id="attr-a", use_in_join_paths=True
+                column_id="c-hub-b",
+                key_id=column_key("c-hub-a"),
+                use_in_join_paths=True,
             )
         )
     junctions, _ = attributes.find_connected_junction_tables(
@@ -143,7 +145,7 @@ def test_foreign_junction_cannot_connect_to_local_target(edge_kind: str) -> None
 def test_parallel_edges_deduplicate_and_self_disabled_edges_are_excluded() -> None:
     store().query_write(
         s.column__semantic_fk.insert().values(
-            column_id="c-left", attribute_id="attr-a", use_in_join_paths=True
+            column_id="c-left", key_id=column_key("c-hub-a"), use_in_join_paths=True
         )
     )
     junctions, paths = attributes.find_connected_junction_tables(
@@ -188,12 +190,14 @@ def test_participation_requires_both_endpoints_in_selected_source() -> None:
                 column, connection_id=cid
             )
     store().query_write(
-        s.column__semantic_fk.insert().values(column_id="c-left", attribute_id="attr-b")
+        s.column__semantic_fk.insert().values(
+            column_id="c-left", key_id=column_key("c-hub-b")
+        )
     )
     assert not attributes.column_participates_in_semantic_fk(
         "c-left", connection_id="a"
     )
-    assert attributes.column_participates_in_semantic_fk("c-left")
+    assert not attributes.column_participates_in_semantic_fk("c-left")
     store().query_write(
         s.column__semantic_fk.update()
         .where(s.column__semantic_fk.c.column_id == "c-right")
@@ -209,7 +213,7 @@ def test_participation_requires_both_endpoints_in_selected_source() -> None:
 @pytest.mark.parametrize(
     "corruption", [{"table_id": "hub-b"}, {"source_column": "wrong"}]
 )
-def test_participation_requires_canonical_owner_on_both_sides(
+def test_participation_uses_key_members_not_attribute_metadata(
     corruption: dict[str, str],
 ) -> None:
     store().query_write(
@@ -218,9 +222,7 @@ def test_participation_requires_canonical_owner_on_both_sides(
         .values(**corruption)
     )
     for column in ("c-right", "c-hub-a"):
-        assert not attributes.column_participates_in_semantic_fk(
-            column, connection_id="a"
-        )
+        assert attributes.column_participates_in_semantic_fk(column, connection_id="a")
         assert attributes.column_participates_in_semantic_fk(column)
 
 
@@ -229,13 +231,13 @@ def test_foreign_incoming_edge_does_not_make_local_target_participate() -> None:
     store().query_write(s.column__semantic_fk.delete())
     store().query_write(
         s.column__semantic_fk.insert().values(
-            column_id="c-hub-b", attribute_id="attr-a"
+            column_id="c-hub-b", key_id=column_key("c-hub-a")
         )
     )
     assert not attributes.column_participates_in_semantic_fk(
         "c-hub-a", connection_id="a"
     )
-    assert attributes.column_participates_in_semantic_fk("c-hub-a")
+    assert not attributes.column_participates_in_semantic_fk("c-hub-a")
 
 
 @pytest.fixture
@@ -243,13 +245,13 @@ def sibling_sources(junction_sources: None) -> None:
     for column in ("c-left", "c-hub-b"):
         store().query_write(
             s.column__semantic_fk.insert().values(
-                column_id=column, attribute_id="attr-a", use_in_join_paths=True
+                column_id=column, key_id=column_key("c-hub-a"), use_in_join_paths=True
             )
         )
 
 
 @pytest.mark.usefixtures("sibling_sources")
-def test_siblings_filter_all_sources_before_cap_and_keep_admin_behavior() -> None:
+def test_siblings_filter_all_sources_before_cap() -> None:
     results, truncated = attributes.find_anchor_hub_siblings(
         "left", max_siblings=None, connection_id="a"
     )
@@ -265,7 +267,7 @@ def test_siblings_filter_all_sources_before_cap_and_keep_admin_behavior() -> Non
     ) == (results, 0)
     assert {
         row["id"] for row in attributes.find_anchor_hub_siblings("left", None)[0]
-    } == {"hub-a", "hub-b", "right"}
+    } == {"hub-a", "right"}
     for cid in ("b", "unknown", ""):
         assert attributes.find_anchor_hub_siblings("left", connection_id=cid) == ([], 0)
     assert attributes.find_anchor_hub_siblings("hub-b", connection_id="a") == ([], 0)
@@ -275,30 +277,39 @@ def test_siblings_filter_all_sources_before_cap_and_keep_admin_behavior() -> Non
 @pytest.mark.parametrize(
     "corruption", [{"table_id": "hub-b"}, {"source_column": "wrong"}]
 )
-def test_siblings_require_canonical_hub_owner(corruption: dict[str, str]) -> None:
+def test_siblings_use_hub_key_not_attribute_metadata(
+    corruption: dict[str, str],
+) -> None:
     store().query_write(
         s.column_attribute.update()
         .where(s.column_attribute.c.id == "attr-a")
         .values(**corruption)
     )
-    assert attributes.find_anchor_hub_siblings("left", connection_id="a") == ([], 0)
-    assert attributes.find_anchor_hub_siblings("left")[0]
+    assert {
+        row["id"]
+        for row in attributes.find_anchor_hub_siblings("left", connection_id="a")[0]
+    } == {"hub-a", "right"}
 
 
 @pytest.mark.usefixtures("sibling_sources")
-def test_siblings_reject_foreign_hub_even_with_valid_canonical_owner() -> None:
+def test_cross_root_key_members_are_not_followed() -> None:
+    key_a = column_key("c-hub-a")
     store().query_write(
-        s.column__has_attribute.update()
-        .where(s.column__has_attribute.c.attribute_id == "attr-a")
-        .values(column_id="c-hub-b")
+        s.concept_key__column.delete().where(
+            s.concept_key__column.c.column_id == "c-hub-b"
+        )
     )
     store().query_write(
-        s.column_attribute.update()
-        .where(s.column_attribute.c.id == "attr-a")
-        .values(table_id="hub-b")
+        s.concept_key__column.insert().values(
+            key_id=key_a, table_id="hub-b", column_id="c-hub-b"
+        )
     )
-    assert attributes.find_anchor_hub_siblings("left", connection_id="a") == ([], 0)
-    assert attributes.find_anchor_hub_siblings("left")[0]
+    assert attributes.find_join_path("c-left", "c-hub-b", connection_id="a") == []
+    assert attributes.find_join_path("c-left", "c-hub-b") == []
+    assert {
+        row["id"]
+        for row in attributes.find_anchor_hub_siblings("left", connection_id="a")[0]
+    } == {"hub-a", "right"}
 
 
 @pytest.mark.usefixtures("sibling_sources")

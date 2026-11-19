@@ -97,7 +97,10 @@ def _expected_semantic_ids(connection_id: str) -> set[str]:
     from auto_ontology.dal.sql_attributes import list_sql_attributes
     from auto_ontology.dal.custom_analyses import list_custom_analyses
 
-    terms, attrs = fetch_all_terms_and_attributes(connection_id=connection_id)
+    # The staged identity backfill runs before the term-family branch exists.
+    terms, attrs = fetch_all_terms_and_attributes(
+        connection_id=connection_id, include_family=False
+    )
     definitions = list_sql_attributes(
         connection_id=connection_id
     ) + list_custom_analyses(connection_id=connection_id)

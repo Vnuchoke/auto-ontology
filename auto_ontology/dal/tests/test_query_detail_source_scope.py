@@ -12,6 +12,7 @@ from sqlalchemy import Table, insert
 
 from auto_ontology.dal import exploration as e, schema as s
 from auto_ontology.dal.session import store
+from auto_ontology.dal.tests.fk_links import column_key
 from auto_ontology.dal.tests.test_public_semantic_source_scope import (
     identity_database as identity_database,
     semantic_sources as semantic_sources,
@@ -41,16 +42,19 @@ def test_local_column_does_not_hydrate_foreign_attribute(link: Table) -> None:
             s.column__has_attribute.c.column_id == "column-a"
         )
     )
-    store().query_write(
-        insert(link).values(column_id="column-a", attribute_id="attr-b")
+    direct = link is s.column__has_attribute
+    target = (
+        {"attribute_id": "attr-b"} if direct else {"key_id": column_key("column-b")}
     )
+    store().query_write(insert(link).values(column_id="column-a", **target))
     result = e.fetch_column_exploration_details("column-a", connection_id="a")
     assert result["column_attribute"] is None
     assert "marker-b" not in repr(result)
-    assert (
-        e.fetch_column_exploration_details("column-a")["column_attribute"]["id"]
-        == "attr-b"
-    )
+    unscoped = e.fetch_column_exploration_details("column-a")["column_attribute"]
+    if direct:
+        assert unscoped["id"] == "attr-b"
+    else:
+        assert unscoped is None  # A key cannot connect different catalog roots.
 
 
 @pytest.mark.usefixtures("semantic_sources")
@@ -110,7 +114,7 @@ def test_attribute_count_and_page_only_include_valid_local_paths() -> None:
     for column in ("local-fk", "column-b"):
         store().query_write(
             insert(s.column__semantic_fk).values(
-                column_id=column, attribute_id="attr-a"
+                column_id=column, key_id=column_key("column-a")
             )
         )
     # A local HAS_ATTRIBUTE edge to the wrong canonical column must not be counted.
@@ -171,7 +175,7 @@ def test_attribute_canonical_ownership_precedes_description_and_term(
         )
         store().query_write(
             insert(s.column__semantic_fk).values(
-                column_id="column-a", attribute_id="attr-a"
+                column_id="column-a", key_id=column_key("column-a")
             )
         )
     assert (

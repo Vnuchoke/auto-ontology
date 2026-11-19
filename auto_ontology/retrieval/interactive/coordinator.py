@@ -624,6 +624,7 @@ def create_session(
     numeric_type_alignment: bool = False,
     connection_id: str | None = None,
     connection_label: str | None = None,
+    column_meanings: str = "",
 ) -> InteractiveSessionState:
     source = resolve_query_source(
         connection_id=connection_id,
@@ -637,6 +638,7 @@ def create_session(
         connection_id=source.connection_id,
         db_schema=db_schema,
         external_kb=external_kb,
+        column_meanings=column_meanings,
         original_question=question,
         working_question=question,
         max_clarify_turns=max_clarify_turns,

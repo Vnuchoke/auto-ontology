@@ -28,6 +28,7 @@ from sqlalchemy import select, update  # noqa: E402
 
 from auto_ontology.dal import datasources as d  # noqa: E402
 from auto_ontology.dal import schema as s  # noqa: E402
+from auto_ontology.dal.tests.fk_links import link_semantic_fk  # noqa: E402
 from auto_ontology.dal.session import store  # noqa: E402
 from auto_ontology.semantic.constants import (  # noqa: E402
     SQL_ATTR_SOURCE_BRIDGE,
@@ -177,11 +178,17 @@ def test_tables_for_schema_counts_columns_and_terms(world) -> None:
     _link(s.column_attribute__term, attribute_id=attribute, term_id=shared)
     # A second, distinct Term via the SEMANTIC_FK route.
     fk_attribute = world.attribute("customer-ref")
+    store().query_write(
+        s.column_attribute.update()
+        .where(s.column_attribute.c.id == fk_attribute)
+        .values(table_id=world.tables["tags"], source_column="tag_id")
+    )
     _link(
-        s.column__semantic_fk,
-        column_id=world.columns["customers.customer_id"],
+        s.column__has_attribute,
+        column_id=world.columns["tags.tag_id"],
         attribute_id=fk_attribute,
     )
+    link_semantic_fk(world.columns["customers.customer_id"], fk_attribute)
     _link(s.column_attribute__term, attribute_id=fk_attribute, term_id=other)
 
     rows = _by_name(d.fetch_tables_for_schema(world.schema))
@@ -417,15 +424,11 @@ def test_tables_by_ids_nests_column_summaries(world) -> None:
     )
     customer_ref = world.attribute("customer-ref")
     _link(
-        s.column__semantic_fk,
-        column_id=world.columns["orders.customer_id"],
-        attribute_id=customer_ref,
-    )
-    _link(
         s.column__has_attribute,
         column_id=world.columns["customers.customer_id"],
         attribute_id=customer_ref,
     )
+    link_semantic_fk(world.columns["orders.customer_id"], customer_ref)
     rows = {
         r["name"]: r
         for r in d.fetch_tables_by_ids(
@@ -610,20 +613,20 @@ def test_no_ids_yields_empty_frames_and_no_database() -> None:
 def test_column_refresh_does_not_embed_its_parent_table(world, monkeypatch) -> None:
     from unittest.mock import Mock
     from auto_ontology.server.datasources import service
-    from auto_ontology import utils, vdb
-    from auto_ontology.utils import embedding
-    from auto_ontology.vdb import records
+    from auto_ontology.utils import catalog_reembed
 
     captured = []
     client = Mock()
-    monkeypatch.setattr(utils, "get_embed_params", lambda: None)
-    monkeypatch.setattr(vdb, "get_data_vdb", Mock(return_value=client))
+    monkeypatch.setattr(catalog_reembed, "get_embed_params", lambda: None)
+    monkeypatch.setattr(catalog_reembed, "get_data_vdb", Mock(return_value=client))
     monkeypatch.setattr(
-        embedding,
+        catalog_reembed,
         "embed_rows",
         lambda rows, *args, **kwargs: captured.extend(rows) or rows,
     )
-    monkeypatch.setattr(records, "write_embedded_rows", lambda client, rows: len(rows))
+    monkeypatch.setattr(
+        catalog_reembed, "write_embedded_rows", lambda client, rows: len(rows)
+    )
     column = world.columns["orders.total"]
     service._refresh_vdb_embeddings([column])
     assert [
@@ -792,11 +795,7 @@ def test_a_semantic_fk_counts_as_a_foreign_key(world) -> None:
         column_id=world.columns["tags.tag_id"],
         attribute_id=attribute,
     )
-    _link(
-        s.column__semantic_fk,
-        column_id=world.columns["order_note.tag_ref"],
-        attribute_id=attribute,
-    )
+    link_semantic_fk(world.columns["order_note.tag_ref"], attribute)
 
     rows = {r["table_name"]: r for r in d.fetch_bridge_table_candidates(world.db)}
     assert "order_note" in rows

@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BRANCH_HEADS = {"caee572fa81c", "e38c06a17f42"}
 MERGE_REVISION = "f4a39d8b2160"
 COMPATIBILITY_REVISION = "f5b40e9c3271"
+CONCEPT_REVISION = "38a47b1ef206"
 
 
 def test_merged_head_preserves_both_migration_branches_and_helm_pin() -> None:
@@ -23,8 +24,9 @@ def test_merged_head_preserves_both_migration_branches_and_helm_pin() -> None:
     heads = scripts.get_heads()
     assert len(heads) == 1, f"expected one merged head, found {heads}"
     head = scripts.get_revision(heads[0])
-    assert head.revision == COMPATIBILITY_REVISION
-    assert head.down_revision == MERGE_REVISION
+    assert head.revision == CONCEPT_REVISION
+    assert head.down_revision == COMPATIBILITY_REVISION
+    assert scripts.get_revision(COMPATIBILITY_REVISION).down_revision == MERGE_REVISION
     assert set(scripts.get_revision(MERGE_REVISION).down_revision) == BRANCH_HEADS
     ancestors = {revision.revision for revision in scripts.walk_revisions()}
     assert BRANCH_HEADS <= ancestors

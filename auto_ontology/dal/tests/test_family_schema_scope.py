@@ -184,7 +184,8 @@ def test_migration_graph(migration):
     config = Config()
     config.set_main_option("script_location", str(ROOT / "alembic"))
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == [REVISION]
+    assert scripts.get_heads() == ["38a47b1ef206"]
+    assert scripts.get_revision("38a47b1ef206").down_revision == REVISION
     assert migration.down_revision == "f4a39d8b2160"
     assert scripts.get_revision(REVISION).down_revision == migration.down_revision
 

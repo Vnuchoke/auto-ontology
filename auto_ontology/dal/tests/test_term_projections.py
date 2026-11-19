@@ -283,6 +283,8 @@ def test_global_edit_refreshes_each_projection_but_source_edit_only_one(
     assert {key: value for key, value in rows.items() if key[0] == "b"} == before_b
     writes.clear()
     service.update_column_attribute("shared", "attr-a", description="A context edit")
+    assert writes == [], "the attribute description is not used in its embedding"
+    service.update_column_attribute("shared", "attr-a", name="A context edit")
     assert writes == [("a", "attr-a")]
     assert "A context edit" in rows[("a", "attr-a")]["text"]
     assert {key: value for key, value in rows.items() if key[0] == "b"} == before_b

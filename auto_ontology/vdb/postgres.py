@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 _DATABASE_METADATA_COLUMN = "database_name"
 _LABEL_METADATA_COLUMN = "label"
 _CONNECTION_METADATA_COLUMN = "connection_id"
+#: ``PGVectorStore``'s default, which ``_get_store`` does not override.
+_CONTENT_COLUMN = "content"
 
 
 class _UnusableEmbeddings(Embeddings):
@@ -608,6 +610,43 @@ class PostgresVDB:
             node_id,
         )
         return deleted
+
+    def ids_with_content_containing(
+        self, node_ids: list[str], fragment: str, *, connection_id: str
+    ) -> list[str]:
+        """The metadata ``id`` of each row among *node_ids* whose text holds *fragment*.
+
+        Like :meth:`delete_by_id`, only the stable projection for the selected
+        source is considered. ``strpos`` makes ``%`` and ``_`` literal.
+        """
+        connection_id = self._source_scope(connection_id)
+        if not node_ids or not self._table_exists():
+            return []
+
+        self._require_source_schema()
+        ids_by_projection = {
+            projection_id(self.collection_name, connection_id, node_id): node_id
+            for node_id in node_ids
+        }
+        with psycopg.connect(self.connection_string) as conn:
+            with conn.cursor() as cur:
+                # Identifiers are internal config, composed as in delete_by_id.
+                cur.execute(
+                    sql.SQL(
+                        """
+                        SELECT langchain_id
+                        FROM {table}
+                        WHERE langchain_id = ANY(%s::uuid[])
+                          AND connection_id = %s
+                          AND strpos({content}, %s) > 0
+                        """
+                    ).format(
+                        table=sql.Identifier(self.schema_name, self.collection_name),
+                        content=sql.Identifier(_CONTENT_COLUMN),
+                    ),
+                    (list(ids_by_projection), connection_id, fragment),
+                )
+                return [ids_by_projection[str(row[0])] for row in cur.fetchall()]
 
     def retrieval(
         self,

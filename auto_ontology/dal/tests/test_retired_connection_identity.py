@@ -279,5 +279,5 @@ def test_downgrade_cannot_discard_retired_identities(retired_database: None) -> 
         {"connection_id": source_id}
     ]
     assert store().query_read("SELECT version_num FROM alembic_version") == [
-        {"version_num": "e38c06a17f42"}
+        {"version_num": "38a47b1ef206"}
     ]

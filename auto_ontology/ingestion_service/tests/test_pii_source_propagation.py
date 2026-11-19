@@ -13,10 +13,13 @@ from auto_ontology.pii_detection import service
 def test_ingestion_wrapper_propagates_only_selected_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    propagate = Mock()
+    propagate = Mock(side_effect=RuntimeError("tagging unavailable"))
+    withhold = Mock()
     monkeypatch.setattr(pii, "propagate_pii_to_attributes", propagate)
+    monkeypatch.setattr(pii, "withhold_pii_column_values", withhold)
     pii.run_pii_propagation("sales", connection_id="a")
     propagate.assert_called_once_with(connection_id="a")
+    withhold.assert_called_once_with(None, connection_id="a")
 
 
 def test_missing_source_is_rejected_before_pii_lookup(
