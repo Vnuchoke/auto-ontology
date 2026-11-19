@@ -183,9 +183,16 @@ def _backfill_concepts() -> None:
               FROM term JOIN term_db ON term_db.term_id = term.id
         )
         SELECT gen_random_uuid()::text AS id, term_id, database_id,
-               CASE WHEN rank = 1 THEN name ELSE name || ' (' || term_id || ')' END AS name,
+               CASE WHEN rank = 1 AND NOT EXISTS (
+                    SELECT 1 FROM concept c WHERE c.database_id = named.database_id
+                    AND c.name = named.name
+               ) THEN name ELSE name || ' (' || term_id || ')' END AS name,
                description
           FROM named
+         WHERE NOT EXISTS (
+            SELECT 1 FROM term__concept tc
+            WHERE tc.term_id = named.term_id AND tc.database_id = named.database_id
+         )
         """
     )
     op.execute(
@@ -320,6 +327,29 @@ def _repoint_semantic_fks() -> None:
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # A database coming from master already has Concepts and key-based FKs.
+    if op.get_context().as_sql:
+        raise RuntimeError(
+            "Concept migration requires an online upgrade to inspect the existing schema"
+        )
+    inspector = sa.inspect(op.get_bind())
+    fk_columns = {
+        column["name"]
+        for column in inspector.get_columns("column__semantic_fk", schema="public")
+    }
+    if inspector.has_table("concept", schema="public"):
+        membership = {
+            column["name"]
+            for column in inspector.get_columns("term__concept", schema="public")
+        }
+        if membership != {"term_id", "concept_id"} or fk_columns != {
+            "column_id",
+            "key_id",
+            "use_in_join_paths",
+        }:
+            raise RuntimeError("Unrecognized master Concepts schema; no edges changed")
+        _upgrade_master_concepts()
+        return
     _check_legacy_semantic_fks()
     op.execute("DROP VIEW IF EXISTS join_path_edge")
     _create_tables()
@@ -328,24 +358,88 @@ def upgrade() -> None:
     _repoint_semantic_fks()
 
 
-def downgrade() -> None:
-    """Downgrade schema."""
-    op.add_column(
-        "column__semantic_fk", sa.Column("attribute_id", sa.Text(), nullable=True)
+def _upgrade_master_concepts() -> None:
+    op.execute(
+        "LOCK TABLE column__semantic_fk, term__concept, concept_key__column IN ACCESS EXCLUSIVE MODE"
     )
-    # Back to an attribute: the lowest one held by any of the key's columns.
     op.execute(
         """
-        UPDATE column__semantic_fk f
-           SET attribute_id = target.attribute_id
-          FROM (
-              SELECT kc.key_id, min(h.attribute_id) AS attribute_id
-                FROM concept_key__column kc
-                JOIN column__has_attribute h ON h.column_id = kc.column_id
-               GROUP BY kc.key_id
-          ) target
-         WHERE target.key_id = f.key_id
+        DO $$
+        DECLARE failures text;
+        BEGIN
+            SELECT string_agg(problem, '; ') INTO failures
+              FROM (
+                SELECT format('key %s, member column %s', kc.key_id, kc.column_id) AS problem
+                  FROM concept_key__column kc
+                  JOIN concept_key k ON k.id = kc.key_id
+                  JOIN concept c ON c.id = k.concept_id
+                  JOIN catalog_column col ON col.id = kc.column_id
+                  JOIN catalog_table t ON t.id = col.table_id
+                  JOIN catalog_schema s ON s.id = t.schema_id
+                 WHERE kc.table_id <> t.id OR c.database_id <> s.database_id
+                UNION ALL
+                SELECT format('FK column %s, key %s', fk.column_id, fk.key_id)
+                  FROM column__semantic_fk fk
+                  JOIN concept_key k ON k.id = fk.key_id
+                  JOIN concept c ON c.id = k.concept_id
+                  JOIN catalog_column col ON col.id = fk.column_id
+                  JOIN catalog_table t ON t.id = col.table_id
+                  JOIN catalog_schema s ON s.id = t.schema_id
+                 WHERE c.database_id <> s.database_id OR NOT EXISTS (
+                     SELECT 1 FROM concept_key__column kc WHERE kc.key_id = fk.key_id
+                 )
+                 ORDER BY 1 LIMIT 10
+              ) problems;
+            IF failures IS NOT NULL THEN
+                RAISE EXCEPTION 'Cannot migrate master Concepts: cross-source, invalid or missing key members. First 10: %', failures;
+            END IF;
+        END $$
         """
+    )
+    op.add_column("term__concept", sa.Column("database_id", sa.Text(), nullable=True))
+    op.execute(
+        "UPDATE term__concept tc SET database_id = c.database_id "
+        "FROM concept c WHERE c.id = tc.concept_id"
+    )
+    op.alter_column(
+        "term__concept", "database_id", existing_type=sa.Text(), nullable=False
+    )
+    op.create_foreign_key(
+        op.f("fk_term__concept_database_id_catalog_database"),
+        "term__concept",
+        "catalog_database",
+        ["database_id"],
+        ["id"],
+        ondelete="CASCADE",
+    )
+    op.drop_constraint("uq_term__concept_term_id", "term__concept", type_="unique")
+    op.create_unique_constraint(
+        "uq_term__concept_term_id", "term__concept", ["term_id", "database_id"]
+    )
+    _backfill_concepts()
+    op.drop_constraint("pk_column__semantic_fk", "column__semantic_fk", type_="primary")
+    op.create_primary_key(
+        "pk_column__semantic_fk", "column__semantic_fk", ["column_id", "key_id"]
+    )
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    if op.get_context().environment_context.get_revision_argument() == "0b6f3c2a9d14":
+        raise RuntimeError(
+            "Downgrade to the master Concepts schema requires a coordinated backup"
+        )
+    op.execute("LOCK TABLE concept, column__semantic_fk IN ACCESS EXCLUSIVE MODE")
+    if (
+        op.get_bind()
+        .execute(sa.text("SELECT EXISTS (SELECT 1 FROM concept)"))
+        .scalar_one()
+    ):
+        raise RuntimeError(
+            "Downgrade would discard Concepts; restore a coordinated backup instead"
+        )
+    op.add_column(
+        "column__semantic_fk", sa.Column("attribute_id", sa.Text(), nullable=False)
     )
     op.drop_index("ix_column__semantic_fk_key_id", "column__semantic_fk")
     op.drop_constraint(
@@ -355,7 +449,6 @@ def downgrade() -> None:
     )
     op.drop_constraint("pk_column__semantic_fk", "column__semantic_fk", type_="primary")
     op.drop_column("column__semantic_fk", "key_id")
-    op.alter_column("column__semantic_fk", "attribute_id", nullable=False)
     op.create_primary_key(
         "pk_column__semantic_fk", "column__semantic_fk", ["column_id", "attribute_id"]
     )

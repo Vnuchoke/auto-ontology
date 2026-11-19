@@ -17,6 +17,8 @@ BRANCH_HEADS = {"caee572fa81c", "e38c06a17f42"}
 MERGE_REVISION = "f4a39d8b2160"
 COMPATIBILITY_REVISION = "f5b40e9c3271"
 CONCEPT_REVISION = "38a47b1ef206"
+MASTER_CONCEPT_REVISION = "0b6f3c2a9d14"
+HEAD = "715d9c03a842"
 
 
 def test_merged_head_preserves_both_migration_branches_and_helm_pin() -> None:
@@ -24,8 +26,12 @@ def test_merged_head_preserves_both_migration_branches_and_helm_pin() -> None:
     heads = scripts.get_heads()
     assert len(heads) == 1, f"expected one merged head, found {heads}"
     head = scripts.get_revision(heads[0])
-    assert head.revision == CONCEPT_REVISION
-    assert head.down_revision == COMPATIBILITY_REVISION
+    assert head.revision == HEAD
+    assert set(head.down_revision) == {CONCEPT_REVISION, MASTER_CONCEPT_REVISION}
+    assert scripts.get_revision(MASTER_CONCEPT_REVISION).down_revision == "caee572fa81c"
+    assert (
+        scripts.get_revision(CONCEPT_REVISION).down_revision == COMPATIBILITY_REVISION
+    )
     assert scripts.get_revision(COMPATIBILITY_REVISION).down_revision == MERGE_REVISION
     assert set(scripts.get_revision(MERGE_REVISION).down_revision) == BRANCH_HEADS
     ancestors = {revision.revision for revision in scripts.walk_revisions()}

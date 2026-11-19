@@ -139,7 +139,6 @@ Helper проверяет обе коллекции и добавляет nullab
 
 ```bash
 PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic upgrade e38c06a17f42
-PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic check
 ```
 
 Цепочка включает constraints revision `d27b94f58c31` и retirement revision
@@ -148,7 +147,8 @@ source-scoped уникальность SQL metadata и таблицу `retired_c
 После завершения backfill и этой цепочки применить объединённую ревизию релиза:
 
 ```bash
-PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic upgrade 38a47b1ef206
+PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic upgrade head
+PYTHON_DOTENV_DISABLED=1 uv run --no-sync alembic check
 ```
 
 Merge-ревизия `f4a39d8b2160` объединяет identity head `e38c06a17f42` и upstream head `caee572fa81c`
@@ -161,9 +161,18 @@ Merge-ревизия `f4a39d8b2160` объединяет identity head `e38c06a1
 источникам и переносит каждую цель semantic FK с её признаком маршрута.
 Если цель нельзя однозначно перенести в пределах источника, транзакция
 останавливается с ID рёбер и причинами вместо удаления. Helm pin и runtime
-schema gate ожидают `38a47b1ef206`. Это не отменяет staged backfill выше и запрет
+schema gate ожидают `715d9c03a842`. Это не отменяет staged backfill выше и запрет
 смешанного запуска старых и source-aware writers. Команды миграции выполняются
 только на отдельно разрешённом store; слияние кода не применяет их к БД.
+
+Если заполненная БД уже на upstream `0b6f3c2a9d14`, до запуска Helm Job
+останови запись, примени additive этап `c19a83e47b20` и выполни согласованный
+backfill с проверкой. Только затем запускай `upgrade head`: он сохраняет
+существующие ID Concepts, ключей, FK и их настройки маршрута. Некорректные
+или межисточниковые ключи останавливают обновление с диагностикой. Старый
+идентификатор остаётся в графе только для совместимости: отдельно обновляться
+до него нельзя. Обновление выполняется онлайн; для возврата к схеме `master`
+нужна согласованная резервная копия.
 Проверить одинаковые ID-наборы у API/ingestion, env-first при непустом
 `CONNECTION_STRINGS`, выбранный source результата и отсутствие изменений
 соседа после scoped reset. До этих проверок API/workers не активировать.
