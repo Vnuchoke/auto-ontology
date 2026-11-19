@@ -701,6 +701,14 @@ def test_replace_drops_only_the_in_scope_fks_the_payload_omits(world) -> None:
     assert _fk_columns(world.customer_ref, outside) == {outside}
 
 
+def test_empty_replace_keeps_existing_semantic_fks(world) -> None:
+    assert _fk_columns(world.customer_ref) == {world.customer_ref}
+
+    mi.apply_import_model(mi.AutoOntologyModelDocument(), replace=True)
+
+    assert _fk_columns(world.customer_ref) == {world.customer_ref}
+
+
 def test_replace_drops_a_term_the_payload_omits(world) -> None:
     document = _document(world)
     stale = _add(

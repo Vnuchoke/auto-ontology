@@ -1855,11 +1855,11 @@ def _import_semantic_fks(
                 f"Conflicting join default for semantic FK {fk.column_id!r}"
             )
     fk_table = s.column__semantic_fk
-    if replace:
+    if replace and source_ids:
         scoped = (
             select(s.catalog_column.c.id)
             .select_from(_catalog_join())
-            .where(_database_scope(source_ids))
+            .where(s.catalog_database.c.id.in_(source_ids))
         )
         for row in store().query_read(
             select(fk_table.c.column_id, fk_table.c.key_id).where(
