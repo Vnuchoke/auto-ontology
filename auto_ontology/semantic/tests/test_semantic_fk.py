@@ -22,7 +22,6 @@ from auto_ontology.semantic.models import SemanticFkJoinDefaultSelection
 
 @pytest.fixture(autouse=True)
 def active_source(monkeypatch):
-    monkeypatch.setattr(semantic_fk, "fetch_semantic_fk_ends", lambda **_: [])
     monkeypatch.setattr(
         "auto_ontology.connectors.sources.list_active_sources",
         lambda: [SourceDescriptor("database", "Test", "sales", "postgres", "managed")],
@@ -438,65 +437,6 @@ def _join_keys(*results: object) -> semantic_fk._KeyIndex:
     return _keys([_key_row("attr", "table-2", [1])], connector)
 
 
-def test_pruning_reads_only_selected_source_and_removes_disjoint_edge() -> None:
-    row = {
-        "source_schema_name": "public",
-        "source_table_name": "A_ONLY",
-        "source_column_name": "ref",
-        "source_column_id": "a-col",
-        "target_schema_name": "public",
-        "target_table_name": "A_TARGET",
-        "target_column_name": "id",
-        "target_key_id": "a-key",
-    }
-    connector = MagicMock(dialect="postgres")
-    connector.qualify.side_effect = lambda schema, table: f'"{schema}"."{table}"'
-    connector.execute.return_value = pd.DataFrame({"n": [1, 0]})
-    with (
-        patch.object(
-            semantic_fk, "is_semantic_fk_db_query_prevented", return_value=False
-        ),
-        patch.object(
-            semantic_fk, "fetch_semantic_fk_ends", return_value=[row]
-        ) as fetch,
-        patch.object(
-            semantic_fk, "_resolve_connector", return_value=connector
-        ) as resolve,
-        patch.object(semantic_fk, "delete_semantic_fk", return_value=True) as delete,
-    ):
-        assert semantic_fk.prune_disjoint_semantic_fks("database") == 1
-    fetch.assert_called_once_with(connection_id="database")
-    resolve.assert_called_once_with("database")
-    delete.assert_called_once_with("a-col", "a-key", connection_id="database")
-    assert "B_ONLY" not in connector.execute.call_args.args[0]
-
-
-def test_pruning_preserves_split_key_with_overlap_and_deletes_only_other_key() -> None:
-    row = {
-        "source_table_name": "orders",
-        "source_column_name": "ref",
-        "source_column_id": "ref-col",
-        "target_column_name": "id",
-    }
-    rows = [
-        {**row, "target_key_id": "split", "target_table_name": "member_one"},
-        {**row, "target_key_id": "other", "target_table_name": "other_target"},
-        {**row, "target_key_id": "split", "target_table_name": "member_two"},
-    ]
-    connector = MagicMock(dialect="postgres")
-    connector.execute.side_effect = [pd.DataFrame({"n": [1, n]}) for n in (0, 0, 1)]
-    with (
-        patch.object(
-            semantic_fk, "is_semantic_fk_db_query_prevented", return_value=False
-        ),
-        patch.object(semantic_fk, "fetch_semantic_fk_ends", return_value=rows),
-        patch.object(semantic_fk, "_resolve_connector", return_value=connector),
-        patch.object(semantic_fk, "delete_semantic_fk", return_value=True) as delete,
-    ):
-        assert semantic_fk.prune_disjoint_semantic_fks("database") == 1
-    delete.assert_called_once_with("ref-col", "other", connection_id="database")
-
-
 def test_join_validation_accepts_a_returned_row() -> None:
     keys = _join_keys(pd.DataFrame({"hit": [1]}))
 
@@ -586,7 +526,8 @@ def test_resolution_logs_candidate_progress(caplog: pytest.LogCaptureFixture) ->
             return_value={},
         ),
         patch(
-            "auto_ontology.semantic.semantic_fk._resolve_connector", return_value=None
+            "auto_ontology.semantic.semantic_fk.is_semantic_fk_db_query_prevented",
+            return_value=True,
         ),
         patch("auto_ontology.semantic.semantic_fk._resolve_via_vdb", return_value=None),
         patch(
@@ -750,10 +691,6 @@ def test_missing_llm_uses_deterministic_default() -> None:
 def test_resolution_always_normalizes_join_defaults() -> None:
     with (
         patch(
-            "auto_ontology.semantic.semantic_fk.prune_disjoint_semantic_fks",
-            return_value=0,
-        ),
-        patch(
             "auto_ontology.semantic.semantic_fk._resolve_semantic_fks",
             return_value=3,
         ),
@@ -766,8 +703,34 @@ def test_resolution_always_normalizes_join_defaults() -> None:
     select_defaults.assert_called_once_with("database")
 
 
+@pytest.mark.parametrize("present", [0, 1], ids=["empty-or-null", "disjoint"])
+def test_existing_fks_are_not_probed_or_removed(present: int) -> None:
+    row = _join_group_row("ref-col", "customer_ref")
+    connector = MagicMock(dialect="postgres")
+    connector.execute.return_value = pd.DataFrame({"n": [present, 0]})
+    with (
+        patch.object(semantic_fk, "find_unlinked_fk_columns", return_value=[]),
+        patch.object(
+            semantic_fk, "is_semantic_fk_db_query_prevented", return_value=False
+        ),
+        patch.object(semantic_fk, "fetch_semantic_fk_join_groups", return_value=[row]),
+        patch.object(semantic_fk, "set_semantic_fk_join_default"),
+        patch.object(
+            semantic_fk, "fetch_semantic_fk_ends", return_value=[row], create=True
+        ),
+        patch.object(
+            semantic_fk, "delete_semantic_fk", return_value=True, create=True
+        ) as delete,
+        patch.object(semantic_fk, "_resolve_connector", return_value=connector),
+    ):
+        assert semantic_fk.resolve_semantic_fks("database") == 0
+
+    delete.assert_not_called()
+    connector.execute.assert_not_called()
+
+
 def _run_inferred_resolution(
-    *, join_ok: bool, prevented: bool = False
+    *, join_ok: bool, prevented: bool = False, connector_available: bool = True
 ) -> tuple[int, MagicMock, MagicMock, MagicMock]:
     candidates = [{"id": "col-1", "name": "customer_ref", "table_name": "orders"}]
     with (
@@ -789,7 +752,7 @@ def _run_inferred_resolution(
         ),
         patch(
             "auto_ontology.semantic.semantic_fk._resolve_connector",
-            return_value=MagicMock(),
+            return_value=MagicMock() if connector_available else None,
         ) as resolve_connector,
         patch(
             "auto_ontology.semantic.semantic_fk.fetch_value_key_candidates",
@@ -826,6 +789,16 @@ def test_inferred_fk_is_dropped_when_the_join_returns_nothing() -> None:
     created, _connector, _join, merge = _run_inferred_resolution(join_ok=False)
 
     assert created == 0
+    merge.assert_not_called()
+
+
+def test_inferred_fk_is_not_stored_when_validation_is_unavailable() -> None:
+    created, _connector, join, merge = _run_inferred_resolution(
+        join_ok=False, connector_available=False
+    )
+
+    assert created == 0
+    join.assert_not_called()
     merge.assert_not_called()
 
 

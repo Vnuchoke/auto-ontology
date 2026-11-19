@@ -27,8 +27,9 @@ Algorithm
       table's own dense ``id`` holds nearly any integer FK's values. For the
       same reason the fallback is skipped altogether for a column whose values
       are all very short (``1..16``): only the LLM's pick can stand.
-   c. **Validated** — an inferred edge is stored only when joining the two
-      columns returns a row.
+   c. **Validated** — when warehouse queries are enabled, an inferred edge is
+      stored only when joining the two columns returns a row. An empty join
+      does not confirm the candidate and does not affect existing edges.
 
 ``PREVENT_SEMANTIC_FK_DB_QUERIES`` turns off everything that queries the
 warehouse — on-demand probes, the value-only fallback and the join check —
@@ -48,8 +49,6 @@ from sqlglot import exp
 from auto_ontology.connectors import get_connector
 from auto_ontology.connectors.base import SQLDatabase
 from auto_ontology.dal.attributes import (
-    delete_semantic_fk,
-    fetch_semantic_fk_ends,
     fetch_semantic_fk_join_groups,
     fetch_value_key_candidates,
     find_unlinked_fk_columns,
@@ -82,7 +81,6 @@ from auto_ontology.utils.sample_values import (
     parse_sample_values,
     stringify_sample_values,
 )
-from auto_ontology.utils.sql_identifiers import quoted_identifier
 from auto_ontology.semantic.models import (
     FkHitSelection,
     SemanticFkJoinDefaultSelection,
@@ -150,70 +148,8 @@ def resolve_semantic_fks(connection_id: str) -> int:
     """
     selected_source(connection_id)
     created = _resolve_semantic_fks(connection_id)
-    prune_disjoint_semantic_fks(connection_id)
     select_semantic_fk_join_defaults(connection_id)
     return created
-
-
-def prune_disjoint_semantic_fks(connection_id: str) -> int:
-    """Delete semantic FKs whose column shares no value with its target.
-
-    An inferred edge is a guess from names and descriptions; a seven-digit
-    school code read as the fourteen-digit CDS code it sits beside is one.
-    No overlap at all is the only test applied: real references in loaded
-    data can still miss most of their target, so a low share is no proof.
-    An all-NULL source column is pruned too: joining through it returns no
-    rows, yet it would still be offered as a join path.
-    Returns the number of edges deleted.
-    """
-    selected_source(connection_id)
-    if is_semantic_fk_db_query_prevented():
-        return 0
-    rows = fetch_semantic_fk_ends(connection_id=connection_id)
-    if not rows:
-        return 0
-    connector = _resolve_connector(connection_id)
-    if connector is None:
-        return 0
-    dialect = getattr(connector, "dialect", None)
-    # A split key still joins if any member shares values. Probe failures are
-    # not evidence of disjointness and must not delete any target.
-    disjoint: dict[tuple[str, str], bool] = {}
-    for row in rows:
-        edge = (row["source_column_id"], row["target_key_id"])
-        if disjoint.get(edge) is False:
-            continue
-        source = connector.qualify(
-            row.get("source_schema_name"), row["source_table_name"]
-        )
-        target = connector.qualify(
-            row.get("target_schema_name"), row["target_table_name"]
-        )
-        sc = quoted_identifier(row["source_column_name"], dialect)
-        tc = quoted_identifier(row["target_column_name"], dialect)
-        sql = (
-            f"SELECT COUNT(*) AS n FROM (SELECT {sc} FROM {source} "
-            f"WHERE {sc} IS NOT NULL LIMIT 1) AS present "
-            f"UNION ALL SELECT COUNT(*) FROM (SELECT {sc} FROM {source} "
-            f"WHERE {sc} IN (SELECT {tc} FROM {target}) LIMIT 1) AS shared"
-        )
-        try:
-            _present, shared = (int(v) for v in connector.execute(sql).iloc[:, 0])
-        except Exception:
-            logger.info(
-                "semantic FK overlap check skipped for %s.%s",
-                row["source_table_name"],
-                row["source_column_name"],
-                exc_info=True,
-            )
-            disjoint[edge] = False
-            continue
-        disjoint[edge] = not shared
-    return sum(
-        delete_semantic_fk(column_id, key_id, connection_id=connection_id)
-        for (column_id, key_id), removable in disjoint.items()
-        if removable
-    )
 
 
 def _resolve_semantic_fks(connection_id: str) -> int:
@@ -301,8 +237,12 @@ def _resolve_semantic_fks(connection_id: str) -> int:
         )
     else:
         connector = _resolve_connector(connection_id)
-        if connector is not None:
-            keys = _KeyIndex(connection_id, connector)
+        if connector is None:
+            logger.warning(
+                "resolve_semantic_fks: no connector to validate inferred FKs"
+            )
+            return declared_written
+        keys = _KeyIndex(connection_id, connector)
 
     families = _Families(
         fetch_table_families(
