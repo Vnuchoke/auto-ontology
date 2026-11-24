@@ -13,7 +13,9 @@ export const openapi: OpenApiRoute = {
 				description:
 					'Active sources, without credentials or source-driver probes. Select one ID or unique label before querying when multiple sources exist.',
 				schema: z.object({
-					data: z.array(sourceDescriptorSchema.extend({ dialect: z.string() })),
+					data: z.array(
+						sourceDescriptorSchema.extend({ dialect: z.string().nullable() }),
+					),
 					count: z.number().int(),
 				}),
 			},

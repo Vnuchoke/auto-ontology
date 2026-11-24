@@ -6,7 +6,7 @@ import { requests } from './requests';
 import type { ApiResponse } from './types';
 import type { SourceDescriptor } from '@/types/chat';
 
-export type SourceSummary = SourceDescriptor & { dialect: string };
+export type SourceSummary = SourceDescriptor & { dialect: string | null };
 
 export const sourcesApi = {
 	list: () => requests.get<ApiResponse<SourceSummary[]>>('connections/sources'),

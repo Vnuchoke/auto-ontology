@@ -18,8 +18,21 @@ vi.mock('@/auth/with-auth', () => ({
 vi.mock('@/auth/sso-token', () => ({ resolveSubjectToken: subjectToken }));
 
 import { GET } from './route';
+import { openapi } from './openapi';
 
 afterEach(() => vi.unstubAllGlobals());
+
+test('the discovery contract accepts an unknown dialect from the backend', () => {
+	const source = {
+		connection_id: 'a',
+		display_label: 'East',
+		database_name: 'sales',
+		dialect: null,
+	};
+	expect(
+		openapi.get?.responses?.[200]?.schema?.safeParse({ data: [source], count: 1 }).success,
+	).toBe(true);
+});
 
 test('discovery uses chat permission and never resolves or forwards credentials', async () => {
 	const body = {

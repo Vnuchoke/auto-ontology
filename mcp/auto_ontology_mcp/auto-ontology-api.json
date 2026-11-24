@@ -2414,7 +2414,14 @@
                             "minLength": 1
                           },
                           "dialect": {
-                            "type": "string"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
