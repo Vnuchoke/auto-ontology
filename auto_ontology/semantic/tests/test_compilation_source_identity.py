@@ -84,6 +84,7 @@ def test_all_compilation_stages_receive_identity_not_physical_name(monkeypatch):
     scoped_stages = []
     for name in (
         "resolve_term_families",
+        "resolve_concepts",
         "attach_unmatched_fk_columns",
         "describe_column_attributes",
     ):

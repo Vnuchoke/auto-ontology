@@ -39,7 +39,7 @@ export const ChatView = () => {
 	const [accepting, setAccepting] = useState(false);
 	const acceptingRef = useRef(false);
 	const generationRef = useRef(0);
-	const viewGeneration = generationRef.current;
+	const [viewGeneration, setViewGeneration] = useState(0);
 	const activeIdRef = useRef<string | null>(focusId);
 	const loadedFocusRef = useRef<string | null | undefined>(undefined);
 
@@ -106,13 +106,24 @@ export const ChatView = () => {
 		}
 	}, []);
 
-	useEffect(() => {
-		let active = true;
+	// The first request already starts in the loading state. Retry and source
+	// rejection use the same refresh path without a synchronous effect update.
+	const refreshSources = () => {
 		setSourcesLoading(true);
 		setSourcesError(null);
-		sourcesApi
-			.list()
-			.then((res) => {
+		setSourcesRevision((revision) => revision + 1);
+	};
+	const [previousSourceRejected, setPreviousSourceRejected] = useState(sourceRejected);
+	if (previousSourceRejected !== sourceRejected) {
+		setPreviousSourceRejected(sourceRejected);
+		if (sourceRejected) refreshSources();
+	}
+
+	useEffect(() => {
+		let active = true;
+		const loadSources = async () => {
+			try {
+				const res = await sourcesApi.list();
 				if (!active) return;
 				if (res.error) {
 					setSources(null);
@@ -120,23 +131,19 @@ export const ChatView = () => {
 				} else {
 					setSources(res.data);
 				}
-			})
-			.catch(() => {
+			} catch {
 				if (!active) return;
 				setSources(null);
 				setSourcesError('Could not load sources.');
-			})
-			.finally(() => {
+			} finally {
 				if (active) setSourcesLoading(false);
-			});
+			}
+		};
+		void loadSources();
 		return () => {
 			active = false;
 		};
 	}, [sourcesRevision]);
-
-	useEffect(() => {
-		if (sourceRejected) setSourcesRevision((revision) => revision + 1);
-	}, [sourceRejected]);
 
 	const loadDetail = useCallback(
 		async (id: string, generation: number, resume: boolean) => {
@@ -171,6 +178,7 @@ export const ChatView = () => {
 	const beginConversation = useCallback(
 		(id: string | null) => {
 			const generation = ++generationRef.current;
+			setViewGeneration(generation);
 			activeIdRef.current = id;
 			loadedFocusRef.current = id;
 			acceptingRef.current = false;
@@ -190,8 +198,26 @@ export const ChatView = () => {
 		[clearConversation, loadDetail, refreshConversations],
 	);
 
+	// A cleared URL focus leaves nothing to load, even before the focus effect runs.
+	const [previousFocusId, setPreviousFocusId] = useState(focusId);
+	if (previousFocusId !== focusId) {
+		setPreviousFocusId(focusId);
+		if (focusId === null) setMessageListLoading(false);
+	}
+
 	useEffect(() => {
-		if (loadedFocusRef.current !== focusId) beginConversation(focusId);
+		if (loadedFocusRef.current === focusId) return;
+		// Start from the latest focus; cleanup invalidates deferred work before it starts.
+		let active = true;
+		const generation = generationRef.current;
+		const loadFocused = async () => {
+			await Promise.resolve();
+			if (active && generation === generationRef.current) beginConversation(focusId);
+		};
+		void loadFocused();
+		return () => {
+			active = false;
+		};
 	}, [focusId, beginConversation]);
 
 	useEffect(
@@ -395,10 +421,7 @@ export const ChatView = () => {
 					{sourcesError && (
 						<p role="alert">
 							{sourcesError}{' '}
-							<button
-								type="button"
-								onClick={() => setSourcesRevision((revision) => revision + 1)}
-							>
+							<button type="button" onClick={refreshSources}>
 								Retry sources
 							</button>
 						</p>
