@@ -34,7 +34,14 @@ services:
     volumes:
       - pgadmin_data:/var/lib/pgadmin
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1/misc/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
 
   auto-ontology:
     build:
