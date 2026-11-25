@@ -248,8 +248,16 @@ def build_embed_row(
     schema_name: str,
     database_name: str | None,
     connection_id: str,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Wrap embedding *text* in the row shape the embed → VDB path expects."""
+    """Wrap embedding *text* in the row shape the embed → VDB path expects.
+
+    *extra* adds label-specific identifiers alongside the common ones -- a
+    conversation turn carries the transcript and position that let retrieval
+    widen a hit to its neighbours, which no tabular row needs. They go into
+    both copies of the metadata, so a consumer reading either sees the same
+    fields.
+    """
     if not connection_id:
         raise ValueError("connection_id is required for embedding rows")
     path = f"auto_ontology:{node_id}" if node_id else "auto_ontology:unknown"
@@ -257,6 +265,7 @@ def build_embed_row(
     # dict. The copies under content_metadata are kept so rows written now look
     # like the ones already stored.
     fields = {
+        **(extra or {}),
         "id": node_id,
         "label": label,
         "name": name,

@@ -6661,10 +6661,11 @@
     },
     "/api/semantic-compilation/reset": {
       "post": {
-        "description": "semanticCompilationApi.reset — delete every database's compiled semantic\nlayer. Destructive, so it sits behind `manage` rather than the `read` tier\nthat may view the toggle.",
+        "description": "semanticCompilationApi.reset — delete the compiled semantic layer. Scoped to\none source when `connection_id` is given, every source otherwise.\nDestructive, so it sits behind `manage` rather than the `read` tier that\nmay view the toggle.",
         "operationId": "post_api_semantic_compilation_reset",
         "parameters": [
           {
+            "description": "Reset only this connection ID. Omit to reset every source.",
             "in": "query",
             "name": "connection_id",
             "required": false,
@@ -6678,6 +6679,7 @@
                   "type": "null"
                 }
               ],
+              "description": "Reset only this connection ID. Omit to reset every source.",
               "title": "Connection Id"
             }
           }
@@ -6710,7 +6712,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "semanticCompilationApi.reset — delete every database's compiled semantic layer.",
+        "summary": "semanticCompilationApi.reset — delete the compiled semantic layer.",
         "tags": ["semantic-compilation"],
         "security": [
           {

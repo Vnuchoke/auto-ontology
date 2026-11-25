@@ -46,9 +46,15 @@ async def trigger() -> dict[str, str]:
 @router.post(
     "/semantic-compilation/reset", status_code=202, response_model=StatusResponse
 )
-async def reset(
+def reset(
     request: Request,
-    connection_id: Annotated[str | None, Query(pattern=r"\S")] = None,
+    connection_id: Annotated[
+        str | None,
+        Query(
+            pattern=r"\S",
+            description="Reset only this connection ID. Omit to reset every source.",
+        ),
+    ] = None,
 ) -> dict[str, str]:
     """Queue a semantic rebuild by opaque ID, or all sources if omitted.
 

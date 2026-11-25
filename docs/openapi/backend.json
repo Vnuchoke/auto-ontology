@@ -9539,6 +9539,7 @@
         "operationId": "reset_api_semantic_compilation_reset_post",
         "parameters": [
           {
+            "description": "Reset only this connection ID. Omit to reset every source.",
             "in": "query",
             "name": "connection_id",
             "required": false,
@@ -9552,6 +9553,7 @@
                   "type": "null"
                 }
               ],
+              "description": "Reset only this connection ID. Omit to reset every source.",
               "title": "Connection Id"
             }
           }

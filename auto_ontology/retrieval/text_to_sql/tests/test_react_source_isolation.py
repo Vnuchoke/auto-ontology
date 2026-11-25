@@ -27,7 +27,6 @@ def test_same_name_sources_a_b_a_have_scoped_catalogs(monkeypatch):
     connectors = [SimpleNamespace(connection_id=c, database_name="sales") for c in "ab"]
     for cid in "aba":
         ctx = ToolContext(
-            retriever=None,
             connectors=connectors,
             database_name="sales",
             connection_id=cid,
@@ -41,7 +40,6 @@ def test_same_name_sources_a_b_a_have_scoped_catalogs(monkeypatch):
 
 def test_missing_selected_connector_never_falls_back():
     ctx = ToolContext(
-        retriever=None,
         connectors=[SimpleNamespace(connection_id="b", database_name="sales")],
         database_name="sales",
         connection_id="a",
@@ -52,9 +50,7 @@ def test_missing_selected_connector_never_falls_back():
 def test_sibling_catalog_is_source_scoped(monkeypatch):
     fetch = Mock(return_value=[])
     monkeypatch.setattr(siblings, "fetch_table_column_names", fetch)
-    ctx = ToolContext(
-        retriever=None, connectors=[], database_name="sales", connection_id="a"
-    )
+    ctx = ToolContext(connectors=[], database_name="sales", connection_id="a")
     assert siblings._catalog(ctx) == []
     fetch.assert_called_once_with("sales", connection_id="a")
 
@@ -109,9 +105,7 @@ def test_react_writes_refused_and_select_stays_read_only(monkeypatch):
         supports_statement_timeout=True,
         execute=execute,
     )
-    ctx = ToolContext(
-        retriever=None, connectors=[connector], database_name="sales", connection_id="a"
-    )
+    ctx = ToolContext(connectors=[connector], database_name="sales", connection_id="a")
     monkeypatch.setattr(
         run_sql, "catalog_for", lambda *args: FakeCatalog({"orders": ["marker"]})
     )
@@ -132,13 +126,18 @@ def test_information_and_prediction_lookups_pass_cid(monkeypatch):
 
     schemas = Mock(return_value=["schema-a"])
     tables = Mock(
-        return_value=[{"id": "a", "schema_name": "public", "name": "LOCAL A"}]
+        return_value=[
+            {
+                "id": "a",
+                "schema_name": "public",
+                "name": "LOCAL A",
+                "connection_id": "a",
+            }
+        ]
     )
     monkeypatch.setattr(information, "fetch_schema_ids_for_database", schemas)
     monkeypatch.setattr(information, "fetch_tables_for_schema", tables)
-    ctx = ToolContext(
-        retriever=None, connectors=[], database_name="sales", connection_id="a"
-    )
+    ctx = ToolContext(connectors=[], database_name="sales", connection_id="a")
     assert "LOCAL A" in information.information(ctx, "")
     schemas.assert_called_once_with("sales", connection_id="a")
     tables.assert_called_once_with("schema-a", connection_id="a")
@@ -184,7 +183,7 @@ def test_steps_cannot_inject_source_or_connectors():
 
 
 def test_name_search_uses_the_persisted_owned_column_name(monkeypatch):
-    from auto_ontology.retrieval.text_to_sql.react import retrieve
+    from auto_ontology.retrieval.text_to_sql.react import catalog as retrieve
     from auto_ontology.retrieval.data_access import candidates
 
     monkeypatch.setattr(
@@ -216,9 +215,7 @@ def test_name_search_uses_the_persisted_owned_column_name(monkeypatch):
     )
     fetch = Mock(return_value={"columns": [{"id": "col-a", "column_name": "amount"}]})
     monkeypatch.setattr(candidates, "fetch_columns_for_table", fetch, raising=False)
-    ctx = ToolContext(
-        retriever=None, connectors=[], database_name="sales", connection_id="a"
-    )
+    ctx = ToolContext(connectors=[], database_name="sales", connection_id="a")
 
     hits = retrieve._name_hits(ctx, "amount", ["ColumnAttribute"])
 

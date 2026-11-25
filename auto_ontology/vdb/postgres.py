@@ -18,6 +18,7 @@ import os
 import threading
 import time
 from typing import Any, Iterable, Optional
+from uuid import uuid4
 
 import psycopg
 from psycopg import sql
@@ -396,9 +397,11 @@ class PostgresVDB:
         self,
         records: list,
         batch_size: int = 500,
+        *,
+        upsert: bool = False,
         **kwargs: Any,
     ) -> int:
-        """Upsert source projections, returning the number of rows written."""
+        """Upsert source projections; conversation callers can explicitly append."""
         documents: list[Document] = []
         embeddings: list[list[float]] = []
         ids: list[str] = []
@@ -425,7 +428,12 @@ class PostgresVDB:
                         "invalid_global_pql: use the explicit global PQL client"
                     )
                 cid = self._source_scope(metadata.get("connection_id"))
-                ids.append(projection_id(self.collection_name, cid, metadata.get("id")))
+                stable_id = projection_id(self.collection_name, cid, metadata.get("id"))
+                ids.append(
+                    str(uuid4())
+                    if metadata.get("label") == "Conversation" and not upsert
+                    else stable_id
+                )
 
             doc_metadata = {
                 "document_type": record.get("document_type"),
@@ -611,6 +619,36 @@ class PostgresVDB:
         )
         return deleted
 
+    def delete_by_conversation(self, connection_id: str, conversation_id: str) -> int:
+        """Delete one transcript's projections within the selected connection."""
+        connection_id = self._source_scope(connection_id)
+        if not self._table_exists():
+            return 0
+        self._require_source_schema()
+        with psycopg.connect(self.connection_string) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        """
+                        DELETE FROM {table}
+                        WHERE connection_id = %s
+                          AND langchain_metadata ->> 'conversation_id' = %s
+                        """
+                    ).format(
+                        table=sql.Identifier(self.schema_name, self.collection_name),
+                    ),
+                    (connection_id, conversation_id),
+                )
+                deleted = cur.rowcount
+        logger.info(
+            "PostgresVDB.delete_by_conversation: deleted %d rows from %s for %s/%s",
+            deleted,
+            self.collection_name,
+            connection_id,
+            conversation_id,
+        )
+        return deleted
+
     def ids_with_content_containing(
         self, node_ids: list[str], fragment: str, *, connection_id: str
     ) -> list[str]:
@@ -724,9 +762,9 @@ class PostgresVDB:
         )
         return results
 
-    def run(self, records: list) -> int:
+    def run(self, records: list, *, upsert: bool = False) -> int:
         """Create the collection if needed, then write records to it."""
-        return self.write_to_index(records)
+        return self.write_to_index(records, upsert=upsert)
 
     #: Seconds to wait for the pool to dispose before giving up on it.
     #:

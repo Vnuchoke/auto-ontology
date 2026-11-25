@@ -18,7 +18,9 @@ MERGE_REVISION = "f4a39d8b2160"
 COMPATIBILITY_REVISION = "f5b40e9c3271"
 CONCEPT_REVISION = "38a47b1ef206"
 MASTER_CONCEPT_REVISION = "0b6f3c2a9d14"
-HEAD = "715d9c03a842"
+CONCEPT_MERGE = "715d9c03a842"
+CONVERSATION_HEAD = "e7a3d5c19f42"
+HEAD = "2d718c2f16a4"
 
 
 def test_merged_head_preserves_both_migration_branches_and_helm_pin() -> None:
@@ -27,7 +29,11 @@ def test_merged_head_preserves_both_migration_branches_and_helm_pin() -> None:
     assert len(heads) == 1, f"expected one merged head, found {heads}"
     head = scripts.get_revision(heads[0])
     assert head.revision == HEAD
-    assert set(head.down_revision) == {CONCEPT_REVISION, MASTER_CONCEPT_REVISION}
+    assert set(head.down_revision) == {CONCEPT_MERGE, CONVERSATION_HEAD}
+    assert set(scripts.get_revision(CONCEPT_MERGE).down_revision) == {
+        CONCEPT_REVISION,
+        MASTER_CONCEPT_REVISION,
+    }
     assert scripts.get_revision(MASTER_CONCEPT_REVISION).down_revision == "caee572fa81c"
     assert (
         scripts.get_revision(CONCEPT_REVISION).down_revision == COMPATIBILITY_REVISION

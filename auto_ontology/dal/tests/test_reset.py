@@ -97,12 +97,25 @@ class _StubVdb:
         pass
 
 
+#: The data-tier collections besides the catalog's: a reset that leaves one
+#: out keeps answering searches for rows the cascade removed.
+CONVERSATION_VDBS = (
+    "get_conversation_vdb",
+    "get_conversation_semantic_vdb",
+    "get_one_hop_path_vdb",
+)
+
+
 @pytest.fixture(autouse=True)
 def stub_vdbs(monkeypatch):
     data, semantic = _StubVdb(), _StubVdb()
     monkeypatch.setattr(r, "get_data_vdb", lambda: data)
     monkeypatch.setattr(r, "get_semantic_vdb", lambda: semantic)
-    return {"data": data, "semantic": semantic}
+    stubs = {"data": data, "semantic": semantic}
+    for factory in CONVERSATION_VDBS:
+        stub = stubs[factory] = _StubVdb()
+        monkeypatch.setattr(r, factory, lambda stub=stub: stub)
+    return stubs
 
 
 def _add(table, **values) -> str:
@@ -397,10 +410,14 @@ def test_the_result_reports_pgvector_rows_from_both_layers(world, stub_vdbs) -> 
 
     result = r.delete_all_data(shop.id)
 
-    assert result.data_rows == 3
+    # Three from each data-tier collection: the catalog's and the three
+    # conversation ones.
+    assert result.data_rows == 3 * 4
     assert result.semantic_rows == 3
     assert stub_vdbs["data"].deleted_databases == [shop.id]
     assert stub_vdbs["semantic"].deleted_databases == [shop.id]
+    for factory in CONVERSATION_VDBS:
+        assert stub_vdbs[factory].deleted_databases == [shop.id], factory
 
 
 def test_an_unscoped_reset_clears_both_collections(world, stub_vdbs) -> None:
@@ -410,11 +427,14 @@ def test_an_unscoped_reset_clears_both_collections(world, stub_vdbs) -> None:
 
     with _rolled_back():
         result = r.delete_all_data(None)
-        assert result.data_rows == 3
+        assert result.data_rows == 3 * 4
 
     assert stub_vdbs["data"].deleted_all == 0
     assert stub_vdbs["semantic"].deleted_all == 0
     assert stub_vdbs["data"].deleted_databases == [shop.id]
+    for factory in CONVERSATION_VDBS:
+        assert stub_vdbs[factory].deleted_all == 0, factory
+        assert stub_vdbs[factory].deleted_databases == [shop.id], factory
 
 
 def test_resetting_a_database_that_does_not_exist_is_harmless(world) -> None:

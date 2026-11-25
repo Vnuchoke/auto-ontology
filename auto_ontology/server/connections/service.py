@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # "unchanged" rather than "clear it".
 SECRET_FIELDS = frozenset(
     {
+        "credentials_json",
         "password",
         "password_env",
         "private_key",

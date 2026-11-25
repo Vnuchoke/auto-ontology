@@ -436,6 +436,26 @@ def test_public_connection_payload_redacts_the_truststore_password() -> None:
     assert serialized["connection"]["truststore"] == "/etc/ssl/ca.jks"
 
 
+def test_public_connection_payload_redacts_the_bigquery_key() -> None:
+    serialized = _serialize_connection(
+        {
+            "connection_id": "bq-source",
+            "display_label": "BigQuery",
+            "database_name": "my-project",
+            "connection": {
+                "type": "bigquery",
+                "database": "my-project",
+                "credentials_json": '{"type": "service_account", "private_key": "x"}',
+                "location": "US",
+            },
+        }
+    )
+
+    assert "credentials_json" not in serialized["connection"]
+    assert "service_account" not in json.dumps(serialized)
+    assert serialized["connection"]["location"] == "US"
+
+
 class _StubConnector:
     def __init__(self, schemas: list[str]) -> None:
         self._schemas = schemas

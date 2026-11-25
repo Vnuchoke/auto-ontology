@@ -224,7 +224,7 @@ def test_sql_payload_and_resume_cannot_replace_identity(
     main = types.ModuleType("auto_ontology.retrieval.text_to_sql.main")
     main.get_agent_response_with_state = agent
     state = types.ModuleType("auto_ontology.retrieval.text_to_sql.state")
-    state.TextToSQLPayload = dict
+    state.AgentRequest = dict
     with (
         patch.dict(sys.modules, {main.__name__: main, state.__name__: state}),
         patch.object(coordinator, "generate_evidence", return_value=""),

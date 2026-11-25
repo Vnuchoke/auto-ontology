@@ -18,7 +18,13 @@ from auto_ontology.dal import schema as s
 from auto_ontology.dal.concepts import delete_orphan_concepts
 from auto_ontology.dal.connections import finalize_connection_removal
 from auto_ontology.dal.session import store, write_transaction
-from auto_ontology.vdb import get_data_vdb, get_semantic_vdb
+from auto_ontology.vdb import (
+    get_conversation_semantic_vdb,
+    get_conversation_vdb,
+    get_data_vdb,
+    get_one_hop_path_vdb,
+    get_semantic_vdb,
+)
 
 
 @dataclass
@@ -154,15 +160,36 @@ def _delete_data_rows(connection_id: str) -> None:
         delete(s.catalog_schema).where(s.catalog_schema.c.database_id == connection_id)
     )
     _delete_queries(connection_id)
+    store().query_write(
+        delete(s.conversation).where(s.conversation.c.database_id == connection_id)
+    )
+    store().query_write(
+        delete(s.conversation_node).where(
+            s.conversation_node.c.database_id == connection_id
+        )
+    )
 
 
 def _delete_vectors(connection_id: str, *, semantic: bool) -> int:
     """Unbound clients work even after retirement or deletion of the root."""
-    client = get_semantic_vdb() if semantic else get_data_vdb()
-    try:
-        return len(client.delete_by_connection(connection_id))
-    finally:
-        client.close()
+    factories = (
+        (get_semantic_vdb,)
+        if semantic
+        else (
+            get_data_vdb,
+            get_conversation_vdb,
+            get_conversation_semantic_vdb,
+            get_one_hop_path_vdb,
+        )
+    )
+    deleted = 0
+    for factory in factories:
+        client = factory()
+        try:
+            deleted += len(client.delete_by_connection(connection_id))
+        finally:
+            client.close()
+    return deleted
 
 
 def delete_semantic_layer(connection_id: str | None = None) -> int:

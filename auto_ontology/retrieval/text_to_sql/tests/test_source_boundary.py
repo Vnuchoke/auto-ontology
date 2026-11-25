@@ -159,7 +159,6 @@ def test_same_sales_connections_execute_distinct_results(
         }
     )
     ctx = ToolContext(
-        retriever=None,
         connectors=state["connectors"],
         database_name="sales",
         connection_id=state["connection_id"],

@@ -129,6 +129,8 @@ def _physical_name(parsed: SplitResult, driver_url: str) -> str:
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     if scheme == "snowflake":
         return query.get("database") or name
+    if scheme == "bigquery":
+        return unquote(parsed.path.strip("/")).strip() or unquote(parsed.netloc).strip()
     if scheme in ("trino", "kyuubi"):
         return name or query.get("catalog", "")
     if scheme in ("postgres", "postgresql") and "+" not in parsed.scheme:

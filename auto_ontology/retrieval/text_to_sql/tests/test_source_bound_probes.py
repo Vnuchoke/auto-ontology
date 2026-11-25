@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from auto_ontology.retrieval.text_to_sql.react import retrieve, run_sql
+from auto_ontology.retrieval.text_to_sql.react import catalog as retrieve, run_sql
 from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
 from .react_fakes import FakeCatalog
 
@@ -38,9 +38,7 @@ def test_extra_tables_use_only_persisted_source_context(monkeypatch, hit_id):
     monkeypatch.setattr(retrieve, "_uncovered_physical_hits", lambda *args: [])
     monkeypatch.setattr(retrieve, "_name_hits", lambda *args: [])
     monkeypatch.setattr(retrieve.config, "siblings_enabled", lambda: False)
-    ctx = ToolContext(
-        retriever=None, connectors=[], database_name="sales", connection_id="a"
-    )
+    ctx = ToolContext(connectors=[], database_name="sales", connection_id="a")
     result = retrieve.retrieve(ctx, "orders")
     assert "FOREIGN B" not in result
     assert ("LOCAL A" in result) == (hit_id == "local-a")
@@ -76,7 +74,6 @@ def test_model_probe_cannot_escape_selected_catalog_or_schema(monkeypatch, table
     executor = Mock()
     monkeypatch.setattr(run_sql, "execute_chat_sql", executor)
     ctx = ToolContext(
-        retriever=None,
         connectors=[connector],
         database_name="catalog_a",
         connection_id="a",
@@ -93,7 +90,7 @@ def test_model_probe_cannot_escape_selected_catalog_or_schema(monkeypatch, table
 def test_ambiguous_probe_is_not_in_view():
     import sqlglot
 
-    ctx = ToolContext(retriever=None, connectors=[], connection_id="a")
+    ctx = ToolContext(connectors=[], connection_id="a")
     ctx.show_table("public", "orders")
     catalog = FakeCatalog({"orders": ["status"]}, {"orders": ["public", "private"]})
     assert run_sql.tables_not_shown(
